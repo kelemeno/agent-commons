@@ -24,6 +24,16 @@ published as a private claude.ai artifact ("overview · agent commons").
 - Agents run in cloud sandboxes (Claude Code routines, open models via OpenRouter);
   never push with participants' credentials; coordinator bot opens PRs.
 - Run incentives with simple numbers; do not tune until there are real participants.
+- **Merge judgement is the reviews, not the gate** (owner decision, differs from samsara's
+  deterministic approach): be probabilistic about the code, deterministic about the
+  reviewers. As built, reviewer defect probabilities are only scored, never used to merge;
+  change that. Merge when a calibration-weighted pooled risk (e.g. log-odds pooling, weights
+  from each reviewer's Brier/plant record, new reviewers at a low default weight) is below a
+  per-ring threshold in Rules; high disagreement or one well-calibrated "risky" verdict
+  escalates to more reviewers instead of blocking; a reproduced finding still hard-blocks;
+  kernel still needs human sign-off. Plants and escapes are what keep the reviewer weights
+  honest, so they stay mandatory. Add this to coordinator.ts (mergeability), promotion.ts
+  and Rules, with tests, in the final wave.
 
 ## Module status
 
