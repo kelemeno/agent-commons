@@ -495,6 +495,8 @@ test("commonsCommit: anyone holding the base rebuilds the same head from the pat
   assert.equal(git(other, "rev-parse", `${theirs.head}^`), a.base); // the objects are written: it can be checked out
   assert.equal(git(other, "status", "--porcelain"), ""); // neither the index nor the work tree was touched
   assert.notEqual(commonsCommit({ repoDir: other, baseCommit: a.base, patch: a.patch, submissionId: "s-2" }).head, mine.head);
+  // From a subdirectory too (git apply alone would skip paths outside it).
+  assert.equal(commonsCommit({ repoDir: path.join(other, "src"), baseCommit: a.base, patch: a.patch, submissionId: "s-1" }).head, mine.head);
   assert.throws(() => commonsCommit({ repoDir: other, baseCommit: a.base, patch: a.patch.replace("-const y = 2;", "-const y = 9;"), submissionId: "s-1" }));
 });
 

@@ -41,7 +41,38 @@ published as a private claude.ai artifact ("overview · agent commons").
 | incentives | built, reviewed, fixed |
 | gates (rings, airlock, specSeparation, size, index) | built, reviewed, fixed (cli wiring of new inputs pending) |
 | promotion, metrics | built, reviewed, fixed |
-| server, coordinator, github bridge, client + agent-kit, cli | in progress |
+| server, coordinator, github bridge, client + agent-kit | built, reviewed, fixed |
+| cli | built and reviewed; **fix pass never ran** — 19 issues in `handoff/runtime-result.json` (`reviewIssues.cli`) |
+
+## Continue on the Mac mini
+
+```bash
+git clone https://github.com/kelemeno/agent-commons && cd agent-commons && git checkout wip-core && npm install
+```
+
+```bash
+git clone --recurse-submodules https://github.com/kelemeno/anthill ../anthill && (cd ../anthill/anthill-backend && npm install)
+```
+
+```bash
+export ANTHILL_BACKEND_DIR="$(cd ../anthill/anthill-backend && pwd)"
+```
+
+Then start `claude` in the agent-commons clone and say: "Read HANDOFF.md and run the
+final wave". The final wave is scripted in `handoff/final-wave.js` (a Claude Code
+workflow script): run it with `args: { root: <abs path of this clone>, anthill:
+<abs path of the anthill clone> }`. Its first stage finishes the CLI fixes and makes
+tests independent of the old cloud paths (tests that import the Anthill backend
+must read ANTHILL_BACKEND_DIR and skip with a message when it is unset).
+
+Reports from every module's build, adversarial review and fix are in `handoff/`
+(`*-result.txt`, `runtime-result.json`); their UNRESOLVED lists are the
+cross-module work for the integration stage.
+
+Known at handoff: the suite was never run as a whole; expect type errors and
+failing tests across module boundaries (e.g. playground calls
+`reviewerScores(state)` without `nowIso`). Tests may reference paths like
+`/home/user/anthill/...` or `../../anthill-backend` from the cloud layout.
 
 ## Final wave (to do after all modules land)
 

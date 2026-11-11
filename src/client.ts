@@ -150,7 +150,9 @@ export function commonsCommit(o: {
     GIT_COMMITTER_EMAIL: COMMONS_COMMIT_IDENTITY.email,
     GIT_COMMITTER_DATE: COMMONS_COMMIT_IDENTITY.date,
   };
-  const run = (args: string[], input?: string) => git([...cfg, ...args], { cwd: o.repoDir, env, input }).trim();
+  // From the top level: in a subdirectory, git apply silently skips paths outside it.
+  const top = git(["rev-parse", "--show-toplevel"], { cwd: o.repoDir, env: {} }).trim();
+  const run = (args: string[], input?: string) => git([...cfg, ...args], { cwd: top, env, input }).trim();
   try {
     const base = run(["rev-parse", "--verify", "--end-of-options", `${o.baseCommit}^{commit}`]);
     run(["read-tree", base]);

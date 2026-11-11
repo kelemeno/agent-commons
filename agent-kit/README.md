@@ -73,7 +73,8 @@ environment (`env -i`), no network (`unshare --net`) and no access to
 `~/.commons`, and kills every process of that user afterwards. It must run as
 root. Every role uses it, and none runs repository code any other way.
 
-Preparing a tree to test, in the trusted shell:
+Preparing a tree to test, in the trusted shell (`commons-agent` and
+`run-untrusted` stand for their absolute paths in `/opt/commons-kit/agent-kit/bin/`):
 
 ```bash
 work=$(mktemp -d)                                     # 0700; never fixed /tmp names

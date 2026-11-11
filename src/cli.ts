@@ -60,6 +60,7 @@ import {
   type PromotionApi,
   runOnce,
   type SelectionApi,
+  type ExecuteDeps,
 } from "./coordinator";
 import { canonical, generateKeyPair, isValidPublicKey, keyIdOf, randomSalt, sha256hex } from "./crypto";
 import { minimalEnv, reproduceFinding } from "./findings";
@@ -1254,14 +1255,89 @@ const COORDINATOR_FLAGS: Record<string, FlagSpec> = {
   approve: { type: "list", help: "phase 1: submission ids a human approved (repeatable)" },
   "snapshot-every": { type: "string", help: "merged submissions that trigger a snapshot (default: never)" },
   "required-gate": { type: "list", help: "gate every submission must pass (repeatable)" },
+  sandbox: {
+    type: "string",
+    help: "JSON argv prefix finding tests run under, e.g. a container runner; it must run as a uid that cannot read --key or write the ledger, patches or --repo/.git (checked). Without it findings are not reproduced",
+  },
 };
+
+// --sandbox as an argv prefix (findings.ts `sandbox`).
+function sandboxArg(ctx: Ctx): string[] | null {
+  const v = str(ctx.flags, "sandbox");
+  if (v === undefined) return null;
+  const j = jsonArg(ctx, v, "--sandbox");
+  if (!Array.isArray(j) || j.length === 0 || j.some((x) => typeof x !== "string" || x === "")) {
+    usage("--sandbox must be a JSON array of non-empty strings (an argv prefix)");
+  }
+  return j as string[];
+}
+
+export type Exposure = { access: "read" | "write"; path: string };
+
+// What a command run under `sandbox` can still reach of `forbidden`, checked
+// by running a probe exactly the way findings.ts runs a test (the sandbox argv,
+// then /bin/sh -c, with its minimal environment). A sandbox that does not run
+// the probe is a leak too. findings.ts's PID_NAMESPACE_SANDBOX keeps the
+// caller's uid, so it fails this for any file the caller can use.
+export function sandboxLeaks(sandbox: readonly string[], forbidden: readonly Exposure[]): string[] {
+  const script =
+    'while [ $# -gt 1 ]; do if [ "$1" = read ] && [ -r "$2" ]; then echo "read $2"; elif [ "$1" = write ] && [ -w "$2" ]; then echo "write $2"; fi; shift 2; done; echo commons-probe-done';
+  const r = spawnSync(sandbox[0] as string, [...sandbox.slice(1), "/bin/sh", "-c", script, "commons-probe", ...forbidden.flatMap((e) => [e.access, e.path])], {
+    cwd: os.tmpdir(),
+    env: minimalEnv(os.tmpdir()),
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  if (r.error || r.status !== 0 || !r.stdout.includes("commons-probe-done")) {
+    return [`not run the probe (${r.error?.message ?? `exit ${r.status}`}${r.stderr ? `: ${r.stderr.trim().slice(0, 200)}` : ""})`];
+  }
+  return r.stdout.split("\n").filter((l) => l.startsWith("read ") || l.startsWith("write "));
+}
+
+function sandboxProblem(sandbox: readonly string[], forbidden: readonly Exposure[]): string | null {
+  const leaks = sandboxLeaks(sandbox, forbidden);
+  return leaks.length === 0
+    ? null
+    : `the --sandbox can still ${leaks.join(", ")}; strangers' tests need a sandbox under a uid that cannot read the signing key or salts and cannot write the ledger, the patches or the repository`;
+}
+
+const ledgerExposures = (ctx: Ctx): Exposure[] => [
+  { access: "write", path: ledgerPath(ctx) },
+  { access: "write", path: path.dirname(ledgerPath(ctx)) },
+  { access: "write", path: patchesDir(ctx) },
+];
+
+const keyExposures = (ctx: Ctx): Exposure[] =>
+  str(ctx.flags, "key") === undefined
+    ? []
+    : [
+        { access: "read", path: resolvePath(ctx, req(ctx.flags, "key")) },
+        { access: "read", path: saltDirOf(ctx) },
+      ];
+
+// The coordinator's reproducer: only under a --sandbox that passed the probe
+// (run once, before the first reproduction). Without one every reproduction
+// fails loudly; it is an operator problem, so it never voids a finding.
+function sandboxedReproducer(ctx: Ctx, repo: string | null, dir: string): ExecuteDeps["reproduce"] {
+  if (repo === null) return () => Promise.resolve(null);
+  const sandbox = sandboxArg(ctx);
+  const inner = localReproducer({ repoDir: repo, testFile: (fid) => findingTestFile(dir, fid), reproduceFinding, ...(sandbox ? { sandbox } : {}) });
+  let checked: string | null | undefined;
+  return (a) => {
+    if (sandbox === null) {
+      return Promise.reject(new Error("no --sandbox: refusing to run a stranger's finding test as the coordinator's uid, which can read its key and write the ledger"));
+    }
+    checked ??= sandboxProblem(sandbox, [...keyExposures(ctx), ...ledgerExposures(ctx), { access: "write", path: path.join(repo, ".git") }]);
+    return checked === null ? inner(a) : Promise.reject(new Error(checked));
+  };
+}
 
 function patchesDir(ctx: Ctx): string {
   const p = str(ctx.flags, "patches");
   return p === undefined ? path.join(path.dirname(ledgerPath(ctx)), "patches") : resolvePath(ctx, p);
 }
 
-async function coordinatorPass(ctx: Ctx, store: LedgerStore, tree: TreeView): Promise<number> {
+async function coordinatorPass(ctx: Ctx, store: LedgerStore, tree: TreeView, harnessErrors = new Map<string, number>()): Promise<number> {
   const f = ctx.flags;
   const repo = str(f, "repo") === undefined ? null : resolvePath(ctx, req(f, "repo"));
   const approved = new Set(list(f, "approve"));
@@ -1278,16 +1354,25 @@ async function coordinatorPass(ctx: Ctx, store: LedgerStore, tree: TreeView): Pr
     tree,
     clock: () => ctx.io.now().toISOString(),
     entropy: () => randomSalt(),
+    // Uploaded patches and finding tests: what gets bound and reproduced.
+    patchesDir: dir,
+    harnessErrors,
+    bindPatch: (s: SubmissionState) => {
+      if (repo === null) return Promise.reject(new Error("no --repo: cannot bind patches"));
+      try {
+        return Promise.resolve(bindPatchLocal(repo, dir, s));
+      } catch (e) {
+        return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    },
+    // `s.headCommit` is the bound head (executeActions passes it).
     runGates: async (s: SubmissionState) => {
       if (repo === null) throw new Error("no --repo: cannot run gates");
-      const run = submissionGates(ctx.io, store.state(), s.id, repo);
+      const run = submissionGates(ctx.io, store.state(), s, repo);
       if (run.harness.length > 0) throw new Error(`gates could not run: ${run.harness.join("; ")}`);
-      return run.reports;
+      return run.reports.map((r) => ({ ...r, details: printable(r.details) }));
     },
-    reproduce:
-      repo === null
-        ? () => Promise.resolve(null)
-        : localReproducer({ repoDir: repo, testFile: (fid) => findingTestFile(dir, fid), reproduceFinding }),
+    reproduce: sandboxedReproducer(ctx, repo, dir),
     bridge: noBridge,
     selection: lazy<SelectionApi>(ctx.io, "selection"),
     humanApproval: (sid) => approved.has(sid),
@@ -1542,12 +1627,13 @@ const COMMANDS: Record<string, Command> = {
       ...REMOTE,
       id: { type: "string", help: "submission id (default generated)" },
       task: { type: "string", help: "task id (omit for an untasked change)" },
-      base: { type: "string", help: "base commit", required: true },
-      head: { type: "string", help: "head commit", required: true },
-      repo: { type: "string", help: "compute files and lines from git diff base..head here" },
-      patch: { type: "string", help: "unified diff file (uploaded with --url)" },
-      files: { type: "list", help: "changed file (repeatable), with --lines" },
+      base: { type: "string", help: "base commit (a full sha, or with --repo any commit name)", required: true },
+      head: { type: "string", help: "head commit (a full sha, or with --repo any commit name)", required: true },
+      repo: { type: "string", help: "compute the change and its patch from git diff base..head here" },
+      patch: { type: "string", help: "unified diff file (git format) against --base" },
+      files: { type: "list", help: "changed file (repeatable), with --lines; no patch, so nothing can be gated until one is uploaded" },
       lines: { type: "string", help: "lines changed, with --files" },
+      patches: { type: "string", help: "local mode: where the patch is stored (default <ledger dir>/patches)" },
     },
     async (ctx) => {
       const f = ctx.flags;
@@ -1556,34 +1642,60 @@ const COMMANDS: Record<string, Command> = {
       let patch: string | null = null;
       let files: string[];
       let lines: number;
-      let base = req(f, "base");
-      let head = req(f, "head");
+      let base: string;
+      let head: string;
       if (str(f, "repo") !== undefined) {
         const repo = resolvePath(ctx, req(f, "repo"));
-        base = resolveCommit(ctx.io.git, repo, revArg(base, "base"));
-        head = resolveCommit(ctx.io.git, repo, revArg(head, "head"));
+        base = resolveCommit(ctx.io.git, repo, revArg(req(f, "base"), "base"));
+        head = resolveCommit(ctx.io.git, repo, revArg(req(f, "head"), "head"));
         const change = gitChanges(ctx.io.git, repo, base, head);
         if (change.unexpanded.length > 0 || change.submodules.length > 0) {
           usage("the change moves a submodule pointer; submit to the submodule's own project instead");
         }
         files = change.files;
         lines = change.linesChanged;
-        if (str(f, "url") !== undefined) {
-          patch = ctx.io.git(repo, ["diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", base, head, "--"]);
-        }
-      } else if (str(f, "patch") !== undefined) {
-        patch = readText(ctx, req(f, "patch"), "patch");
+        // Explicit prefixes and full index lines whatever the user's diff
+        // config says: the bridge's parser needs exactly git's default format.
+        patch = ctx.io.git(repo, [
+          "diff",
+          "--no-renames",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--no-color",
+          "--no-relative",
+          "--full-index",
+          "--src-prefix=a/",
+          "--dst-prefix=b/",
+          base,
+          head,
+          "--",
+        ]);
         let summary;
         try {
           summary = summarisePatch(patch);
         } catch (e) {
-          return usage(`patch ${req(f, "patch")}: ${(e as Error).message}`);
+          return usage(`git's patch for ${base}..${head} cannot be applied by the GitHub bridge (${(e as Error).message}); nothing was submitted`);
         }
-        files = summary.files;
-        lines = summary.linesChanged;
+        if (summary.files.join("\n") !== files.join("\n") || summary.linesChanged !== lines) {
+          usage(`git's patch for ${base}..${head} (${summary.files.length} files, ${summary.linesChanged} lines) differs from the change (${files.length} files, ${lines} lines); nothing was submitted`);
+        }
       } else {
-        files = list(f, "files");
-        lines = int(f, "lines", { min: 0 }) ?? usage("--files needs --lines");
+        base = shaArg(req(f, "base"), "base");
+        head = shaArg(req(f, "head"), "head");
+        if (str(f, "patch") !== undefined) {
+          patch = readText(ctx, req(f, "patch"), "patch");
+          let summary;
+          try {
+            summary = summarisePatch(patch);
+          } catch (e) {
+            return usage(`patch ${req(f, "patch")}: ${(e as Error).message}`);
+          }
+          files = summary.files;
+          lines = summary.linesChanged;
+        } else {
+          files = list(f, "files");
+          lines = int(f, "lines", { min: 0 }) ?? usage("--files needs --lines");
+        }
       }
       const bad = files.find((p) => !isCanonicalPath(p));
       if (bad !== undefined) usage(`changed file ${JSON.stringify(bad)} is not a canonical repo path`);
@@ -1596,21 +1708,34 @@ const COMMANDS: Record<string, Command> = {
         changedFiles: [...new Set(files)].sort(),
         linesChanged: lines,
       };
+      if (!SAFE_ID.test(body.id)) usage(`--id ${JSON.stringify(body.id)} must match ${SAFE_ID.source}`);
       const signer = signerKey(ctx);
       const e = await emit(ctx, body, signer);
       report(ctx, e, `${body.changedFiles.length} files, ${lines} lines`);
+      if (patch === null) {
+        ctx.out("no patch stored (pass --patch or --repo); the coordinator cannot bind or gate it until one is");
+        return 0;
+      }
       if (str(f, "url") !== undefined) {
-        if (patch === null) {
-          ctx.out("no patch uploaded (pass --patch or --repo); the coordinator cannot gate it until one is");
-          return 0;
-        }
         try {
           const up = await client(ctx, signer).uploadPatch(body.id, patch);
           ctx.out(`patch ${up.created ? "uploaded" : "already stored"} ${up.sha256.slice(0, 16)}`);
         } catch (err) {
           return refuse(`submission posted but the patch upload failed: ${(err as Error).message}`);
         }
+        return 0;
       }
+      // Local mode stores it where the coordinator's server would.
+      const file = patchFile(patchesDir(ctx), body.id);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      try {
+        fs.writeFileSync(file, patch, { flag: "wx", mode: 0o644 });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST" || fs.readFileSync(file, "utf8") !== patch) {
+          return refuse(`submission appended but the patch could not be stored at ${file}: ${(err as NodeJS.ErrnoException).code ?? (err as Error).message}`);
+        }
+      }
+      ctx.out(`patch stored in ${file}`);
       return 0;
     },
   ),
@@ -1618,12 +1743,13 @@ const COMMANDS: Record<string, Command> = {
   gates: command(
     "run the static gates: CI mode (--base --head --rules) or a ledger submission (--submission)",
     {
-      repo: { type: "string", help: "git checkout with both commits (CI mode: checked out at --head)", required: true },
+      repo: { type: "string", help: "git repository with both commits (its working tree is never read)", required: true },
       base: { type: "string", help: "CI mode: base commit" },
       head: { type: "string", help: "CI mode: head commit" },
       rules: { type: "string", help: "CI mode: Rules JSON to judge against" },
-      submission: { type: "string", help: "ledger mode: submission id (gates run in a temporary worktree)" },
-      record: { type: "boolean", help: "ledger mode: append gateResult entries (signed by the coordinator --key)" },
+      submission: { type: "string", help: "ledger mode: submission id; gates the head built from its stored patch" },
+      record: { type: "boolean", help: "ledger mode: append the binding and gateResult entries (signed by the coordinator --key)" },
+      patches: { type: "string", help: "ledger mode: patches directory (default <ledger dir>/patches)" },
       "dependency-track": { type: "boolean", help: "the change is on the dependency track (may touch locked paths)" },
       json: { type: "boolean", help: "print the reports as JSON" },
     },
@@ -1665,7 +1791,7 @@ const COMMANDS: Record<string, Command> = {
         ...(str(f, "base-manifest") === undefined ? {} : { baseManifestPath: resolvePath(ctx, req(f, "base-manifest")) }),
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
       });
-      if (bool(f, "json")) ctx.out(JSON.stringify(r, null, 2));
+      if (bool(f, "json")) ctx.block(JSON.stringify(r, null, 2));
       else {
         ctx.out(`${r.pass ? "PASS" : "FAIL"} ${r.gate}: ${r.details}`);
         for (const d of r.divergences) {
@@ -1795,30 +1921,43 @@ const COMMANDS: Record<string, Command> = {
       "test-file": { type: "string", help: "the finding's test content (default <patches>/findings/<id>.test)" },
       patches: { type: "string", help: "patches directory (default <ledger dir>/patches)" },
       "timeout-ms": { type: "string", help: "per run" },
-      record: { type: "boolean", help: "append the findingResult (signed by the coordinator --key)" },
+      record: { type: "boolean", help: "append the findingResult (signed by the coordinator --key; needs --sandbox)" },
+      sandbox: { type: "string", help: "JSON argv prefix the test runs under; must not be able to read --key or its salts, or write the ledger or --repo/.git (checked)" },
+      "unsafe-same-uid": { type: "boolean", help: "run the test as you, unsandboxed: it can read your keys and write your files. Only for a test you have read" },
     },
     async (ctx) => {
       const f = ctx.flags;
       const fid = req(f, "finding");
+      const sandbox = sandboxArg(ctx);
+      if ((sandbox === null) === !bool(f, "unsafe-same-uid")) usage("pass --sandbox <argv JSON>, or --unsafe-same-uid for a test you have read yourself");
+      if (bool(f, "record") && sandbox === null) usage("--record needs --sandbox: never run a stranger's test as the coordinator's uid");
+      const repoDir = resolvePath(ctx, req(f, "repo"));
+      if (sandbox !== null) {
+        const problem = sandboxProblem(sandbox, [...keyExposures(ctx), ...ledgerExposures(ctx), { access: "write", path: path.join(repoDir, ".git") }]);
+        if (problem !== null) usage(problem);
+      } else {
+        ctx.io.stderr("commons finding verify: WARNING: running the test unsandboxed as your uid (--unsafe-same-uid); it can read your keys and change your files\n");
+      }
       const st = state(ctx);
       const finding = st.findings.get(fid) ?? refuse(`no finding ${fid}`);
       const commits = findingCommits(st, fid) ?? refuse(`cannot tell which commits finding ${fid} is about`);
       const testFile = str(f, "test-file") ?? findingTestFile(patchesDir(ctx), fid);
       const timeoutMs = int(f, "timeout-ms", { min: 1 });
       const r = await reproduceFinding({
-        repoDir: resolvePath(ctx, req(f, "repo")),
+        repoDir,
         baseCommit: commits.base,
         headCommit: commits.head,
         testPath: finding.testPath,
         testContent: readText(ctx, testFile, "test file"),
         testCommand: finding.testCommand,
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        ...(sandbox === null ? {} : { sandbox }),
       });
       ctx.out(`fails on head ${commits.head}: ${r.failsOnHead}`);
       ctx.out(`passes on parent ${commits.base}: ${r.passesOnParent}`);
       ctx.out(`reproduced: ${r.reproduced} (log ${r.logDigest.slice(0, 16)})`);
       if (r.harnessError) {
-        ctx.io.stderr(`commons finding verify: harness error: ${r.harnessError}\n${r.log.slice(-4000)}\n`);
+        ctx.io.stderr(`commons finding verify: harness error: ${printable(r.harnessError)}\n${printable(r.log.slice(-4000), true)}\n`);
         return 2;
       }
       if (bool(f, "record")) {
@@ -1895,7 +2034,7 @@ const COMMANDS: Record<string, Command> = {
     { ...TREE, snapshot: { type: "string", help: "snapshot id", required: true }, json: { type: "boolean", help: "print JSON" } },
     async (ctx) => {
       const r = await evaluate(ctx);
-      if (bool(ctx.flags, "json")) ctx.out(JSON.stringify(r, null, 2));
+      if (bool(ctx.flags, "json")) ctx.block(JSON.stringify(r, null, 2));
       return r.pass ? 0 : 1;
     },
   ),
@@ -1917,12 +2056,15 @@ const COMMANDS: Record<string, Command> = {
     "commit to a planted bug before submitting it (signed by an admin); the salt is saved next to the key",
     {
       submission: { type: "string", help: "the id the plant will be submitted under", required: true },
-      salt: { type: "string", help: "salt (default 32 random bytes)" },
+      salt: { type: "string", help: "salt: exactly 32 random bytes as 64 hex digits (default: generated)" },
     },
     (ctx) => {
       const sid = req(ctx.flags, "submission");
       const file = plantFile(ctx, sid);
       const salt = str(ctx.flags, "salt") ?? randomSalt();
+      // A guessable salt lets reviewers test new submission ids against the
+      // open commitments and spot the plants.
+      if (!/^[0-9a-f]{64}$/.test(salt)) usage("--salt must be 32 random bytes as 64 lowercase hex digits");
       const commitment = plantCommitment(sid, salt);
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
       try {
@@ -1978,6 +2120,11 @@ const COMMANDS: Record<string, Command> = {
         promotion: { evaluatePromotion: () => ({ pass: false, checks: [] }) },
       });
       const signer = signerKey(ctx);
+      // The plan's escapes come before the settlements it computed with them
+      // (a reproduced finding against a promoted snapshot settles at main).
+      for (const a of actions) {
+        if (a.kind === "escape") report(ctx, appendLocal(ctx, { kind: "escape", findingId: a.findingId, snapshotId: a.snapshotId }, signer));
+      }
       let n = 0;
       for (const a of actions) {
         if (a.kind !== "settle") continue;
@@ -1999,7 +2146,7 @@ const COMMANDS: Record<string, Command> = {
       const st = state(ctx);
       const rows = (ctx.io.load("metrics") as MetricsApi).computeMetrics(st, tree, stamp(ctx));
       if (bool(ctx.flags, "json")) {
-        ctx.out(JSON.stringify(rows, null, 2));
+        ctx.block(JSON.stringify(rows, null, 2));
         return 0;
       }
       const cells = rows.map((r) => [r.group, r.metric, typeof r.value === "string" ? r.value : JSON.stringify(r.value) ?? "", r.bad ? "BAD" : "", r.note]);
@@ -2049,10 +2196,11 @@ const COMMANDS: Record<string, Command> = {
         const every = int(f, "loop-seconds", { min: 1 });
         if (every !== undefined) {
           let running = false;
+          const harnessErrors = new Map<string, number>();
           timer = setInterval(() => {
             if (running) return;
             running = true;
-            coordinatorPass(ctx, store, tree)
+            coordinatorPass(ctx, store, tree, harnessErrors)
               .catch((e: unknown) => ctx.io.stderr(`coordinator pass: ${(e as Error).message}\n`))
               .finally(() => (running = false));
           }, every * 1000);
@@ -2066,7 +2214,7 @@ const COMMANDS: Record<string, Command> = {
   ),
 
   "coordinator run-once": command(
-    "one coordinator pass: settle, reproduce findings, gate, assign, merge, snapshot, promote",
+    "one coordinator pass: settle, reproduce findings, bind patches, gate, assign, merge, snapshot, promote (git fetch --repo first)",
     COORDINATOR_FLAGS,
     async (ctx) => {
       const tree = await loadTree(ctx);
@@ -2194,16 +2342,22 @@ export async function main(argv: readonly string[], io: Partial<Io> = {}): Promi
   try {
     const { flags, rest } = parseArgs(args, cmd.flags);
     if (rest.length > 0) usage(`unexpected argument ${JSON.stringify(rest[0])}`);
-    const ctx: Ctx = { io: full, out: (line) => full.stdout(`${line}\n`), flags, name };
+    const ctx: Ctx = {
+      io: full,
+      out: (line) => full.stdout(`${printable(line)}\n`),
+      block: (text) => full.stdout(`${printable(text, true)}\n`),
+      flags,
+      name,
+    };
     return await cmd.run(ctx);
   } catch (e) {
     if (e instanceof CliError) {
-      full.stderr(`commons ${name}: ${e.message}${e.exitCode === 2 && e.message.startsWith("missing --") ? ` (see commons ${name} --help)` : ""}\n`);
+      full.stderr(`commons ${name}: ${printable(e.message, true)}${e.exitCode === 2 && e.message.startsWith("missing --") ? ` (see commons ${name} --help)` : ""}\n`);
       return e.exitCode;
     }
     // Unexpected: the message, and the stack only when asked for.
     const debug = process.env.COMMONS_DEBUG !== undefined && e instanceof Error;
-    full.stderr(`commons ${name}: ${e instanceof Error ? (debug ? e.stack : e.message) : String(e)}\n`);
+    full.stderr(`commons ${name}: ${printable(e instanceof Error ? ((debug ? e.stack : e.message) ?? "") : String(e), true)}\n`);
     return 2;
   }
 }

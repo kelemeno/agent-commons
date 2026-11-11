@@ -1,0 +1,106 @@
+{
+  "summary": "Finish remaining anthill-commons core module groups (build, review, fix) in parallel shards",
+  "agentCount": 2,
+  "logs": [],
+  "result": [
+    {
+      "key": "findings",
+      "fix": {
+        "summary": "I checked all 10 issues under \"findings\" against the current src/findings.ts. The earlier fix attempt had finished and every issue is fixed, each with a regression test in /home/user/anthill/anthill-commons/test/findings.test.ts. I made no edits in this pass. All 32 tests pass (node --import tsx --test test/findings.test.ts, about 16 s), and tsc shows no errors in src/findings.ts or test/findings.test.ts. The \"delta\" key in the issues file is for behaviourDelta.ts, which is not my module, so I left it alone.\n\nHow each issue stands:\n1. Critical, hooks and secrets reaching the harness's own git calls: fixed. Both commits are resolved and checked out before any command runs, and git is never run on the repo after that. Every git call uses --no-replace-objects, core.hooksPath=/dev/null and core.fsmonitor=false, with a minimal environment that carries no secrets. Tests: \"hooks and fsmonitor configured in the repository never run during the harness's own git calls\" and \"the command's checkout is not linked to the repository: it cannot plant hooks, move refs, replace objects or edit config\".\n2. Critical, the command could change the shared repo through a linked worktree, including `git replace`: fixed. I no longer use `git worktree`. Each checkout is built with `git read-tree` into a private index plus `checkout-index --prefix`, so it has no `.git` link back to the repo. A testPath that touches `.git` is rejected. Tests: the \"not linked\" test above and \"a planted git replace cannot swap the tree behind a genuine parent sha\".\n3. High, secrets readable through /proc/$PPID/environ (raised twice): partly fixed, as far as one process can go. The header comment now says plainly that this is not isolation. Values of secret-named variables, taken from process.env, /proc/self/environ and opts.env, are redacted from the log, including a partial secret cut off by truncation. There is a new opt-in `sandbox` option, `PID_NAMESPACE_SANDBOX`, which uses unshare user/pid/mount namespaces with all capabilities dropped. Tests: one where the secret is in the launch environment of a child node process and the command reads it via /proc/$PPID/environ, one for redact(), and two sandbox tests. The module cannot run commands as a separate uid, so findings from strangers still need a container, and the comment says so.\n4. Medium, cleanup order and cleanup errors replacing the result: fixed. With no worktrees there is nothing to prune. removeTree never throws: if removal fails it restores owner permissions and retries, and a final failure goes into `cleanupError` without changing the outcome. Test: \"cleanup survives a command that fakes .git and locks directories, and never replaces the result\".\n5. Low, timeouts above 2^31-1 ms firing almost at once: fixed. MAX_TIMEOUT_MS is 2147483647. Test: values 0, -1, NaN, Infinity, MAX+1 and 3e9 are rejected, and MAX itself still reproduces.\n6. Low, base resolved after head ran: fixed. Both are resolved to full shas up front, and the log records those shas. Test: \"both commits are resolved and checked out before any command runs, and base runs first\".\n7. Low, weak test assertions: fixed. The outcome tests assert harnessError === null, and there are new tests for a spawn error, .git tampering and the /proc read.\n8. High, hang when a setsid descendant holds the output pipes: fixed. After the shell exits or the timeout kills the group, the promise settles within DRAIN_MS (1 s) and destroys the pipes. Two regression tests cover this.\n9. Medium, the two runs could interfere, including predictable paths and mkdir(home) failing: fixed. Both checkout and home directories are created inside prepare() before any command runs, and prepare turns every failure into a harness error instead of throwing. Base runs first, so code from the head commit runs only after the base result is captured.\n\nChanges from the contract:\n- ARCHITECTURE.md says each commit is checked out in a \"temporary git worktree\". The implementation uses read-tree plus checkout-index instead, because a linked worktree hands the untrusted command the operator's git directory (issue 2). That doc is not one of my files; someone should change the findings.ts entry to say \"exports each commit into a plain directory with no .git link; base runs first; both are checked out before any command runs\".\n- The result has extra fields `harnessError` and `cleanupError`, and the options have an extra optional `sandbox`. The spec's \"git worktree list shows only main\" check is still asserted.\n- Commits that start with \"-\" are rejected, and `--end-of-options` is passed to rev-parse.\n- The secret filter also matches names containing PASSWD, CREDENTIAL and AUTH, not just the four names the spec lists.\n\nPossible types.ts change: the findingResult ledger event cannot record a harness error. Today cli.ts exits with code 2 and never records a result when there is a harness error, so nothing is wrong yet. Adding an optional `harnessError?: string` to that event would let settlement tell \"could not run\" apart from \"did not reproduce\" if a harness-error result is ever recorded.",
+        "testCount": 32,
+        "testsPassing": true,
+        "typeChangeRequests": [
+          "Optional: the findingResult ledger event in src/types.ts could carry an optional `harnessError?: string`, so a run that could not execute is never read as a false finding. cli.ts currently avoids this by refusing to record a harness-error result."
+        ],
+        "unresolved": [
+          "ARCHITECTURE.md (not my file) still says findings.ts uses a temporary git worktree. The implementation now exports plain directories with no .git link (read-tree plus checkout-index) to fix the critical issue where the command could change the shared repo, so the doc entry should be updated.",
+          "Full isolation from a same-uid command (the /proc and filesystem reach in issue 3) needs a separate uid or a container, which this module cannot provide. Mitigations in place: an honest header comment, redaction of secret values from the log, and the opt-in PID_NAMESPACE_SANDBOX."
+        ]
+      }
+    },
+    {
+      "key": "delta",
+      "fix": {
+        "summary": "I checked all 10 \"delta\" issues against the current code. I fixed 7 in full, fixed 2 in part, and left 1 alone (the ARCHITECTURE.md edit, which is not my file). Each fix has a regression test. All 37 tests pass (run twice, about 45 s each). Both files type-check with zero errors. test/adapters-anthill.test.ts, which another agent owns and which uses this module, still passes (21/21). I ran the new regression tests against the pre-fix version (commit fe42d3a) and all 7 failed there, so they do catch the bugs.\n\nFiles: /home/user/anthill/anthill-commons/src/gates/behaviourDelta.ts and /home/user/anthill/anthill-commons/test/behaviourDelta.test.ts. While I was working, someone else committed my unfinished copy as WIP commit 9902899. I did not commit anything; the working tree has the final version.\n\nExported API: GATE, DeclaredDelta, Manifest, Divergence, EngineLike, DigestRecord, ReplayResult, digestEngine, parseManifest, loadManifest, runBehaviourDelta({oldBackendDir, newBackendDir, logPath, manifest?, timeoutMs?}), compareReplays, replayCheckout. ReplayResult.communities is now a Map instead of a plain object. EngineLike now also needs read.recDagVoteCount, read.recDagVote and read.sentDagVoteTotalWeight; the backend engine has all three.\n\nFixed:\n1. Seed-time changes were reported late. Each community is now digested once after the seed loads and before any action, recorded at the seed line's index. This uses a second Store built from the log's non-action lines. The two tests that expected the late answer now expect entry 0. A new test changes loadFromGraph on a log whose first action comes 6 entries after the seed. It checks that the divergence is at the seed and that declaring from the first action fails.\n2. The \"no manifest can excuse\" tests used `community: '*'`, which matches nothing. They now pass a real manifest declaring commons, demo and alpha from entry 0, and check that pass is false and divergences is empty.\n3. Entries were matched to log lines by object identity. They are now matched by content (the log's own bigint encoding), with a queue for duplicate lines. If an entry matches no line, it takes the next unreplayed line and is flagged with an error. If Store drops an action, that line is recorded as \"skipped without a report\" and shows up as a divergence a manifest can declare. Tests cover a load() that passes copies (passes) and a Store that drops changeName actions (declarable divergence).\n4. A community id like \"constructor\" crashed the replay. Communities are now kept in a Map, sent as [id, records] pairs and checked on receipt. Tests cover a real \"constructor\" community and compareReplays with \"constructor\", \"__proto__\" and \"toString\".\n5. The timeout did not bound the wait. The worker now runs in its own process group and the gate settles on its exit plus a 250 ms grace (or on the deadline), never on stdio EOF. On settling it kills the whole process group and closes stderr. The worker also exits by itself once it has sent its result. Tests cover a grandchild in the same group that holds stderr (returns quickly, grandchild killed) and a grandchild in its own group (returns quickly).\n6. The new side could copy the old side's result. The two sides now run one after the other, each in its own temp dir, and the old dir is deleted before the new side starts. Results come back over an IPC channel, never through a file. The regression test itself showed why this matters: on a file-based version it found another concurrent gate run's result.json in /tmp.\n7. The digest left out vote details. It now covers each vote as a full (id, weight, dist, posInOther) tuple in slot order, received votes, and total sent weight. The `dist + 7` change from the issue is now caught. I deliberately left out the stored reputation and epoch: calculateReputation rewrites that cache, including when the digest itself runs it, and nothing the engine decides reads it.\n\nPartly fixed or not taken:\n- Issue 9, Store-level state: users, passkeys, invites, polls and community settings are still not compared. Instead, the file header now says the gate compares tree state only. This keeps the Anthill integration minimal, as you asked.\n- Issue 10, one declaration excusing a community forever: mostly already handled. addedDeclarations in src/adapters/anthill.ts (another agent's file) counts only declarations the change adds. The gate keeps the spec's rule (a declaration may start at or before the divergence). It now picks the tightest covering declaration and reports how many entries early it starts, so reviewers can see what it might hide. I did not require an exact entry or fail unused declarations, because the spec says the gate passes if and only if every divergence is declared.\n- Issue 8, beyond the fixes above: there is no real sandbox. The new code still runs as the coordinator's user and can edit the old checkout or this file. Untrusted submissions need a container or a separate uid; the header says so.\n- Issue 5: ARCHITECTURE.md is not one of my files, so I did not edit it. The doc change it needs is listed below.",
+        "testsPassing": true,
+        "testCount": 37,
+        "typeChangeRequests": [
+          "ARCHITECTURE.md (not types.ts), behaviourDelta.ts entry: mark the module as running processes (like findings.ts) and add it to the 'Core is pure' list. Change the signature to runBehaviourDelta({ oldBackendDir, newBackendDir, logPath, manifest?, timeoutMs? }) (default 120 s). State that replay failures and timeouts fail the gate with no divergences, so no manifest can excuse them. Say that digest points are the seed line, each action line, and the end of the log. Say that only engine tree state is compared, not Store state."
+        ],
+        "unresolved": [
+          "Isolation is not a sandbox. The new checkout runs as the coordinator's user and can modify the old checkout on disk or src/gates/behaviourDelta.ts, and a grandchild in its own process group outlives the gate. Fixing this needs a container, bubblewrap or a separate uid in the CLI or CI setup, outside this module.",
+          "Store-level replay state (users, passkeys, invites incl. usedBy, polls, community settings) is not digested. The module now says it claims tree equivalence only.",
+          "Only the first divergence per community is reported, so an accepted declaration covers every later change in that community. The gap is now shown in details. Tying declarations to the change that adds them happens in addedDeclarations in src/adapters/anthill.ts."
+        ]
+      }
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Implement"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Review"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Fix"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 4,
+      "title": "Integrate"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "fix:findings",
+      "phaseIndex": 3,
+      "phaseTitle": "Fix",
+      "agentId": "afcca5d40db4908a9",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1794391840645,
+      "queuedAt": 1794391840608,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "I checked all 10 issues under \"findings\" against the curren…",
+      "promptPreview": "You are building one part of \"anthill-commons\", a TypeScript package at /home/user/anthill/anthill-commons (inside the git repo /home/user/anthill, branch agent-commons; the Anthill backend source is at /home/user/anthill/anthill-backend). It is the coordinator for an open \"agent commons\": people's AI agents propose, implement and review code for a shared project (first: Anthill itself), with Anth…",
+      "promptFramed": true,
+      "lastProgressAt": 1794391915079,
+      "tokens": 92190,
+      "toolCalls": 8,
+      "durationMs": 74433,
+      "resultPreview": "{\"summary\":\"I checked all 10 issues under \\\"findings\\\" against the current src/findings.ts. The earlier fix attempt had finished and every issue is fixed, each with a regression test in /home/user/anthill/anthill-commons/test/findings.test.ts. I made no edits in this pass. All 32 tests pass (node --import tsx --test test/findings.test.ts, about 16 s), and tsc shows no errors in src/findings.ts or …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "fix:delta",
+      "phaseIndex": 3,
+      "phaseTitle": "Fix",
+      "agentId": "ad0052e7d68bfb372",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1794391840645,
+      "queuedAt": 1794391840608,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "I checked all 10 \"delta\" issues against the current code. I…",
+      "promptPreview": "You are building one part of \"anthill-commons\", a TypeScript package at /home/user/anthill/anthill-commons (inside the git repo /home/user/anthill, branch agent-commons; the Anthill backend source is at /home/user/anthill/anthill-backend). It is the coordinator for an open \"agent commons\": people's AI agents propose, implement and review code for a shared project (first: Anthill itself), with Anth…",
+      "promptFramed": true,
+      "lastProgressAt": 1794392733512,
+      "tokens": 153116,
+      "toolCalls": 35,
+      "durationMs": 891537,
+      "resultPreview": "{\"summary\":\"I checked all 10 \\\"delta\\\" issues against the current code. I fixed 7 in full, fixed 2 in part, and left 1 alone (the ARCHITECTURE.md edit, which is not my file). Each fix has a regression test. All 37 tests pass (run twice, about 45 s each). Both files type-check with zero errors. test/adapters-anthill.test.ts, which another agent owns and which uses this module, still passes (21/21).…"
+    }
+  ],
+  "totalTokens": 245306,
+  "totalToolCalls": 43
+}
