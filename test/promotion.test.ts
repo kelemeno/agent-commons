@@ -251,7 +251,7 @@ test("a healthy snapshot passes every check, in the documented order", () => {
   const r = evaluatePromotion(w.state, tree, "S1", w.nowPlus(0));
   assert.deepEqual(
     r.checks.map((c) => c.name),
-    ["notPromoted", "coverage", "recall", "criticals", "openIssues", "kernel", "soak"],
+    ["notPromoted", "lineage", "coverage", "recall", "criticals", "openIssues", "kernel", "soak"],
   );
   for (const c of r.checks) assert.equal(c.pass, true, `${c.name}: ${c.detail}`);
   assert.equal(r.pass, true);
@@ -304,7 +304,7 @@ test("coverage: a submission reviewed by two families fails and is named", () =>
     ["c1", 0.1],
   ]);
   w.merge("s3");
-  w.snapshot("S2", ["s3"]); // previous null: covers only s3, no attestation
+  w.snapshot("S2", ["s3"], "S1"); // S1's attestation does not count for s3
   w.advance(100);
   const c = check(w, "S2", "coverage");
   assert.equal(c.pass, false);
@@ -337,7 +337,8 @@ test("coverage: one owner's two agents are one owner (Sybil seats)", () => {
     ["c1", 0.1],
   ]);
   w.merge("s3");
-  w.snapshot("S2", ["s3"]);
+  w.promote("S1"); // so S2 covers only s3, which bob may attest
+  w.snapshot("S2", ["s3"], "S1");
   w.reviews("S2", [["b2", 0.1]], "snapshot"); // bob's second agent, a third family
   w.advance(100);
   const c = check(w, "S2", "coverage");
@@ -345,19 +346,30 @@ test("coverage: one owner's two agents are one owner (Sybil seats)", () => {
   assert.match(c.detail, /s3: 3\/3 families \[gpt,kimi,qwen\], 2\/3 owners/);
 });
 
-test("coverage: a revoked reviewer's verdict stops vouching", () => {
+test("coverage: an agent that obeyed a honeytoken stops vouching", () => {
   const w = healthy();
   assert.equal(check(w, "S1", "coverage").pass, true);
-  w.append(
-    { kind: "agentRevoked", agent: w.agentKey("c1").keyId, reason: "obeyed a honeytoken" },
-    w.owners.get("carol") as Key,
-  );
+  w.coordinator({ kind: "honeytokenTriggered", agent: w.agentKey("c1").keyId, tokenId: "tok" });
+  w.coordinator({ kind: "agentRevoked", agent: w.agentKey("c1").keyId, reason: "honeytoken tok" });
   const c = check(w, "S1", "coverage");
   assert.equal(c.pass, false);
-  assert.match(c.detail, /s1: 2\/3 families/);
+  assert.match(c.detail, /s1: 2\/3 families \[deepseek,gpt\]/);
 });
 
-test("coverage runs over unpromoted ancestors; attestations count only on the snapshot itself", () => {
+test("coverage: an owner revoking their own agent (key rotation) does not withdraw its verdicts", () => {
+  // Regression: revocation used to drop the verdicts, so an owner could make a
+  // snapshot unpromotable for free once nobody could replace the coverage.
+  const w = healthy();
+  w.append(
+    { kind: "agentRevoked", agent: w.agentKey("c1").keyId, reason: "rotating keys" },
+    w.owners.get("carol") as Key,
+  );
+  w.agent("c2", "carol", "qwen");
+  assert.equal(check(w, "S1", "coverage").pass, true);
+  assert.equal(evaluatePromotion(w.state, tree, "S1", w.nowPlus(0)).pass, true);
+});
+
+test("coverage runs over unpromoted ancestors; attestations count only on the snapshot that lists the work", () => {
   const w = healthy();
   // s0: barely reviewed, parked in S0 which nobody promotes.
   w.submit("s0", "a1", ring1("parked"));
@@ -380,14 +392,139 @@ test("coverage runs over unpromoted ancestors; attestations count only on the sn
   assert.deepEqual(coveredSubmissionIds(w.state, "S2"), ["s3", "s0", "s1", "s2"]);
   const c = check(w, "S2", "coverage");
   assert.equal(c.pass, false, "s0 rides in on S2");
-  // s0 has b1 (review) + d1 (S2 attestation) = 2 families; c1's attestation was on S0.
-  assert.match(c.detail, /s0: 2\/3 families \[deepseek,gpt\]/);
+  // s0 has b1 (review) + c1 (S0 attestation, which saw it) = 2 families; d1
+  // attested S2, whose diff starts at S0's commit and does not contain s0.
+  assert.match(c.detail, /s0: 2\/3 families \[gpt,qwen\]/);
   assert.doesNotMatch(c.detail, /s3:|s1:|s2:/);
 
   // Once S0 is promoted (with its ancestor S1 shipped), S2 covers only s3.
   w.promote("S0");
   assert.deepEqual(coveredSubmissionIds(w.state, "S2"), ["s3"]);
   assert.equal(check(w, "S2", "coverage").pass, true);
+});
+
+test("coverage: attesters of a later snapshot do not vouch for an unattested ancestor (probe P1)", () => {
+  // Regression: every attestation on the head snapshot used to count for every
+  // covered submission, so s0 (one gpt review) reached main on S2.
+  const w = healthy();
+  w.promote("S1");
+  w.submit("s0", "a1", ring1("weak"));
+  w.assign("s0", ["b1"]);
+  w.reviews("s0", [["b1", 0.1]]);
+  w.merge("s0");
+  w.snapshot("S0", ["s0"], "S1"); // nobody attests S0
+  w.submit("s3", "a1", ring1("x"));
+  w.assign("s3", ["b1"]);
+  w.reviews("s3", [["b1", 0.1]]);
+  w.merge("s3");
+  w.snapshot("S2", ["s3"], "S0");
+  w.reviews(
+    "S2",
+    [
+      ["c1", 0.1],
+      ["d1", 0.1],
+    ],
+    "snapshot",
+  );
+  w.advance(100);
+  const r = evaluatePromotion(w.state, tree, "S2", w.nowPlus(0));
+  const c = r.checks.find((x) => x.name === "coverage");
+  assert.equal(c?.pass, false);
+  assert.match(c?.detail ?? "", /s0: 1\/3 families \[gpt\], 1\/2 owners/);
+  assert.doesNotMatch(c?.detail ?? "", /s3:/, "s3 is in S2, which c1 and d1 attested");
+  assert.equal(r.pass, false);
+});
+
+test("lineage: a snapshot that skips an unpromoted earlier snapshot fails and names what it skipped", () => {
+  const w = healthy(); // S1 unpromoted
+  w.submit("s3", "a1", ring1("x"));
+  w.assign("s3", ["b1", "c1"]);
+  w.reviews("s3", [
+    ["b1", 0.1],
+    ["c1", 0.1],
+  ]);
+  w.merge("s3");
+  w.snapshot("S2", ["s3"]); // previous null, but S2's commit holds s1 and s2
+  w.reviews("S2", [["d1", 0.1]], "snapshot");
+  w.advance(100);
+  const c = check(w, "S2", "lineage");
+  assert.equal(c.pass, false);
+  assert.equal(c.overall, false);
+  assert.match(c.detail, /s1 \(in S1, not on this chain\); s2 \(in S1, not on this chain\)/);
+  assert.equal(check(w, "S2", "coverage").pass, true, "every other check would have passed");
+  // The same work on the proper chain passes.
+  assert.equal(check(w, "S1", "lineage").pass, true);
+});
+
+test("lineage: a fork that drops an unreviewed ancestor fails; after a forced promotion the ancestor cannot follow (probe P2)", () => {
+  const w = healthy();
+  w.submit("s0", "a1", ring1("unreviewed")); // zero reviews
+  w.merge("s0");
+  w.snapshot("S0", ["s0"], "S1");
+  w.submit("s3", "a1", ring1("x"));
+  w.assign("s3", ["b1", "c1"]);
+  w.reviews("s3", [
+    ["b1", 0.1],
+    ["c1", 0.1],
+  ]);
+  w.merge("s3");
+  w.snapshot("S2", ["s3"], "S1"); // names S1, not S0
+  w.reviews("S2", [["d1", 0.1]], "snapshot");
+  w.advance(100);
+  const c = check(w, "S2", "lineage");
+  assert.equal(c.pass, false);
+  assert.match(c.detail, /s0 \(in S0, not on this chain\)/);
+  // Coverage, soak, openIssues and kernel only see the chain; lineage is what catches s0.
+  assert.equal(check(w, "S2", "coverage").pass, true);
+
+  // The ledger accepts a promotion the rule refused (e.g. an operator).
+  w.promote("S2");
+  const np = check(w, "S0", "notPromoted");
+  assert.equal(np.pass, false, "main would move backwards");
+  assert.match(np.detail, /main has moved past it: later snapshot S2 was promoted/);
+});
+
+test("lineage: a merge left out of every snapshot blocks; one merged after the snapshot or already on main does not", () => {
+  const w = healthy();
+  w.promote("S1");
+  w.submit("lost", "a1", ring1("lost"));
+  w.assign("lost", ["b1", "c1"]);
+  w.reviews("lost", [
+    ["b1", 0.1],
+    ["c1", 0.1],
+  ]);
+  w.merge("lost");
+  w.submit("s3", "a1", ring1("x"));
+  w.assign("s3", ["b1", "c1"]);
+  w.reviews("s3", [
+    ["b1", 0.1],
+    ["c1", 0.1],
+  ]);
+  w.merge("s3");
+  w.snapshot("S2", ["s3"], "S1"); // leaves "lost" out
+  w.reviews("S2", [["d1", 0.1]], "snapshot");
+  w.submit("after", "a1", ring1("after"));
+  w.assign("after", ["b1"]);
+  w.reviews("after", [["b1", 0.1]]);
+  w.merge("after"); // merged after S2 was taken: not in S2's commit
+  w.advance(100);
+  const c = check(w, "S2", "lineage");
+  assert.equal(c.pass, false);
+  assert.match(c.detail, /^merged before this snapshot but neither covered nor on main: lost \(in no snapshot\)$/);
+
+  // Work merged before an already promoted snapshot was taken is on main: a
+  // snapshot after that promotion does not ship it and is not blocked by it.
+  const v = healthy();
+  v.submit("early", "a1", ring1("early"));
+  v.merge("early");
+  v.submit("s3", "a1", ring1("x"));
+  v.merge("s3");
+  v.snapshot("P", ["s3"], "S1"); // omits "early"
+  v.promote("P"); // forced past the rule
+  v.submit("s4", "a1", ring1("y"));
+  v.merge("s4");
+  v.snapshot("S3", ["s4"], "P");
+  assert.equal(check(v, "S3", "lineage").pass, true);
 });
 
 test("recall: fewer than minSeeds revealed plants fails even if all were caught", () => {
@@ -469,13 +606,23 @@ test("openIssues: an unresolved high finding blocks; not reproduced clears it; r
   assert.match(c.detail, /f2 \(critical\) reproduced/);
 });
 
-test("openIssues: low and medium findings never block", () => {
+test("openIssues: unresolved low and medium findings do not block; a reproduced one of any severity does (probe P4)", () => {
   const w = healthy();
   w.finding("f1", "c1", { submissionId: "s1" }, "low");
   w.finding("f2", "d1", { submissionId: "s1" }, "medium");
   w.finding("f3", "c1", { submissionId: "s2" }, "medium");
-  w.result("f3", true);
+  w.result("f3", false);
   assert.equal(check(w, "S1", "openIssues").pass, true);
+  // Regression: a reproduced defect labelled "medium" by the finder used to ship.
+  w.finding("f4", "c1", { snapshotId: "S1" }, "medium");
+  w.result("f4", true);
+  const c = check(w, "S1", "openIssues");
+  assert.equal(c.pass, false);
+  assert.equal(c.detail, "f4 (medium) reproduced");
+  assert.equal(c.overall, false);
+  w.finding("f5", "d1", { submissionId: "s1" }, "low");
+  w.result("f5", true);
+  assert.equal(check(w, "S1", "openIssues").detail, "f4 (medium) reproduced; f5 (low) reproduced");
 });
 
 test("openIssues: findings on the snapshot or a covered ancestor snapshot block; on another snapshot they do not", () => {

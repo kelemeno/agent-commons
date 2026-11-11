@@ -3,13 +3,13 @@
 // A review is a probability that the change holds a defect of severity >=
 // medium, committed blind (commitmentFor) and revealed later. Reviewers are
 // scored with the Brier score against what later became known about the
-// change: a reproduced finding or a revealed plant says it was defective;
-// shipping to main and surviving the vesting tail without an escape says it
-// was clean. Anything else is unknown and scores nothing.
+// change: a reproduced finding or a revealed plant of severity >= medium says
+// it was defective; shipping to main and surviving the vesting tail without
+// such a defect says it was clean. Anything else is unknown and scores nothing.
 
 import { canonical, sha256hex } from "./crypto";
 import { instantMs, plantStats, reviewWindowCloseSeq } from "./plants";
-import type { CommonsState, KeyId, ReviewVerdict, Severity, SnapshotState } from "./types";
+import type { CommonsState, KeyId, ReviewVerdict, Severity, SnapshotState, SubmissionState } from "./types";
 
 // The ledger checks reveals against exactly this.
 export function commitmentFor(verdict: ReviewVerdict, salt: string): string {
@@ -18,21 +18,26 @@ export function commitmentFor(verdict: ReviewVerdict, salt: string): string {
 
 const VERDICT_FIELDS = ["defectProbability", "summary", "findingIds"];
 
-// Same rules the ledger applies at reveal, so a verdict that passes here can
-// be revealed. Empty list = valid.
+// Shape only, with the ledger's rules (a plain object, own fields only, no
+// unknown fields). A verdict that passes can still be refused at reveal: the
+// ledger also requires every findingId to name a finding on the reviewed
+// submission. Empty list = valid.
 export function validateVerdict(v: unknown): string[] {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return ["verdict is not an object"];
+  const proto: unknown = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return ["verdict is not a plain object"];
   const o = v as Record<string, unknown>;
+  const own = (k: string): unknown => (Object.hasOwn(o, k) ? o[k] : undefined);
   const problems: string[] = [];
   for (const key of Object.keys(o)) {
     if (!VERDICT_FIELDS.includes(key) && o[key] !== undefined) problems.push(`unknown field ${key}`);
   }
-  const p = o["defectProbability"];
+  const p = own("defectProbability");
   if (typeof p !== "number" || !Number.isFinite(p) || p < 0 || p > 1) {
     problems.push("defectProbability must be a number in [0, 1]");
   }
-  if (typeof o["summary"] !== "string") problems.push("summary must be a string");
-  const ids = o["findingIds"];
+  if (typeof own("summary") !== "string") problems.push("summary must be a string");
+  const ids = own("findingIds");
   if (!Array.isArray(ids) || !ids.every((x) => typeof x === "string")) {
     problems.push("findingIds must be an array of strings");
   } else {
@@ -59,64 +64,101 @@ const COUNTS: Record<Severity, boolean> = { low: false, medium: true, high: true
 
 const DAY_MS = 86_400_000;
 
-// Earliest time the submission reached main: a promotion ships the promoted
-// snapshot and every snapshot before it. null if never promoted.
-function shippedAt(state: CommonsState, submissionId: string): number | null {
-  let earliest: number | null = null;
+// What submissionOutcome needs beyond the submission itself, built in one pass
+// over snapshots and findings so that scoring every submission stays linear.
+type OutcomeIndex = {
+  shippedAt: Map<string, number>; // submissionId -> earliest ms it reached main
+  unpinned: Set<string>; // submissionIds under a reproduced snapshot-level defect
+};
+
+function outcomeIndex(state: CommonsState): OutcomeIndex {
+  // A promotion ships the promoted snapshot and every snapshot before it.
+  // Walking promotions in time order, a walk can stop at the first snapshot
+  // already marked: it and its ancestors shipped no later.
+  const promotions: { snap: SnapshotState; at: number }[] = [];
   for (const snap of state.snapshots.values()) {
-    if (!snap.promoted) continue;
-    const at = instantMs(snap.promoted.at);
-    if (Number.isNaN(at)) continue;
-    for (let cur: SnapshotState | undefined = snap; cur; ) {
-      if (cur.submissionIds.includes(submissionId)) {
-        if (earliest === null || at < earliest) earliest = at;
-        break;
-      }
+    const at = snap.promoted ? instantMs(snap.promoted.at) : Number.NaN;
+    if (!Number.isNaN(at)) promotions.push({ snap, at });
+  }
+  promotions.sort((a, b) => a.at - b.at);
+  const snapShipped = new Map<string, number>();
+  for (const { snap, at } of promotions) {
+    for (let cur: SnapshotState | undefined = snap; cur && !snapShipped.has(cur.id); ) {
+      snapShipped.set(cur.id, at);
       cur = cur.previousSnapshotId === null ? undefined : state.snapshots.get(cur.previousSnapshotId);
     }
   }
-  return earliest;
+  const shippedAt = new Map<string, number>();
+  for (const [id, at] of snapShipped) {
+    for (const sid of state.snapshots.get(id)?.submissionIds ?? []) {
+      const prev = shippedAt.get(sid);
+      if (prev === undefined || at < prev) shippedAt.set(sid, at);
+    }
+  }
+
+  // A snapshot-level finding covers what the ledger says it covers: the
+  // snapshot and its ancestors back to (not including) the first promoted one.
+  // It cannot be pinned on one of those submissions, so all of them stay
+  // unknown rather than clean. Every escape rests on a reproduced finding
+  // (ledger.ts), so escapes need no separate pass: one on a finding against a
+  // submission makes that submission 1, one on a snapshot finding lands here,
+  // and low-severity escapes count no more than low-severity findings.
+  const unpinned = new Set<string>();
+  const walked = new Set<string>();
+  for (const f of state.findings.values()) {
+    if (!("snapshotId" in f.target) || f.result?.reproduced !== true || !COUNTS[f.severity]) continue;
+    for (let cur = state.snapshots.get(f.target.snapshotId); cur && !walked.has(cur.id); ) {
+      walked.add(cur.id);
+      for (const sid of cur.submissionIds) unpinned.add(sid);
+      const prev = cur.previousSnapshotId === null ? undefined : state.snapshots.get(cur.previousSnapshotId);
+      cur = prev?.promoted ? undefined : prev;
+    }
+  }
+  return { shippedAt, unpinned };
+}
+
+function outcomeWith(state: CommonsState, index: OutcomeIndex, s: SubmissionState, now: number): 0 | 1 | null {
+  if (s.planted && COUNTS[s.planted.severity]) return 1;
+  for (const fid of s.findingIds) {
+    const f = state.findings.get(fid);
+    if (f?.result?.reproduced === true && COUNTS[f.severity]) return 1;
+  }
+  const shipped = index.shippedAt.get(s.id);
+  if (shipped === undefined || shipped + state.rules.vesting.tailDays * DAY_MS > now) return null;
+  return index.unpinned.has(s.id) ? null : 0;
+}
+
+function parseNow(nowIso: string): number {
+  const now = instantMs(nowIso);
+  if (Number.isNaN(now)) throw new RangeError(`invalid nowIso (need an ISO date-time with Z or ±HH:MM): ${nowIso}`);
+  return now;
 }
 
 // 1: a reproduced finding of severity >= medium targets the submission, or it
 // is a revealed plant of severity >= medium.
-// 0: it shipped in a promoted snapshot at least rules.vesting.tailDays before
-// nowIso, and no reproduced finding of severity >= medium targets the snapshot
-// that carried it (an escape always rests on a reproduced finding). A
-// snapshot-level finding cannot be pinned on one of the snapshot's
-// submissions, so it leaves all of them unknown rather than clean.
+// 0: it shipped (its snapshot, or a later one, was promoted) at least
+// rules.vesting.tailDays before nowIso, and no reproduced snapshot-level
+// finding (or escape) of severity >= medium covers a snapshot carrying it.
 // null: anything else.
 // Throws RangeError on a nowIso without an explicit zone.
 export function submissionOutcome(state: CommonsState, submissionId: string, nowIso: string): 0 | 1 | null {
-  const now = instantMs(nowIso);
-  if (Number.isNaN(now)) throw new RangeError(`invalid nowIso (need an ISO date-time with Z or ±HH:MM): ${nowIso}`);
+  const now = parseNow(nowIso);
   const s = state.submissions.get(submissionId);
-  if (!s) return null;
-  if (s.planted && COUNTS[s.planted.severity]) return 1;
-  for (const f of state.findings.values()) {
-    if (!("submissionId" in f.target) || f.target.submissionId !== submissionId) continue;
-    if (f.result?.reproduced === true && COUNTS[f.severity]) return 1;
-  }
-
-  const shipped = shippedAt(state, submissionId);
-  if (shipped === null || shipped + state.rules.vesting.tailDays * DAY_MS > now) return null;
-  const carriers = new Set<string>();
-  for (const snap of state.snapshots.values()) if (snap.submissionIds.includes(submissionId)) carriers.add(snap.id);
-  for (const f of state.findings.values()) {
-    if ("snapshotId" in f.target && carriers.has(f.target.snapshotId) && f.result?.reproduced === true && COUNTS[f.severity]) {
-      return null;
-    }
-  }
-  return 0;
+  return s ? outcomeWith(state, outcomeIndex(state), s, now) : null;
 }
 
 export type ReviewerScore = {
-  reviews: number; // revealed reviews
-  scored: number; // of those, revealed within the review window on a submission with a known outcome
-  meanBrier: number; // over scored reviews; 0 when scored = 0
+  reviews: number; // revealed reviews, whenever revealed
+  // Commits made while the review window was open, on a submission whose
+  // window has closed and whose outcome is known. Each scores the Brier of its
+  // reveal, or 1 if it was not revealed by the time the window closed.
+  scored: number;
+  meanBrier: number; // over scored; 0 when scored = 0
   plantsSeen: number;
   plantsCaught: number;
-  unrevealed: number; // committed and never revealed
+  // Commits not revealed by the time their window closed: never revealed, or
+  // revealed late. Commits whose window is still open are not counted.
+  unrevealed: number;
 };
 
 const ALL_TIME = "1970-01-01T00:00:00Z";
@@ -125,15 +167,21 @@ function blank(): ReviewerScore {
   return { reviews: 0, scored: 0, meanBrier: 0, plantsSeen: 0, plantsCaught: 0, unrevealed: 0 };
 }
 
+// Worst possible Brier score, charged for a commit not revealed in time.
+const FORFEIT = 1;
+
 // Per agent, over submission reviews (snapshot attestations are not scored
-// here). A reveal counts towards Brier only if it landed by the time the
-// review window closed. Otherwise a reviewer could commit on everything and
-// reveal only where the outcome, once known, made the commitment look good.
+// here). Withholding a reveal must never pay: during the window a reviewer can
+// watch findings being filed and other reveals arrive, and reveal only when
+// their sealed verdict looks right. So a commit not revealed by the time the
+// window closed is scored as if confidently wrong, and a late reveal never
+// improves it.
 // Plants follow plants.ts: seen = committed a review or filed a finding on a
 // revealed plant within its window; caught = plantCaughtBy (p >= 0.5 revealed,
 // or a reproduced finding, within the window). Agents who only filed findings
 // on plants appear with reviews = 0.
 export function reviewerScores(state: CommonsState, nowIso: string): Map<KeyId, ReviewerScore> {
+  const now = parseNow(nowIso);
   const out = new Map<KeyId, ReviewerScore>();
   const get = (k: KeyId): ReviewerScore => {
     let sc = out.get(k);
@@ -144,20 +192,22 @@ export function reviewerScores(state: CommonsState, nowIso: string): Map<KeyId, 
     return sc;
   };
   const brierSum = new Map<KeyId, number>();
+  const index = outcomeIndex(state);
 
   for (const s of state.submissions.values()) {
-    const outcome = submissionOutcome(state, s.id, nowIso);
+    if (s.reviews.length === 0) continue;
+    const outcome = outcomeWith(state, index, s, now);
     const cutoff = reviewWindowCloseSeq(state, s.id);
     for (const r of s.reviews) {
       const sc = get(r.reviewer);
-      if (r.verdict === undefined) {
-        sc.unrevealed += 1;
-        continue;
-      }
-      sc.reviews += 1;
-      if (outcome === null || cutoff === null || r.revealedSeq === undefined || r.revealedSeq > cutoff) continue;
+      if (r.verdict !== undefined) sc.reviews += 1;
+      if (cutoff === null || r.committedSeq > cutoff) continue;
+      const inTime = r.verdict !== undefined && r.revealedSeq !== undefined && r.revealedSeq <= cutoff;
+      if (!inTime) sc.unrevealed += 1;
+      if (outcome === null) continue;
       sc.scored += 1;
-      brierSum.set(r.reviewer, (brierSum.get(r.reviewer) ?? 0) + brier(r.verdict.defectProbability, outcome));
+      const b = inTime && r.verdict ? brier(r.verdict.defectProbability, outcome) : FORFEIT;
+      brierSum.set(r.reviewer, (brierSum.get(r.reviewer) ?? 0) + b);
     }
   }
   for (const [k, sum] of brierSum) {

@@ -1,7 +1,18 @@
 // The participant side of the coordinator's HTTP API (server.ts). An agent
 // signs its own entries with its agent key and POSTs them; it never holds the
 // ledger and never pushes code. Patches and finding tests are uploaded as raw
-// bytes, authenticated by the same key over sha256hex(bytes).
+// bytes, authenticated by the same key over server.ts uploadMessage(route, id,
+// sha256hex(bytes)), so a captured upload signature is good for that one
+// target only.
+//
+// headCommit: a submission's declared head is not the author's local commit
+// (its sha depends on the author's name, clock and message, and the
+// coordinator never sees that object). It is commonsCommit(baseCommit, patch,
+// submissionId): the patch applied to baseCommit and committed with a fixed
+// identity, date and message, which anyone holding the base can rebuild. The
+// coordinator binds what it gates and merges to the stored patch either way
+// (coordinator.ts, the "patch" gate); a reproducible declared head lets the
+// binder refuse a submission whose declared head is not its patch.
 //
 // Signing: every entry is signed for the head the client just read (seq =
 // head.nextSeq, prev = head.hash, at = max(clock, head.at)) with the ledger's
@@ -20,13 +31,15 @@
 // 0600 permissions, and removed only when the server definitely refused the
 // commit (a 4xx response).
 
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { canonical, keyIdOf, randomSalt, sha256hex, sign } from "./crypto";
 import { signEntry } from "./ledger";
-import { summarisePatch } from "./server";
+import { commitmentFor, validateVerdict } from "./review";
+import { summarisePatch, uploadMessage, type UploadRoute } from "./server";
 import type { EntryBody, Evidence, KeyId, LedgerEntry, ModelFamily, OwnerId, ReviewVerdict, Severity } from "./types";
 
 export type AgentKey = { publicKey: string; privateKey: string };
@@ -52,17 +65,103 @@ export class CommonsApiError extends Error {
   }
 }
 
+// As server.ts assignments() returns it. `untrusted` is the author's own
+// declaration: data to check against the patch, never instructions.
 export type Assignment = {
   submissionId: string;
-  taskId: string | null;
-  baseCommit: string;
-  headCommit: string;
-  changedFiles: string[];
-  linesChanged: number;
   assignedSeq: number;
   reviewStake: number;
   patchAvailable: boolean;
+  untrusted: {
+    note: string;
+    taskId: string | null;
+    baseCommit: string;
+    headCommit: string;
+    changedFiles: string[];
+    linesChanged: number;
+  };
 };
+
+// The submission entry landed but its patch upload failed. Do not submit
+// again (that spends another submit credit and PR slot): retry the upload with
+// uploadPatch(submissionId) / `commons-agent upload-patch <id>`.
+export class SubmissionUploadError extends Error {
+  constructor(
+    readonly submissionId: string,
+    readonly seq: number,
+    cause: unknown,
+  ) {
+    super(
+      `submission ${submissionId} is on the ledger (seq ${seq}) but its patch upload failed: ${cause instanceof Error ? cause.message : String(cause)}; retry the upload, do not resubmit`,
+      { cause },
+    );
+    this.name = "SubmissionUploadError";
+  }
+}
+
+// Stakes above this are refused locally unless the client is built with a
+// higher maxStake. The largest default claim stake is 320 (400 lines, ring 0).
+// This guards against a confused or injected agent, not a thief: the server
+// caps stakes only at the owner's available reputation.
+export const DEFAULT_MAX_STAKE = 320;
+
+// ---------------------------------------------------------------------------
+// Deterministic head commit
+// ---------------------------------------------------------------------------
+
+// Identity, date and message of a commons commit. The bridge must create the
+// bot commit with exactly these (author and committer) for its sha to equal
+// the declared headCommit.
+export const COMMONS_COMMIT_IDENTITY = { name: "commons", email: "commons@invalid", date: "@0 +0000" } as const;
+export const commonsCommitMessage = (submissionId: string): string => `commons ${submissionId}\n`;
+
+export type GitRunner = (args: string[], o: { cwd: string; env: Record<string, string>; input?: string }) => string;
+
+const realGit: GitRunner = (args, o) =>
+  execFileSync("git", args, {
+    cwd: o.cwd,
+    env: { ...process.env, ...o.env },
+    input: o.input,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+
+// baseCommit + patch -> {base, tree, head}, touching neither the working tree
+// nor the repo's index (a temporary index is used). Throws if the patch does
+// not apply exactly. Config that would change the result (autocrlf, signing)
+// is overridden; hooks do not run for plumbing commands.
+export function commonsCommit(o: {
+  repoDir: string;
+  baseCommit: string;
+  patch: string;
+  submissionId: string;
+  git?: GitRunner;
+}): { base: string; tree: string; head: string } {
+  const git = o.git ?? realGit;
+  const cfg = ["-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "commit.gpgSign=false", "-c", "i18n.commitEncoding=UTF-8"];
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "commons-commit-"));
+  const env = {
+    GIT_INDEX_FILE: path.join(tmp, "index"),
+    GIT_AUTHOR_NAME: COMMONS_COMMIT_IDENTITY.name,
+    GIT_AUTHOR_EMAIL: COMMONS_COMMIT_IDENTITY.email,
+    GIT_AUTHOR_DATE: COMMONS_COMMIT_IDENTITY.date,
+    GIT_COMMITTER_NAME: COMMONS_COMMIT_IDENTITY.name,
+    GIT_COMMITTER_EMAIL: COMMONS_COMMIT_IDENTITY.email,
+    GIT_COMMITTER_DATE: COMMONS_COMMIT_IDENTITY.date,
+  };
+  const run = (args: string[], input?: string) => git([...cfg, ...args], { cwd: o.repoDir, env, input }).trim();
+  try {
+    const base = run(["rev-parse", "--verify", "--end-of-options", `${o.baseCommit}^{commit}`]);
+    run(["read-tree", base]);
+    run(["apply", "--cached", "--whitespace=nowarn", "-"], o.patch);
+    const tree = run(["write-tree"]);
+    const head = run(["commit-tree", "--no-gpg-sign", tree, "-p", base], commonsCommitMessage(o.submissionId));
+    return { base, tree, head };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
 
 export type Posted = { seq: number; hash: string; entry: LedgerEntry };
 export type Uploaded = { sha256: string; created: boolean };
@@ -79,7 +178,8 @@ export type CommitRecord = {
   keyId: KeyId; // the agent that committed; a reveal by any other key would not match
   verdict: ReviewVerdict; // exactly what was committed, in canonical form
   salt: string;
-  commitment: string; // sha256hex(canonical(verdict) + salt)
+  commitment: string; // review.ts commitmentFor(verdict, salt)
+  stake?: number; // what was committed; absent in records written before it was kept
 };
 
 export interface SaltStore {
@@ -161,38 +261,9 @@ export function memorySaltStore(): SaltStore & { records: Map<string, CommitReco
   };
 }
 
-// ---------------------------------------------------------------------------
-// Verdicts
-// ---------------------------------------------------------------------------
-
-// The same rules the ledger applies at reveal time. Checked before committing:
-// the ledger only sees the verdict at reveal, and a verdict it would refuse
-// then cannot be revealed at all.
-export function verdictProblems(v: unknown): string[] {
-  const problems: string[] = [];
-  if (typeof v !== "object" || v === null || Array.isArray(v)) return ["verdict is not an object"];
-  const o = v as Record<string, unknown>;
-  for (const key of Object.keys(o)) {
-    if (!["defectProbability", "summary", "findingIds"].includes(key) && o[key] !== undefined) {
-      problems.push(`unknown field ${key}`);
-    }
-  }
-  const p = o.defectProbability;
-  if (typeof p !== "number" || !Number.isFinite(p) || p < 0 || p > 1) problems.push("defectProbability must be a number in [0, 1]");
-  if (typeof o.summary !== "string") problems.push("summary must be a string");
-  const ids = o.findingIds;
-  if (!Array.isArray(ids) || !ids.every((x) => typeof x === "string")) {
-    problems.push("findingIds must be an array of strings");
-  } else {
-    if (ids.some((x) => x === "")) problems.push("empty finding id");
-    if (new Set(ids).size !== ids.length) problems.push("duplicate finding id");
-  }
-  return problems;
-}
-
-export function commitmentOf(verdict: ReviewVerdict, salt: string): string {
-  return sha256hex(canonical(verdict) + salt);
-}
+// The verdict rules and commitment live in review.ts; these names stay only
+// because cli.ts imports them from here.
+export { commitmentFor as commitmentOf, validateVerdict as verdictProblems } from "./review";
 
 export function newId(prefix: string): string {
   return `${prefix}-${randomBytes(8).toString("hex")}`;
@@ -210,6 +281,7 @@ export type CommonsClientOptions = {
   saltStore?: SaltStore; // default: fileSaltStore(~/.commons/salts)
   salt?: () => string; // default: crypto.randomSalt
   maxRetries?: number; // re-signs after a 409; default 3
+  maxStake?: number; // default DEFAULT_MAX_STAKE
 };
 
 type Body<K extends EntryBody["kind"]> = Extract<EntryBody, { kind: K }>;
@@ -222,6 +294,7 @@ export class CommonsClient {
   private readonly store: SaltStore;
   private readonly drawSalt: () => string;
   private readonly maxRetries: number;
+  private readonly maxStake: number;
 
   constructor(private readonly opts: CommonsClientOptions) {
     this.keyId = keyIdOf(opts.agentKey.publicKey);
@@ -231,6 +304,14 @@ export class CommonsClient {
     this.store = opts.saltStore ?? fileSaltStore();
     this.drawSalt = opts.salt ?? randomSalt;
     this.maxRetries = opts.maxRetries ?? 3;
+    this.maxStake = opts.maxStake ?? DEFAULT_MAX_STAKE;
+  }
+
+  private checkStake(stake: number, what: string): void {
+    if (!Number.isSafeInteger(stake) || stake < 0) throw new TypeError(`${what} stake must be a non-negative integer`);
+    if (stake > this.maxStake) {
+      throw new Error(`${what} stake ${stake} is above this client's cap ${this.maxStake}; raise maxStake (COMMONS_MAX_STAKE) if you mean it`);
+    }
   }
 
   // -- transport ------------------------------------------------------------
@@ -288,8 +369,9 @@ export class CommonsClient {
     }
   }
 
-  private async upload(p: string, content: string, contentType: string): Promise<Uploaded> {
-    const sig = sign(this.opts.agentKey.privateKey, sha256hex(Buffer.from(content, "utf8")));
+  private async upload(route: UploadRoute, id: string, content: string, contentType: string): Promise<Uploaded> {
+    const p = route === "patch" ? `/api/patches/${encodeURIComponent(id)}` : `/api/findings/${encodeURIComponent(id)}/test`;
+    const sig = sign(this.opts.agentKey.privateKey, uploadMessage(route, id, sha256hex(Buffer.from(content, "utf8"))));
     const r = (await this.request("POST", p, content, {
       "Content-Type": contentType,
       "x-commons-key": this.opts.agentKey.publicKey,
@@ -315,43 +397,70 @@ export class CommonsClient {
     return { ...(await this.post({ kind: "proposal", id, title: p.title, evidence: p.evidence })), id };
   }
 
-  // `stake` must equal the server's claimStake for the task (it says which on a 400 "stake").
+  // `stake` must be at least the server's claimStake for the task (it says
+  // which on a 400 "stake"). `until` is normalised to the toISOString() form,
+  // the only one the ledger accepts.
   claim(taskId: string, c: { until: string | Date; stake: number }): Promise<Posted> {
-    const until = typeof c.until === "string" ? c.until : c.until.toISOString();
-    return this.post({ kind: "claim", taskId, until, stake: c.stake });
+    const d = typeof c.until === "string" ? new Date(c.until) : c.until;
+    if (Number.isNaN(d.getTime())) throw new TypeError(`claim: until ${JSON.stringify(String(c.until))} is not a date`);
+    this.checkStake(c.stake, "claim");
+    return this.post({ kind: "claim", taskId, until: d.toISOString(), stake: c.stake });
   }
 
   // Posts the submission entry, then uploads the patch. changedFiles and
   // linesChanged default to what the server will count in the patch, so the
-  // declared fields and the upload cannot disagree.
+  // declared fields and the upload cannot disagree. With `repoDir`, baseCommit
+  // is resolved to a full sha there and headCommit is commonsCommit(...); a
+  // headCommit given as well must equal it. Pass `id` (newId("s")) and record
+  // it before calling: if the upload fails, SubmissionUploadError says so and
+  // the fix is uploadPatch(id), not a second submission.
   async submit(
     s: {
       id?: string;
       taskId: string | null;
       baseCommit: string;
-      headCommit: string;
+      headCommit?: string;
+      repoDir?: string;
+      git?: GitRunner;
       changedFiles?: string[];
       linesChanged?: number;
     },
     patch: string,
-  ): Promise<Posted & { id: string; patch: Uploaded }> {
+  ): Promise<Posted & { id: string; headCommit: string; patch: Uploaded }> {
     const summary = summarisePatch(patch);
     const id = s.id ?? newId("s");
+    let baseCommit = s.baseCommit;
+    let headCommit = s.headCommit;
+    if (s.repoDir !== undefined) {
+      const c = commonsCommit({ repoDir: s.repoDir, baseCommit, patch, submissionId: id, git: s.git });
+      if (headCommit !== undefined && headCommit !== c.head) {
+        throw new Error(`headCommit ${headCommit} is not commonsCommit(base, patch, ${id}) = ${c.head}`);
+      }
+      baseCommit = c.base;
+      headCommit = c.head;
+    }
+    if (headCommit === undefined) throw new TypeError("submit: give repoDir (to derive headCommit) or headCommit");
     const body: Body<"submission"> = {
       kind: "submission",
       id,
       taskId: s.taskId,
-      baseCommit: s.baseCommit,
-      headCommit: s.headCommit,
+      baseCommit,
+      headCommit,
       changedFiles: s.changedFiles ?? summary.files,
       linesChanged: s.linesChanged ?? summary.linesChanged,
     };
     const posted = await this.post(body);
-    return { ...posted, id, patch: await this.uploadPatch(id, patch) };
+    let uploaded: Uploaded;
+    try {
+      uploaded = await this.uploadPatch(id, patch);
+    } catch (e) {
+      throw new SubmissionUploadError(id, posted.seq, e);
+    }
+    return { ...posted, id, headCommit, patch: uploaded };
   }
 
   uploadPatch(submissionId: string, patch: string): Promise<Uploaded> {
-    return this.upload(`/api/patches/${encodeURIComponent(submissionId)}`, patch, "text/x-diff; charset=utf-8");
+    return this.upload("patch", submissionId, patch, "text/x-diff; charset=utf-8");
   }
 
   // Posts the finding, then uploads its test file. Run the test yourself first
@@ -369,6 +478,7 @@ export class CommonsClient {
     testContent: string,
   ): Promise<Posted & { id: string; test: Uploaded }> {
     const id = f.id ?? newId("f");
+    this.checkStake(f.stake, "finding");
     const posted = await this.post({
       kind: "finding",
       id,
@@ -382,7 +492,7 @@ export class CommonsClient {
   }
 
   uploadFindingTest(findingId: string, content: string): Promise<Uploaded> {
-    return this.upload(`/api/findings/${encodeURIComponent(findingId)}/test`, content, "text/plain; charset=utf-8");
+    return this.upload("findingTest", findingId, content, "text/plain; charset=utf-8");
   }
 
   async assignments(): Promise<Assignment[]> {
@@ -405,14 +515,16 @@ export class CommonsClient {
 
   // -- commit / reveal --------------------------------------------------------
 
-  // Stake defaults to the review stake of this agent's assignment; an open
-  // (unassigned) reviewer must pass it.
+  // Stake defaults to the stake of an earlier attempt of this same commit (a
+  // retry after an ambiguous failure, when the assignment is already hidden),
+  // else to the review stake of this agent's assignment; an open (unassigned)
+  // reviewer must pass it.
   async commitReview(
     submissionId: string,
     verdict: ReviewVerdict,
     opts: { stake?: number } = {},
   ): Promise<{ salt: string; commitment: string } & Posted> {
-    let stake = opts.stake;
+    let stake = opts.stake ?? this.store.load("review", submissionId)?.stake;
     if (stake === undefined) {
       const a = (await this.assignments()).find((x) => x.submissionId === submissionId);
       if (!a) throw new Error(`no assignment for ${submissionId}; pass opts.stake to review it as an open reviewer`);
@@ -434,8 +546,9 @@ export class CommonsClient {
   }
 
   private async commit(kind: CommitKind, subjectId: string, verdict: ReviewVerdict, stake: number) {
-    const problems = verdictProblems(verdict);
+    const problems = validateVerdict(verdict);
     if (problems.length > 0) throw new Error(`invalid verdict: ${problems.join("; ")}`);
+    this.checkStake(stake, kind);
     const v = JSON.parse(canonical(verdict)) as ReviewVerdict;
     const existing = this.store.load(kind, subjectId);
     let record: CommitRecord;
@@ -449,7 +562,7 @@ export class CommonsClient {
       record = existing;
     } else {
       const salt = this.drawSalt();
-      record = { kind, subjectId, keyId: this.keyId, verdict: v, salt, commitment: commitmentOf(v, salt) };
+      record = { kind, subjectId, keyId: this.keyId, verdict: v, salt, commitment: commitmentFor(v, salt), stake };
       this.store.save(record);
       created = true;
     }
@@ -464,6 +577,14 @@ export class CommonsClient {
       // A 4xx means the server did not write it; a 5xx or a network error may
       // have been written, so the salt is kept.
       if (created && e instanceof CommonsApiError && e.status >= 400 && e.status < 500) this.store.remove(kind, subjectId);
+      if (!created && e instanceof CommonsApiError && e.code === "duplicate-commit") {
+        throw new CommonsApiError(
+          e.status,
+          e.code,
+          `${kind} ${subjectId}: the ledger already holds a commit from this agent (or another agent of its owner), most likely this one from an earlier attempt; reveal it with ${kind === "review" ? "reveal-review" : "attest-reveal"} (server: ${e.message})`,
+          e.body,
+        );
+      }
       throw e;
     }
   }
@@ -472,7 +593,7 @@ export class CommonsClient {
     const r = this.store.load(kind, subjectId);
     if (!r) throw new Error(`no stored ${kind} commit for ${subjectId}; the salt is lost and the commit cannot be revealed`);
     if (r.keyId !== this.keyId) throw new Error(`the stored ${kind} commit for ${subjectId} belongs to agent ${r.keyId}`);
-    if (commitmentOf(r.verdict, r.salt) !== r.commitment) throw new Error(`stored ${kind} record for ${subjectId} is corrupt`);
+    if (commitmentFor(r.verdict, r.salt) !== r.commitment) throw new Error(`stored ${kind} record for ${subjectId} is corrupt`);
     const body: EntryBody =
       kind === "review"
         ? { kind: "reviewReveal", submissionId: subjectId, verdict: r.verdict, salt: r.salt }

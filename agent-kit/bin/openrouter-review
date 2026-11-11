@@ -1,0 +1,11 @@
+#!/bin/sh
+# Runs scripts/openrouter-review.ts of the kit this file belongs to. Same
+# rules as ./commons-agent: call it by absolute path from a kit installed
+# outside the checkout under review, with a private tsx cache.
+set -eu
+kit="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)"
+TMPDIR="${HOME:?}/.commons/tmp"
+mkdir -p "$TMPDIR"
+chmod 700 "$HOME/.commons" "$TMPDIR"
+export TMPDIR
+exec "$kit/node_modules/.bin/tsx" "$kit/scripts/openrouter-review.ts" "$@"

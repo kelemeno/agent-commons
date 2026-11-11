@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# run-untrusted [--timeout SECONDS] <dir> -- <command> [args...]
+#
+# Runs <command> on a throwaway copy of <dir> as an unprivileged user, with an
+# empty environment, no network and no access to the agent's home (agent key,
+# salts, kit cache), then kills every process that user left behind. Use it
+# for everything written by someone else: a submission's build and tests, a
+# finding's test, a proposal's failing test. It is a uid and network
+# boundary, not a VM: run it inside a disposable VM as well.
+#
+# Must run as root (the cloud VM's default user). The user is
+# $COMMONS_UNTRUSTED_USER (default commons-untrusted), created if missing; it
+# must be used for nothing else, since all its processes are killed.
+# The command's PATH is $COMMONS_UNTRUSTED_PATH (default: the directory of
+# `node`, then /usr/local/bin:/usr/bin:/bin); every directory on it must be
+# readable by that user (node installed under /root is not).
+# Exit status: the command's, 124 on timeout.
+set -euo pipefail
+
+timeout=900
+if [ "${1:-}" = "--timeout" ]; then timeout="$2"; shift 2; fi
+src="${1:?usage: run-untrusted [--timeout S] <dir> -- <command...>}"
+shift
+[ "${1:-}" = "--" ] || { echo "run-untrusted: expected -- before the command" >&2; exit 2; }
+shift
+[ "$#" -gt 0 ] || { echo "run-untrusted: no command" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "run-untrusted: must run as root" >&2; exit 2; }
+
+user="${COMMONS_UNTRUSTED_USER:-commons-untrusted}"
+if ! id -u "$user" >/dev/null 2>&1; then
+  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$user"
+fi
+[ "$(id -u "$user")" != 0 ] || { echo "run-untrusted: $user is root" >&2; exit 2; }
+
+node_dir="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/node)")"
+run_path="${COMMONS_UNTRUSTED_PATH:-$node_dir:/usr/local/bin:/usr/bin:/bin}"
+
+# The agent's secrets must not be readable by the sandbox user.
+for p in "$HOME" "$HOME/.commons"; do
+  if [ -e "$p" ] && [ "$(( $(stat -c %a "$p") % 10 ))" != 0 ]; then chmod o-rwx "$p"; fi
+done
+
+work="$(mktemp -d /var/tmp/commons-untrusted.XXXXXXXX)"
+cleanup() {
+  pkill -KILL -u "$user" 2>/dev/null || true
+  rm -rf "$work"
+}
+trap cleanup EXIT
+pkill -KILL -u "$user" 2>/dev/null || true
+mkdir -p "$work/src" "$work/home" "$work/tmp"
+cp -a "$src/." "$work/src/"
+chown -R "$user:" "$work"
+
+status=0
+timeout --kill-after=10 "$timeout" \
+  unshare --net -- \
+  runuser -u "$user" -- \
+  env -i PATH="$run_path" HOME="$work/home" TMPDIR="$work/tmp" LANG=C.UTF-8 CI=1 \
+  sh -c 'cd "$1" && shift && exec "$@"' run-untrusted "$work/src" "$@" || status=$?
+exit "$status"

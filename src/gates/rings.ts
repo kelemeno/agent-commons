@@ -9,10 +9,12 @@
 // them: a gate never guesses what such a path means.
 //
 // What checkRingImports catches: relative import/export-from/require/dynamic
-// import specifiers, Vite's import.meta.glob and `new URL(lit, import.meta.url)`
-// (worker and asset references, which the bundler follows), string escapes in
-// specifiers, comments between tokens, symlinks out of ring 2, and computed
-// dynamic imports it cannot follow (those fail). What it does not: bare
+// import specifiers, Vite's import.meta.glob* (with type arguments and the
+// options it can read) and `new URL(lit, import.meta.url)` (worker and asset
+// references, which the bundler follows), string and identifier escapes,
+// comments between tokens, kernel paths spelled in another letter case (a
+// case-insensitive filesystem resolves them), symlinks out of ring 2, and
+// computed references it cannot follow (those fail). What it does not: bare
 // specifiers, including aliases configured in vite/tsconfig files (those
 // files are ring 0, so adding an alias is itself a kernel change), and
 // transitive imports through ring-1 modules. The scan reads the raw text
@@ -21,7 +23,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ringOf as ruleRingOf } from "../rules";
+import { globToRegExp } from "../rules";
 import type { GateReport, Ring, Rules } from "../types";
 
 export const GATE = "rings";
@@ -40,7 +42,36 @@ export function normalizeRepoPath(p: string): string | null {
 // unusable path is ring 0: the most scrutiny for what cannot be classified.
 export function ringOf(p: string, rules: Rules): Ring {
   const n = normalizeRepoPath(p);
-  return n === null ? 0 : ruleRingOf(n, rules);
+  return n === null ? 0 : classify(n, rules);
+}
+
+// rules.ringOf with the globs compiled once per rings table (rules.ts compiles
+// them on every call, and a glob walk classifies thousands of paths). Rules
+// come from ledger state and are never mutated in place, so the array is a
+// sound cache key.
+type RingTable = { exact: RegExp; folded: RegExp; ring: Ring }[];
+const tables = new WeakMap<Rules["rings"], RingTable>();
+
+function table(rules: Rules): RingTable {
+  let t = tables.get(rules.rings);
+  if (t === undefined) {
+    t = rules.rings.map(({ glob, ring }) => {
+      const exact = globToRegExp(glob);
+      return { exact, folded: new RegExp(exact.source, `${exact.flags}i`), ring };
+    });
+    tables.set(rules.rings, t);
+  }
+  return t;
+}
+
+function classify(n: string, rules: Rules): Ring {
+  return table(rules).find((r) => r.exact.test(n))?.ring ?? 1;
+}
+
+// Whether a path the bundler might load is kernel, under the exact spelling or
+// under case folding: on a case-insensitive filesystem `src/Engine` is engine.ts.
+function isKernel(n: string, rules: Rules): boolean {
+  return classify(n, rules) === 0 || (table(rules).find((r) => r.folded.test(n))?.ring ?? 1) === 0;
 }
 
 // The lowest ring touched. An empty change touches nothing and is ring 1, the
@@ -50,72 +81,120 @@ export function submissionRing(files: string[], rules: Rules): Ring {
   return Math.min(...files.map((f) => ringOf(f, rules))) as Ring;
 }
 
-const CODE_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|html?)$/;
-const RESOLVE_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts", "/index.ts", "/index.tsx", "/index.js"];
-const GLOB_WALK_LIMIT = 20_000;
+export const CODE_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|html?)$/;
+// Vite's default resolve.extensions (.mjs .js .mts .ts .jsx .tsx .json) and
+// their index files, plus what TypeScript resolves.
+export const RESOLVE_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts", ".cjs", ".cts", ".json"].flatMap((x) =>
+  x === "" ? [""] : [x, `/index${x}`],
+);
+// Paths one gate run may lstat, over all files, specifiers and glob walks: a
+// submission crafted to make the gate walk forever fails instead.
+const PATH_BUDGET = 50_000;
+
+export type RingImportOptions = {
+  // Changed files the diff deletes (repo-relative). Only these may be absent
+  // from the checkout: any other absent ring-2 file (an uninitialised
+  // submodule, a sparse checkout) could not be read, so it fails.
+  deleted?: Iterable<string>;
+};
+
+type Run = {
+  root: string;
+  rules: Rules;
+  budget: number;
+  globs: Map<string, string | null>; // walk result by prefix
+  specs: Map<string, string | null>; // checkSpecifier result by dir + spec
+};
+
+class OverBudget extends Error {}
 
 // Reads the changed ring-2 files under `repoDir` (the checkout at the
 // submission's head) and fails if any import resolves into ring 0, if a
-// changed ring-2 file is a symlink out of ring 2, or if any changed path is
-// unusable. Missing files are deletions and are skipped.
-export function checkRingImports(repoDir: string, files: string[], rules: Rules): GateReport {
-  const root = fs.realpathSync(repoDir);
+// changed ring-2 file is a symlink out of ring 2 or is absent without being
+// deleted, or if any changed path is unusable.
+export function checkRingImports(repoDir: string, files: string[], rules: Rules, opts: RingImportOptions = {}): GateReport {
+  const run: Run = { root: fs.realpathSync(repoDir), rules, budget: PATH_BUDGET, globs: new Map(), specs: new Map() };
+  const deleted = new Set<string>();
+  for (const d of opts.deleted ?? []) {
+    const n = normalizeRepoPath(d);
+    if (n !== null) deleted.add(n);
+  }
   const problems: string[] = [];
   let scanned = 0;
-  let missing = 0;
-  for (const raw of files) {
-    const file = normalizeRepoPath(raw);
-    if (file === null) {
-      problems.push(`${JSON.stringify(raw)} is not a path inside the repository`);
-      continue;
-    }
-    if (ruleRingOf(file, rules) !== 2) continue;
-    const abs = path.join(root, file);
-    let lst: fs.Stats;
-    try {
-      lst = fs.lstatSync(abs);
-    } catch {
-      missing += 1;
-      continue;
-    }
-    // realpath also catches a symlinked parent directory, not only a link file.
-    const real = realLocation(root, abs, lst);
-    if (real !== file && (real === null || ruleRingOf(real, rules) !== 2)) {
-      problems.push(`${file} is a symlink to ${real ?? "a path outside the repository"}, outside ring 2`);
-      continue;
-    }
-    let st: fs.Stats;
-    try {
-      st = fs.statSync(abs);
-    } catch {
-      continue; // a dangling link whose target is ring 2: nothing to read
-    }
-    if (!st.isFile() || !CODE_FILE.test(file)) continue;
-    scanned += 1;
-    const source = fs.readFileSync(abs, "utf8");
-    const dirs = [...new Set([path.posix.dirname(file), path.posix.dirname(real ?? file)])];
-    const lineOf = lineIndex(source);
-    for (const ref of scanImports(source)) {
-      const where = `${file}:${lineOf(ref.index)}`;
-      if (ref.spec === null) {
-        problems.push(`${where}: ${ref.how} with a computed specifier cannot be checked`);
+  let removed = 0;
+  try {
+    for (const raw of files) {
+      const file = normalizeRepoPath(raw);
+      if (file === null) {
+        problems.push(`${JSON.stringify(raw)} is not a path inside the repository`);
         continue;
       }
-      for (const dir of dirs) {
-        const why = ref.how === "import.meta.glob" ? checkGlob(root, dir, ref.spec, rules) : checkSpecifier(root, dir, ref.spec, rules);
-        if (why !== null) {
-          problems.push(`${where}: ${ref.how} ${JSON.stringify(ref.spec)} ${why}`);
-          break;
-        }
-      }
+      if (classify(file, rules) !== 2) continue;
+      const r = checkChangedFile(run, file, deleted, problems);
+      if (r === "scanned") scanned += 1;
+      else if (r === "deleted") removed += 1;
     }
+  } catch (e) {
+    if (!(e instanceof OverBudget)) throw e;
+    problems.push(`more than ${PATH_BUDGET} paths to check: the change cannot be checked`);
   }
   if (problems.length > 0) return { gate: GATE, pass: false, details: listProblems(problems) };
   return {
     gate: GATE,
     pass: true,
-    details: `no ring-2 file reaches ring 0 (${scanned} ring-2 code files scanned${missing > 0 ? `, ${missing} absent (deleted)` : ""})`,
+    details: `no ring-2 file reaches ring 0 (${scanned} ring-2 code files scanned${removed > 0 ? `, ${removed} deleted` : ""})`,
   };
+}
+
+function lstat(run: Run, abs: string): fs.Stats | null {
+  if (--run.budget < 0) throw new OverBudget();
+  try {
+    return fs.lstatSync(abs);
+  } catch {
+    return null;
+  }
+}
+
+function checkChangedFile(run: Run, file: string, deleted: Set<string>, problems: string[]): "scanned" | "deleted" | "skipped" {
+  const { root, rules } = run;
+  const abs = path.join(root, file);
+  const lst = lstat(run, abs);
+  if (lst === null) {
+    if (deleted.has(file)) return "deleted";
+    problems.push(`${file} is not present in the checkout and cannot be checked (uninitialised submodule?)`);
+    return "skipped";
+  }
+  // realpath also catches a symlinked parent directory, not only a link file.
+  const real = realLocation(root, abs, lst);
+  if (real !== file && (real === null || classify(real, rules) !== 2)) {
+    problems.push(`${file} is a symlink to ${real ?? "a path outside the repository"}, outside ring 2`);
+    return "skipped";
+  }
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(abs);
+  } catch {
+    return "skipped"; // a dangling link whose target is ring 2: nothing to read
+  }
+  if (!st.isFile() || !CODE_FILE.test(file)) return "skipped";
+  const source = decodeIdentifierEscapes(fs.readFileSync(abs, "utf8"));
+  const dirs = [...new Set([path.posix.dirname(file), path.posix.dirname(real ?? file)])];
+  const lineOf = lineIndex(source);
+  for (const ref of scanImports(source)) {
+    const where = `${file}:${lineOf(ref.index)}`;
+    if (ref.spec === null) {
+      problems.push(`${where}: ${ref.how} ${ref.reason ?? "with a computed specifier"} cannot be checked`);
+      continue;
+    }
+    for (const dir of dirs) {
+      const why = ref.how === "import.meta.glob" ? checkGlob(run, dir, ref.spec) : checkSpecifier(run, dir, ref.spec);
+      if (why !== null) {
+        problems.push(`${where}: ${ref.how} ${JSON.stringify(ref.spec)} ${why}`);
+        break;
+      }
+    }
+  }
+  return "scanned";
 }
 
 // Gate details end up in a ledger entry; a crafted file must not bloat it.
@@ -140,34 +219,45 @@ function realLocation(root: string, abs: string, lst: fs.Stats): string | null {
 }
 
 // Why a specifier from a file in `dir` reaches ring 0, or null if it does not.
-// Every resolution candidate is classified, existing or not (a submodule or
-// a file absent from this checkout is still what the bundler would load), and
-// each existing one also by where its symlinks really lead.
-function checkSpecifier(root: string, dir: string, spec: string, rules: Rules): string | null {
-  if (/^(?:\/|file:)/i.test(spec)) return "is absolute and cannot be checked";
-  const bare = spec.replace(/[?#].*$/s, "");
-  if (!/^\.\.?(?:\/|$)/.test(bare)) return null; // a package (or alias) import
-  const lexical = normalizeRepoPath(path.posix.join(dir, bare));
-  if (lexical === null) return "resolves outside the repository";
-  const candidates = RESOLVE_SUFFIXES.map((s) => lexical + s);
-  // TypeScript ESM style: `./engine.js` names engine.ts.
-  const m = /\.([cm]?)js(x?)$/.exec(lexical);
-  if (m) {
-    const stem = lexical.slice(0, -m[0].length);
-    candidates.push(`${stem}.${m[1] ?? ""}ts${m[2] ?? ""}`, `${stem}.ts`, `${stem}.tsx`);
+// Every resolution candidate is classified, existing or not (a file absent
+// from this checkout is still what the bundler would load), and each existing
+// one also by where its symlinks really lead. `?` and `#` start a query in
+// ESM and Vite but are path characters to CommonJS require(), so both
+// readings are judged.
+function checkSpecifier(run: Run, dir: string, spec: string): string | null {
+  const key = `${dir}\0${spec}`;
+  let why = run.specs.get(key);
+  if (why === undefined) {
+    why = resolveSpecifier(run, dir, spec);
+    run.specs.set(key, why);
   }
-  for (const c of candidates) {
-    if (ruleRingOf(c, rules) === 0) return `resolves to ring-0 ${c}`;
-    const abs = path.join(root, c);
-    let lst: fs.Stats;
-    try {
-      lst = fs.lstatSync(abs);
-    } catch {
-      continue;
+  return why;
+}
+
+function resolveSpecifier(run: Run, dir: string, spec: string): string | null {
+  const { root, rules } = run;
+  if (/^(?:\/|file:)/i.test(spec)) return "is absolute and cannot be checked";
+  const stripped = spec.replace(/[?#].*$/s, "");
+  for (const reading of stripped === spec ? [spec] : [stripped, spec]) {
+    if (!/^\.\.?(?:\/|$)/.test(reading)) continue; // a package (or alias) import
+    const lexical = normalizeRepoPath(path.posix.join(dir, reading));
+    if (lexical === null) return "resolves outside the repository";
+    const candidates = RESOLVE_SUFFIXES.map((x) => lexical + x);
+    // TypeScript ESM style: `./engine.js` names engine.ts.
+    const m = /\.([cm]?)js(x?)$/.exec(lexical);
+    if (m) {
+      const stem = lexical.slice(0, -m[0].length);
+      candidates.push(`${stem}.${m[1] ?? ""}ts${m[2] ?? ""}`, `${stem}.ts`, `${stem}.tsx`);
     }
-    const real = realLocation(root, abs, lst);
-    if (real === null) return `resolves through a symlink outside the repository (${c})`;
-    if (ruleRingOf(real, rules) === 0) return `resolves through a symlink to ring-0 ${real}`;
+    for (const c of candidates) {
+      if (isKernel(c, rules)) return `resolves to ring-0 ${c}`;
+      const abs = path.join(root, c);
+      const lst = lstat(run, abs);
+      if (lst === null) continue;
+      const real = realLocation(root, abs, lst);
+      if (real === null) return `resolves through a symlink outside the repository (${c})`;
+      if (classify(real, rules) === 0) return `resolves through a symlink to ring-0 ${real}`;
+    }
   }
   return null;
 }
@@ -175,35 +265,42 @@ function checkSpecifier(root: string, dir: string, spec: string, rules: Rules): 
 // import.meta.glob patterns: the static part of the pattern (before the first
 // wildcard segment) must lie in ring 2, and nothing under it on disk may be
 // ring 0 or a symlink out of ring 2. This over-approximates what the pattern
-// matches, which is the safe direction.
-function checkGlob(root: string, dir: string, pattern: string, rules: Rules): string | null {
+// matches, which is the safe direction. A pattern without wildcards names one
+// file, judged like a specifier whether or not it exists here.
+function checkGlob(run: Run, dir: string, pattern: string): string | null {
+  const { rules } = run;
   if (pattern.startsWith("!")) return null; // negations only exclude
   if (pattern.startsWith("/")) return "is absolute and cannot be checked";
   if (!/^\.\.?\//.test(pattern)) return null;
   const lexical = normalizeRepoPath(path.posix.join(dir, pattern));
   if (lexical === null) return "resolves outside the repository";
   const segments = lexical.split("/");
-  const firstWild = segments.findIndex((s) => /[*?[\]{}()!+@]/.test(s));
+  const firstWild = segments.findIndex((x) => /[*?[\]{}()!+@]/.test(x));
+  if (firstWild < 0 && isKernel(lexical, rules)) return `names ring-0 ${lexical}`;
   const prefix = (firstWild < 0 ? segments : segments.slice(0, firstWild)).join("/");
-  if (prefix === "" || ruleRingOf(`${prefix}/__commons_probe__`, rules) !== 2) return `reaches outside ring 2 (${prefix || "."})`;
+  if (prefix === "" || classify(`${prefix}/__commons_probe__`, rules) !== 2) return `reaches outside ring 2 (${prefix || "."})`;
+  let why = run.globs.get(prefix);
+  if (why === undefined) {
+    why = walk(run, prefix);
+    run.globs.set(prefix, why);
+  }
+  return why;
+}
+
+function walk(run: Run, prefix: string): string | null {
+  const { root, rules } = run;
   const stack = [prefix];
-  let seen = 0;
   while (stack.length > 0) {
     const rel = stack.pop() as string;
-    if (++seen > GLOB_WALK_LIMIT) return `matches more than ${GLOB_WALK_LIMIT} paths and cannot be checked`;
     const abs = path.join(root, rel);
-    let lst: fs.Stats;
-    try {
-      lst = fs.lstatSync(abs);
-    } catch {
-      continue;
-    }
+    const lst = lstat(run, abs);
+    if (lst === null) continue;
     // Directories are not classified: `anthill-frontend` the submodule
     // pointer is ring 0, the files under it are not.
-    if (!lst.isDirectory() && ruleRingOf(rel, rules) === 0) return `can match ring-0 ${rel}`;
+    if (!lst.isDirectory() && classify(rel, rules) === 0) return `can match ring-0 ${rel}`;
     if (lst.isSymbolicLink()) {
       const real = realLocation(root, abs, lst);
-      if (real === null || ruleRingOf(real, rules) !== 2) return `can match ${rel}, a symlink outside ring 2`;
+      if (real === null || classify(real, rules) !== 2) return `can match ${rel}, a symlink outside ring 2`;
     } else if (lst.isDirectory()) {
       for (const name of fs.readdirSync(abs)) stack.push(`${rel}/${name}`);
     }
@@ -217,14 +314,32 @@ function checkGlob(root: string, dir: string, pattern: string, rules: Rules): st
 
 export type ImportRef = {
   how: "from" | "import" | "import()" | "require()" | "import.meta.glob" | "new URL()";
-  spec: string | null; // null: a computed specifier
-  index: number;
+  spec: string | null; // null: a reference the gate cannot read
+  reason?: string; // why spec is null, when it is not simply a computed specifier
+  index: number; // into decodeIdentifierEscapes(src)
 };
+
+// `require(...)` is a require to every JS parser. Escapes that decode to
+// an ASCII letter, `_` or `$` are replaced by that character everywhere: in
+// an identifier that exposes the keyword, and inside a string, template or
+// regex literal it means the same character either way. Escaped backslashes
+// are consumed in pairs so `"\\u0072"` (a backslash, then u0072) is kept.
+// Lines are unchanged, so line numbers agree with the original file.
+export function decodeIdentifierEscapes(src: string): string {
+  return src.replace(/\\\\|\\u(?:\{([0-9a-fA-F]{1,8})\}|([0-9a-fA-F]{4}))/g, (m, cp: string | undefined, u4: string | undefined) => {
+    const hex = cp ?? u4;
+    if (hex === undefined) return m;
+    const code = parseInt(hex, 16);
+    const c = code <= 0x7f ? String.fromCharCode(code) : "";
+    return /^[A-Za-z_$]$/.test(c) ? c : m;
+  });
+}
 
 // Every module reference in `src`. Linear in the source length: comment
 // skipping is memoised and searches the precomputed comment ends, so a file
 // crafted with thousands of unterminated comments cannot stall the gate.
-export function scanImports(src: string): ImportRef[] {
+export function scanImports(source: string): ImportRef[] {
+  const src = decodeIdentifierEscapes(source);
   const refs: ImportRef[] = [];
   const skip = skipper(src);
   // The index just past `tokens`, each preceded by optional whitespace and
@@ -247,6 +362,7 @@ export function scanImports(src: string): ImportRef[] {
     const after = src[skip(lit.end)];
     return after === "," || after === ")" ? lit.value : null;
   };
+  const globName = /glob[\w$]*/y;
   // `x.import(` and `x.from "` are member names, not keywords; `module.require(` is a require.
   const word = /(?<![\w$])(?:from|import|new|require)(?![\w$])/g;
   for (let m = word.exec(src); m !== null; m = word.exec(src)) {
@@ -260,52 +376,143 @@ export function scanImports(src: string): ImportRef[] {
       if (expect(e, "(") !== null) refs.push({ how: "require()", spec: callArg(e), index: k });
     } else if (m[0] === "import") {
       const j = skip(e);
-      const glob = expect(e, ".", "meta", ".", "globEager") ?? expect(e, ".", "meta", ".", "glob");
+      const meta = expect(e, ".", "meta", ".");
       if (src[j] === '"' || src[j] === "'") {
         const lit = readLiteral(src, j, false);
         if (lit !== null) refs.push({ how: "import", spec: lit.value, index: k });
       } else if (src[j] === "(") {
         refs.push({ how: "import()", spec: callArg(e), index: k });
-      } else if (glob !== null) {
-        for (const spec of globArgs(src, skip, glob)) refs.push({ how: "import.meta.glob", spec, index: k });
+      } else if (meta !== null) {
+        // import.meta.glob, globEager, globEagerDefault, ...: every Vite variant.
+        globName.lastIndex = skip(meta);
+        if (globName.exec(src) === null) continue;
+        const call = globCall(src, skip, globName.lastIndex);
+        if (typeof call === "string") refs.push({ how: "import.meta.glob", spec: null, reason: call, index: k });
+        else for (const spec of call) refs.push({ how: "import.meta.glob", spec, index: k });
       }
     } else {
-      // new URL("lit", import.meta.url): Vite bundles the target.
+      // new URL("lit", import.meta.url): Vite bundles the target, and turns an
+      // interpolated template into a glob it cannot be checked against.
       const open = expect(e, "URL", "(");
       if (open === null) continue;
       const lit = readLiteral(src, skip(open), true);
-      if (lit === null || lit.value === null) continue;
+      if (lit === null) continue;
       if (expect(lit.end, ",", "import", ".", "meta", ".", "url") !== null) refs.push({ how: "new URL()", spec: lit.value, index: k });
     }
   }
   return refs;
 }
 
-// import.meta.glob("p") or import.meta.glob(["p", "q"]); anything else is a
-// pattern the gate cannot read, reported as one computed reference.
-function globArgs(src: string, skip: (i: number) => number, e: number): (string | null)[] {
-  const open = skip(e);
-  if (src[open] !== "(") return [];
-  let p = skip(open + 1);
-  if (src[p] !== "[") {
-    const lit = readLiteral(src, p, true);
-    return [lit === null ? null : lit.value];
+// Options of import.meta.glob the gate understands. Anything else, `base`
+// above all (it re-roots relative patterns), makes the call unreadable.
+const GLOB_OPTIONS = new Set(["eager", "import", "query", "as", "exhaustive"]);
+
+// The patterns of `import.meta.glob<T>(pattern | [patterns], options?)` whose
+// name ends at e, or why the call cannot be read.
+function globCall(src: string, skip: (i: number) => number, e: number): (string | null)[] | string {
+  let p = skip(e);
+  if (src[p] === "<") {
+    const q = skipTypeArgs(src, p);
+    if (q === null) return "with type arguments the gate cannot read";
+    p = skip(q);
   }
-  const out: (string | null)[] = [];
+  if (src[p] !== "(") return "used other than as a call";
   p = skip(p + 1);
-  while (src[p] !== "]") {
+  const out: (string | null)[] = [];
+  if (src[p] === "[") {
+    p = skip(p + 1);
+    while (src[p] !== "]") {
+      const lit = readLiteral(src, p, true);
+      if (lit === null || lit.value === null) return "with a computed pattern";
+      out.push(lit.value);
+      p = skip(lit.end);
+      if (src[p] === ",") p = skip(p + 1);
+      else if (src[p] !== "]") return "with a computed pattern";
+    }
+    p = skip(p + 1);
+  } else {
     const lit = readLiteral(src, p, true);
-    if (lit === null || lit.value === null) return [null];
+    if (lit === null || lit.value === null) return "with a computed pattern";
     out.push(lit.value);
     p = skip(lit.end);
-    if (src[p] === ",") p = skip(p + 1);
-    else if (src[p] !== "]") return [null];
   }
+  if (src[p] === ",") {
+    p = skip(p + 1);
+    if (src[p] !== ")") {
+      const q = readObject(src, skip, p, GLOB_OPTIONS);
+      if (q === null) return "with options other than eager/import/query/as/exhaustive literals";
+      p = skip(q);
+      if (src[p] === ",") p = skip(p + 1);
+    }
+  }
+  if (src[p] !== ")") return "with arguments the gate cannot read";
   return out;
 }
 
+// An object literal at p whose keys are in `keys` (any key when null, which
+// also forbids nesting) and whose values are string or boolean literals, or a
+// nested object for `query`. Returns the index past `}`, or null.
+function readObject(src: string, skip: (i: number) => number, p: number, keys: Set<string> | null): number | null {
+  if (src[p] !== "{") return null;
+  p = skip(p + 1);
+  while (src[p] !== "}") {
+    let key: string | null;
+    const lit = readLiteral(src, p, false);
+    if (lit !== null) {
+      key = lit.value;
+      p = lit.end;
+    } else {
+      const id = /[A-Za-z_$][\w$]*/y;
+      id.lastIndex = p;
+      key = id.exec(src)?.[0] ?? null;
+      p = id.lastIndex;
+    }
+    if (key === null || (keys !== null && !keys.has(key))) return null;
+    p = skip(p);
+    if (src[p] !== ":") return null;
+    p = skip(p + 1);
+    const value = readLiteral(src, p, true);
+    const bool = /(?:true|false)(?![\w$])/y;
+    bool.lastIndex = p;
+    if (value !== null) {
+      if (value.value === null) return null;
+      p = value.end;
+    } else if (bool.exec(src) !== null) {
+      p = bool.lastIndex;
+    } else if (keys !== null && key === "query" && src[p] === "{") {
+      const q = readObject(src, skip, p, null);
+      if (q === null) return null;
+      p = q;
+    } else return null;
+    p = skip(p);
+    if (src[p] === ",") p = skip(p + 1);
+    else if (src[p] !== "}") return null;
+  }
+  return p + 1;
+}
+
+// The index past a balanced `<...>` type argument list at p, or null. `=>`
+// inside (function types) does not close a bracket; strings are skipped.
+// Bounded, so an unclosed `<` costs little.
+function skipTypeArgs(src: string, p: number): number | null {
+  let depth = 0;
+  for (let i = p; i < src.length && i < p + 2048; i++) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === "`") {
+      const lit = readLiteral(src, i, true);
+      if (lit === null) return null;
+      i = lit.end - 1;
+    } else if (c === "<") depth++;
+    else if (c === ">" && src[i - 1] !== "=") {
+      if (--depth === 0) return i + 1;
+    }
+  }
+  return null;
+}
+
 // A string literal (or a template literal when allowed) starting at i: its
-// cooked value (null for a template with `${`) and the index just past it.
+// cooked value (null for a template with `${` or an invalid escape) and the
+// index just past it.
 function readLiteral(src: string, i: number, template: boolean): { value: string | null; end: number } | null {
   const q = src[i];
   if (q !== '"' && q !== "'" && !(template && q === "`")) return null;
@@ -326,18 +533,25 @@ function readLiteral(src: string, i: number, template: boolean): { value: string
 }
 
 // JS string escapes, so "\x2e\x2e/engine" is read as the "../engine" it is.
-// An escape that is not valid JS yields null (treated as computed: fails).
+// An escape that is not valid in strict code yields null (treated as
+// computed: fails): legacy octal `\56` and `\8` mean "." and "8" to sloppy
+// scripts and CommonJS, and the gate does not guess which one a file is.
 function unescape(body: string): string | null {
   const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", "0": "\0" };
   try {
-    return body.replace(/\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|(\r\n|[\s\S]))/g, (_, cp, u4, x2, ch) => {
-      const hex = (cp ?? u4 ?? x2) as string | undefined;
-      if (hex !== undefined) return String.fromCodePoint(parseInt(hex, 16));
-      const c = ch as string;
-      if (c === "\n" || c === "\r" || c === "\r\n" || c === "\u2028" || c === "\u2029") return "";
-      if (c === "u" || c === "x") throw new Error("bad escape");
-      return simple[c] ?? c;
-    });
+    return body.replace(
+      /\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|(\r\n|[\s\S]))/g,
+      (m: string, cp: string | undefined, u4: string | undefined, x2: string | undefined, ch: string | undefined, at: number) => {
+        const hex = cp ?? u4 ?? x2;
+        if (hex !== undefined) return String.fromCodePoint(parseInt(hex, 16));
+        const c = ch as string;
+        if (c === "\n" || c === "\r" || c === "\r\n" || c === " " || c === " ") return "";
+        if (c === "u" || c === "x" || /[1-9]/.test(c) || (c === "0" && /[0-9]/.test(body[at + m.length] ?? ""))) {
+          throw new Error("bad escape");
+        }
+        return simple[c] ?? c;
+      },
+    );
   } catch {
     return null;
   }
@@ -383,10 +597,12 @@ function skipper(src: string): (i: number) => number {
   };
 }
 
+// Whether the word at k follows a member-access dot. A spread `...import(x)`
+// is not one: the import is real.
 function afterDot(src: string, k: number): boolean {
   let i = k - 1;
   while (i >= 0 && /\s/.test(src[i] as string)) i--;
-  return src[i] === ".";
+  return src[i] === "." && src[i - 1] !== ".";
 }
 
 // Index of the first element >= x in an ascending array (its length if none).

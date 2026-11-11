@@ -414,7 +414,7 @@ test("reviewerScores: nothing known means scored 0 and meanBrier 0", (t) => {
   assert.deepEqual(b, { reviews: 1, scored: 0, meanBrier: 0, plantsSeen: 0, plantsCaught: 0, unrevealed: 0 });
 });
 
-test("gaming: revealing only after the outcome is known scores nothing", (t) => {
+test("gaming: revealing only after the outcome is known scores as a forfeit", (t) => {
   const w = setup(t);
   w.submit("X").assign("X", ["b1"]);
   w.commit("X", "b1", verdict(0.3));
@@ -423,14 +423,15 @@ test("gaming: revealing only after the outcome is known scores nothing", (t) => 
   w.finding({ submissionId: "X" }, "d1", "high", true);
   w.reveal("X", "e1", verdict(0.95)); // revealed once the defect is public
   const scores = reviewerScores(w.state, w.now());
-  assert.deepEqual(scores.get(w.id("e1")), { reviews: 1, scored: 0, meanBrier: 0, plantsSeen: 0, plantsCaught: 0, unrevealed: 0 });
+  // A perfect-looking late reveal earns nothing: scored as Brier 1, and visible as unrevealed.
+  assert.deepEqual(scores.get(w.id("e1")), { reviews: 1, scored: 1, meanBrier: 1, plantsSeen: 0, plantsCaught: 0, unrevealed: 1 });
   const b = scores.get(w.id("b1"));
   assert.ok(b);
   assert.equal(b.scored, 1);
   close(b.meanBrier, brier(0.3, 1));
 });
 
-test("gaming: a reviewer who never reveals is recorded as unrevealed, not as a review", (t) => {
+test("gaming: a reviewer who never reveals is unrevealed and scored as confidently wrong", (t) => {
   const w = setup(t);
   w.submit("X").assign("X", ["b1"]);
   w.commit("X", "b1", verdict(0.3));
@@ -438,7 +439,7 @@ test("gaming: a reviewer who never reveals is recorded as unrevealed, not as a r
   w.reveal("X", "b1", verdict(0.3));
   w.finding({ submissionId: "X" }, "d1", "high", true);
   const e = reviewerScores(w.state, w.now()).get(w.id("e1"));
-  assert.deepEqual(e, { reviews: 0, scored: 0, meanBrier: 0, plantsSeen: 0, plantsCaught: 0, unrevealed: 1 });
+  assert.deepEqual(e, { reviews: 0, scored: 1, meanBrier: 1, plantsSeen: 0, plantsCaught: 0, unrevealed: 1 });
 });
 
 test("reviewerScores: a plant caught by a reproduced finding counts for the finder", (t) => {
@@ -456,7 +457,9 @@ test("reviewerScores: a plant caught by a reproduced finding counts for the find
   assert.ok(b);
   assert.equal(b.plantsSeen, 1);
   assert.equal(b.plantsCaught, 0);
-  assert.equal(b.scored, 0);
+  assert.equal(b.scored, 1, "the late reveal is scored as a forfeit");
+  assert.equal(b.meanBrier, 1);
+  assert.equal(b.unrevealed, 1);
 });
 
 test("reviewerScores is deterministic and the same after reopening the ledger", (t) => {
@@ -466,4 +469,110 @@ test("reviewerScores is deterministic and the same after reopening the ledger", 
   const a = reviewerScores(w.state, after);
   assert.deepEqual(reviewerScores(Ledger.open(w.ledger.path).state(), after), a);
   assert.deepEqual(reviewerScores(w.state, after), a);
+});
+
+// ---------------------------------------------------------------------------
+// Regressions from review
+// ---------------------------------------------------------------------------
+
+test("gaming: withholding a reveal until a finding reproduces does not erase a wrong call", (t) => {
+  // b1 commits p = 0.05 on two submissions, sees a high finding filed, waits
+  // for it to reproduce and only then reveals. c1 reveals honestly.
+  const w = setup(t);
+  for (const id of ["X1", "X2"]) {
+    w.submit(id).assign(id, ["b1", "c1"]);
+    w.commit(id, "b1", verdict(0.05));
+    w.commit(id, "c1", verdict(0.05));
+    w.reveal(id, "c1", verdict(0.05));
+    w.finding({ submissionId: id }, "d1", "high", true); // closes the window
+    w.reveal(id, "b1", verdict(0.05));
+  }
+  const scores = reviewerScores(w.state, w.now());
+  const b = scores.get(w.id("b1"));
+  const c = scores.get(w.id("c1"));
+  assert.ok(b && c);
+  assert.deepEqual(b, { reviews: 2, scored: 2, meanBrier: 1, plantsSeen: 0, plantsCaught: 0, unrevealed: 2 });
+  assert.equal(c.scored, 2);
+  close(c.meanBrier, brier(0.05, 1));
+  assert.ok(b.meanBrier >= c.meanBrier, "withholding never beats revealing");
+});
+
+test("reviewerScores: a commit whose window is still open is neither scored nor unrevealed", (t) => {
+  const w = setup(t);
+  w.submit("X").assign("X", ["b1", "c1"]);
+  w.commit("X", "b1", verdict(0.4));
+  w.commit("X", "c1", verdict(0.4));
+  w.reveal("X", "c1", verdict(0.4)); // b1 still to reveal: the window is open
+  const b = reviewerScores(w.state, w.now()).get(w.id("b1"));
+  assert.deepEqual(b, { reviews: 0, scored: 0, meanBrier: 0, plantsSeen: 0, plantsCaught: 0, unrevealed: 0 });
+});
+
+test("reviewerScores: a missed reveal on an unknown outcome is unrevealed but unscored", (t) => {
+  const w = setup(t);
+  w.submit("X").assign("X", ["b1"]);
+  w.commit("X", "b1", verdict(0.4));
+  w.merge("X"); // closes the window; nothing known about X yet
+  const b = reviewerScores(w.state, w.now()).get(w.id("b1"));
+  assert.deepEqual(b, { reviews: 0, scored: 0, meanBrier: 0, plantsSeen: 0, plantsCaught: 0, unrevealed: 1 });
+});
+
+test("reviewerScores throws on a bad nowIso even on an empty ledger", (t) => {
+  assert.throws(() => reviewerScores(setup(t).state, "2026-01-01T00:00:00"), RangeError);
+});
+
+test("outcome: a snapshot finding on a later snapshot leaves its unpromoted ancestors unknown", (t) => {
+  const w = setup(t);
+  w.submit("s1").reviewed("s1", { b1: 0.1 }).merge("s1").snapshot("snap1", ["s1"]);
+  w.submit("s2").reviewed("s2", { b1: 0.1 }).merge("s2").snapshot("snap2", ["s2"], "snap1");
+  const promoted = w.promote("snap2"); // ships snap1 too; snap1 itself was never promoted
+  w.finding({ snapshotId: "snap2" }, "c1", "high", true);
+  const after = iso(promoted + defaultRules().vesting.tailDays * DAY);
+  assert.equal(submissionOutcome(w.state, "s2", after), null);
+  assert.equal(submissionOutcome(w.state, "s1", after), null, "s1 is in what snap2 covers, so it may be the culprit");
+  assert.equal(reviewerScores(w.state, after).get(w.id("b1"))?.scored, 0, "nobody is rewarded for calling s1 clean");
+});
+
+test("outcome: a low-severity snapshot finding or escape does not block a clean outcome", (t) => {
+  const w = setup(t);
+  w.submit("s1").reviewed("s1", { b1: 0.1 }).merge("s1").snapshot("snap1", ["s1"]);
+  const promoted = w.promote("snap1");
+  const fid = w.finding({ snapshotId: "snap1" }, "c1", "low", true);
+  w.append({ kind: "escape", findingId: fid, snapshotId: "snap1" }, w.coord);
+  const after = iso(promoted + defaultRules().vesting.tailDays * DAY);
+  assert.equal(submissionOutcome(w.state, "s1", after), 0, "the verdict predicts defects of severity >= medium only");
+});
+
+test("outcome: shipped time is the earliest promotion that covers the submission", (t) => {
+  const w = setup(t);
+  w.submit("s1").reviewed("s1", { b1: 0.1 }).merge("s1").snapshot("snap1", ["s1"]);
+  const first = w.promote("snap1");
+  w.at(first + 10 * DAY);
+  w.submit("s2").reviewed("s2", { b1: 0.1 }).merge("s2").snapshot("snap2", ["s2"], "snap1");
+  w.promote("snap2");
+  const tail = defaultRules().vesting.tailDays * DAY;
+  assert.equal(submissionOutcome(w.state, "s1", iso(first + tail)), 0);
+  assert.equal(submissionOutcome(w.state, "s2", iso(first + tail)), null);
+});
+
+test("validateVerdict wants a plain object with its own fields, like the ledger", () => {
+  const inherited = Object.create({ defectProbability: 0.5, summary: "", findingIds: [] }) as unknown;
+  assert.deepEqual(validateVerdict(inherited), ["verdict is not a plain object"]);
+  class V {
+    defectProbability = 0.5;
+    summary = "";
+    findingIds: string[] = [];
+  }
+  assert.deepEqual(validateVerdict(new V()), ["verdict is not a plain object"]);
+  const bare = Object.assign(Object.create(null) as object, verdict(0.5));
+  assert.deepEqual(validateVerdict(bare), []);
+});
+
+test("validateVerdict checks shape only: the ledger also requires findings on this submission", (t) => {
+  const w = setup(t);
+  w.submit("s1").submit("s2").assign("s1", ["b1"]);
+  const elsewhere = w.finding({ submissionId: "s2" }, "c1", "high", false);
+  const v = { ...verdict(0.5), findingIds: [elsewhere] };
+  assert.deepEqual(validateVerdict(v), []);
+  w.commit("s1", "b1", v);
+  assert.throws(() => w.reveal("s1", "b1", v), (e: unknown) => e instanceof LedgerError && e.code === "invalid-target");
 });

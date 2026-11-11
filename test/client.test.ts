@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -9,12 +10,15 @@ import { generateKeyPair, keyIdOf, sha256hex, verify } from "../src/crypto";
 import {
   CommonsApiError,
   CommonsClient,
-  commitmentOf,
+  commonsCommit,
   fileSaltStore,
   memorySaltStore,
-  verdictProblems,
+  newId,
+  SubmissionUploadError,
   type FetchLike,
 } from "../src/client";
+import { commitmentFor, validateVerdict } from "../src/review";
+import { uploadMessage } from "../src/server";
 import {
   applyEntry,
   emptyState,
@@ -27,7 +31,14 @@ import {
 } from "../src/ledger";
 import { defaultRules } from "../src/rules";
 import { main as agentMain } from "../agent-kit/commons-agent";
-import { main as reviewMain, parseContent, parseVerdict, reviewDiff, stripInvisible } from "../scripts/openrouter-review";
+import {
+  checkModelId,
+  main as reviewMain,
+  parseContent,
+  parseVerdict,
+  reviewDiff,
+  stripInvisible,
+} from "../scripts/openrouter-review";
 import type { EntryBody, LedgerEntry, ReviewVerdict } from "../src/types";
 
 // ---------------------------------------------------------------------------
@@ -63,7 +74,11 @@ class FakeCoordinator {
   conflictsLeft = 0;
   headGets = 0;
   posts = 0;
+  conflicts409 = 0;
+  failUploads = 0; // answer 500 to the next N uploads
+  failEntriesWith = 0; // answer this status (without writing) to the next entry post
   patches = new Map<string, string>();
+  findingTests = new Map<string, string>();
   server: http.Server;
   baseUrl = "";
 
@@ -126,6 +141,11 @@ class FakeCoordinator {
     if (req.method === "POST" && url.pathname === "/api/entries") {
       this.posts++;
       const entry = JSON.parse(raw.toString("utf8")) as LedgerEntry;
+      if (this.failEntriesWith !== 0) {
+        const status = this.failEntriesWith;
+        this.failEntriesWith = 0;
+        return send(status, { error: "overloaded", message: "try later" });
+      }
       if (this.conflictsLeft > 0) {
         this.conflictsLeft--;
         this.append({ kind: "gateResult", submissionId: "s-bob", gate: "size", pass: true, details: "ok" }, this.coord);
@@ -134,7 +154,10 @@ class FakeCoordinator {
       const pk = this.state.publicKeys.get(entry.signer);
       if (!pk || !verify(pk, entryMessage(entry), entry.sig)) return send(400, { error: "signature", message: "bad sig" });
       const h = this.head();
-      if (entry.seq !== h.nextSeq || entry.prev !== h.hash) return send(409, { error: "head", message: "stale", head: h });
+      if (entry.seq !== h.nextSeq || entry.prev !== h.hash) {
+        this.conflicts409++;
+        return send(409, { error: "head", message: "stale", head: h });
+      }
       try {
         applyEntry(this.state, entry);
       } catch (e) {
@@ -144,16 +167,23 @@ class FakeCoordinator {
       return send(201, { seq: entry.seq, hash: entry.hash });
     }
     const pm = /^\/api\/patches\/([^/]+)$/.exec(url.pathname);
-    if (req.method === "POST" && pm) {
-      const sid = decodeURIComponent(pm[1] ?? "");
-      const s = this.state.submissions.get(sid);
+    const fm = /^\/api\/findings\/([^/]+)\/test$/.exec(url.pathname);
+    if (req.method === "POST" && (pm || fm)) {
+      const route = pm ? "patch" : "findingTest";
+      const id = decodeURIComponent((pm ?? fm)?.[1] ?? "");
+      const author = pm ? this.state.submissions.get(id)?.author : this.state.findings.get(id)?.by;
       const key = req.headers["x-commons-key"];
       const sig = req.headers["x-commons-sig"];
-      if (!s || typeof key !== "string" || typeof sig !== "string") return send(400, { error: "bad" });
-      if (this.state.publicKeys.get(s.author) !== key) return send(403, { error: "unauthorised" });
-      if (!verify(key, sha256hex(raw), sig)) return send(401, { error: "signature" });
-      this.patches.set(sid, raw.toString("utf8"));
-      return send(201, { submissionId: sid, sha256: sha256hex(raw), created: true });
+      if (author === undefined || typeof key !== "string" || typeof sig !== "string") return send(400, { error: "bad" });
+      if (this.failUploads > 0) {
+        this.failUploads--;
+        return send(500, { error: "internal", message: "disk full" });
+      }
+      if (this.state.publicKeys.get(author) !== key) return send(403, { error: "unauthorised" });
+      // server.ts verifyUpload: the signature covers purpose, route, id and digest.
+      if (!verify(key, uploadMessage(route, id, sha256hex(raw)), sig)) return send(401, { error: "signature" });
+      (pm ? this.patches : this.findingTests).set(id, raw.toString("utf8"));
+      return send(201, { sha256: sha256hex(raw), created: true });
     }
     if (req.method === "GET" && url.pathname === "/api/assignments") {
       const agent = url.searchParams.get("agent") ?? "";
@@ -311,7 +341,7 @@ test("commitReview stores the salt 0600 under <dir>/<submissionId>.json; revealR
     assert.equal((await c.assignments()).length, 1);
     const { salt, commitment } = await c.commitReview("s-bob", verdict); // stake from the assignment
     assert.equal(salt, "11".repeat(32));
-    assert.equal(commitment, commitmentOf(verdict, salt));
+    assert.equal(commitment, commitmentFor(verdict, salt));
     const file = path.join(dir, "s-bob.json");
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
@@ -391,7 +421,7 @@ test("reveal without a stored record fails clearly", async () => {
 
 test("fileSaltStore never overwrites a record and refuses unsafe ids", () => {
   const store = fileSaltStore(tmpDir());
-  const rec = { kind: "review" as const, subjectId: "s1", keyId: "k", verdict, salt: "x", commitment: commitmentOf(verdict, "x") };
+  const rec = { kind: "review" as const, subjectId: "s1", keyId: "k", verdict, salt: "x", commitment: commitmentFor(verdict, "x") };
   store.save(rec);
   assert.throws(() => store.save({ ...rec, salt: "y" }), /already exists/);
   assert.equal(store.load("review", "s1")?.salt, "x");

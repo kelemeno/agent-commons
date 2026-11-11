@@ -6,7 +6,7 @@ import * as path from "node:path";
 
 import { canonical, generateKeyPair, keyIdOf, sha256hex } from "../src/crypto";
 import { Ledger } from "../src/ledger";
-import { computeMetrics, gini, median, reciprocity, type MetricRow } from "../src/metrics";
+import { computeMetrics, gini, median, reciprocity, reviewConcentration, type MetricRow } from "../src/metrics";
 import { plantCommitment } from "../src/plants";
 import { claimStake, defaultRules } from "../src/rules";
 import { treeFromParents } from "../src/tree";
@@ -81,6 +81,13 @@ class World {
     this.agents.set(`${name}1`, a);
     this.append({ kind: "agentRegistered", owner: name, publicKey: a.publicKey, modelFamily: family, harness: "t" }, o);
   }
+  agent(name: string, owner: string, family: ModelFamily): void {
+    const a = key();
+    this.agents.set(name, a);
+    const o = this.owners.get(owner);
+    assert.ok(o, `no owner ${owner}`);
+    this.append({ kind: "agentRegistered", owner, publicKey: a.publicKey, modelFamily: family, harness: "t" }, o);
+  }
   submit(
     id: string,
     author: string,
@@ -102,6 +109,10 @@ class World {
       beacon: "b",
       reviewers: verdicts.map(([a]) => this.agentKey(a).keyId),
     });
+    this.openReview(id, verdicts);
+  }
+  // Reviewers who chose to review: no assignment names them.
+  openReview(id: string, verdicts: [string, number][]): void {
     const salts = verdicts.map(() => `salt${this.n++}`);
     const verdict = (p: number) => ({ defectProbability: p, summary: "", findingIds: [] });
     verdicts.forEach(([a, p], i) =>
@@ -120,12 +131,12 @@ class World {
   merge(id: string): void {
     this.coordinator({ kind: "merge", submissionId: id, commit: `m-${id}` });
   }
-  finding(id: string, finder: string, submissionId: string, reproduced: boolean | null): void {
+  finding(id: string, finder: string, target: string | { snapshotId: string }, reproduced: boolean | null): void {
     this.append(
       {
         kind: "finding",
         id,
-        target: { submissionId },
+        target: typeof target === "string" ? { submissionId: target } : target,
         severity: "high",
         testPath: `test/${id}.test.ts`,
         testCommand: "npm test",
@@ -143,11 +154,12 @@ class World {
       logDigest: "d",
     });
   }
-  plant(id: string, author: string, reviewer: string, p: number): void {
+  plant(id: string, author: string, reviewer: string, p: number, open = false): void {
     const salt = `ps${this.n++}`;
     this.append({ kind: "plantCommit", commitment: plantCommitment(id, salt) }, this.admin);
     this.submit(id, author);
-    this.review(id, [[reviewer, p]]);
+    if (open) this.openReview(id, [[reviewer, p]]);
+    else this.review(id, [[reviewer, p]]);
     this.append({ kind: "plantReveal", submissionId: id, salt, description: "d", severity: "high" }, this.admin);
   }
   proposal(id: string, by: string): void {
@@ -238,56 +250,133 @@ test("an empty commons: recall unmeasured is bad, absent rates are n/a and not b
   }
   assert.equal(get(rows, "failed gates").value, 0);
   assert.equal(get(rows, "reciprocity").value, 0);
+  assert.equal(get(rows, "open-review concentration").value, "n/a");
+  assert.equal(get(rows, "open-review concentration").bad, false);
+  assert.equal(get(rows, "most active agents of one owner").value, 0);
 });
 
-test("reciprocity: a pair that reviews each other is flagged and named", () => {
-  const w = people();
-  for (let i = 0; i < 6; i++) {
-    w.submit(`a${i}`, "alice1");
-    w.review(`a${i}`, [["bob1", 0.05]]);
-    w.submit(`b${i}`, "bob1");
-    w.review(`b${i}`, [["alice1", 0.05]]);
+// alice and bob open-review each other's work `n` times each way.
+function collude(w: World, n: number, prefix = ""): void {
+  for (let i = 0; i < n; i++) {
+    w.submit(`${prefix}a${i}`, "alice1");
+    w.openReview(`${prefix}a${i}`, [["bob1", 0.05]]);
+    w.submit(`${prefix}b${i}`, "bob1");
+    w.openReview(`${prefix}b${i}`, [["alice1", 0.05]]);
   }
-  w.submit("c0", "carol1");
-  w.review("c0", [["dave1", 0.1]]);
-  w.submit("c1", "carol1");
-  w.review("c1", [["erin1", 0.1]]);
+}
 
+test("reciprocity: a pair that open-reviews each other is flagged however much other reviewing there is", () => {
+  // Regression: the share used to be over every review in the commons, so
+  // honest (and beacon-drawn) reviewing elsewhere hid the pair.
+  const w = people();
+  collude(w, 6);
+  for (let i = 0; i < 20; i++) {
+    w.submit(`c${i}`, "carol1");
+    w.review(`c${i}`, [
+      ["dave1", 0.1],
+      ["erin1", 0.1],
+    ]);
+  }
   const rec = reciprocity(w.state);
-  assert.equal(rec.total, 14);
   assert.deepEqual(rec.pair, ["alice", "bob"]);
-  assert.ok(Math.abs(rec.share - 12 / 14) < 1e-12);
+  assert.equal(rec.mutual, 12);
+  assert.equal(rec.given, 12, "assigned reviews are not chosen and do not count");
+  assert.equal(rec.share, 1);
   const row = get(rowsOf(w), "reciprocity");
   assert.equal(row.bad, true);
-  assert.equal(row.value, 0.857);
-  assert.match(row.note, /alice ↔ bob exchanged 12 of 14 reviews/);
+  assert.equal(row.value, 1);
+  assert.match(row.note, /alice ↔ bob: 12 of the 12 open reviews they gave went to each other/);
 });
 
-test("reciprocity: one-way reviewing (a cycle) is not reciprocity; small samples are not judged", () => {
+test("reciprocity: reviews of revealed plants do not dilute the pair's share", () => {
   const w = people();
-  const ring = ["alice1", "bob1", "carol1", "dave1"];
-  for (let i = 0; i < 12; i++) {
-    const author = ring[i % 4] as string;
-    const reviewer = ring[(i + 1) % 4] as string;
-    w.submit(`x${i}`, author);
-    w.review(`x${i}`, [[reviewer, 0.1]]);
+  collude(w, 5);
+  const before = reciprocity(w.state);
+  for (let i = 0; i < 10; i++) {
+    w.plant(`pa${i}`, "erin1", "alice1", 0.9, true);
+    w.plant(`pb${i}`, "erin1", "bob1", 0.9, true);
   }
-  const row = get(rowsOf(w), "reciprocity");
-  assert.equal(row.value, 0);
-  assert.equal(row.bad, false);
-  assert.match(row.note, /12 reviews, no owner pair/);
+  assert.deepEqual(reciprocity(w.state), before);
+  assert.equal(before.share, 1);
+  assert.equal(get(rowsOf(w), "reciprocity").bad, true);
+});
+
+test("reciprocity: a busy reviewer is not a pair; small samples are not judged", () => {
+  const w = people();
+  // alice reviews everyone a lot, bob reviews alice once back.
+  for (const [author, n] of [
+    ["bob1", 5],
+    ["carol1", 5],
+    ["dave1", 5],
+  ] as const) {
+    for (let i = 0; i < n; i++) {
+      w.submit(`${author}-${i}`, author);
+      w.openReview(`${author}-${i}`, [["alice1", 0.1]]);
+    }
+  }
+  w.submit("back", "alice1");
+  w.openReview("back", [["bob1", 0.1]]);
+  const rec = reciprocity(w.state);
+  assert.deepEqual(rec.pair, ["alice", "bob"]);
+  assert.equal(rec.share, 2 / 16);
+  assert.equal(get(rowsOf(w), "reciprocity").bad, false);
 
   // A perfectly reciprocal pair, but below 10 reviews: reported, not flagged.
   const v = people();
-  for (let i = 0; i < 2; i++) {
-    v.submit(`a${i}`, "alice1");
-    v.review(`a${i}`, [["bob1", 0.1]]);
-    v.submit(`b${i}`, "bob1");
-    v.review(`b${i}`, [["alice1", 0.1]]);
-  }
+  collude(v, 2);
   const small = get(rowsOf(v), "reciprocity");
   assert.equal(small.value, 1);
   assert.equal(small.bad, false);
+});
+
+test("concentration: a one-way ring is not reciprocity; it is judged only once enough owners review", () => {
+  const w = people();
+  const ring = ["alice1", "bob1", "carol1", "dave1"];
+  for (let i = 0; i < 40; i++) {
+    const author = ring[i % 4] as string;
+    w.submit(`x${i}`, author);
+    w.openReview(`x${i}`, [[ring[(i + 1) % 4] as string, 0.1]]);
+  }
+  const rows = rowsOf(w);
+  assert.equal(get(rows, "reciprocity").value, 0);
+  assert.equal(get(rows, "reciprocity").note, "no owner pair gave each other open reviews");
+  const conc = get(rows, "open-review concentration");
+  assert.equal(conc.value, 1);
+  assert.equal(conc.bad, false, "4 reviewing owners: a small commons has nobody else");
+  assert.match(conc.note, /4 do\)$/);
+});
+
+test("concentration: a 5-owner round robin with no direct reciprocity is flagged (probe from review)", () => {
+  const w = people();
+  w.person("frank", "glm");
+  const five = ["alice1", "bob1", "carol1", "dave1", "erin1"];
+  five.forEach((author, i) => {
+    for (let j = 0; j < 5; j++) {
+      const id = `${author}-${j}`;
+      w.submit(id, author);
+      w.openReview(id, [
+        [five[(i + 1) % 5] as string, 0.05],
+        [five[(i + 2) % 5] as string, 0.05],
+      ]);
+    }
+  });
+  let rows = rowsOf(w);
+  assert.equal(get(rows, "reciprocity").value, 0, "nobody reviews back directly");
+  assert.equal(get(rows, "open-review concentration").bad, false, "5 reviewing owners: not judged");
+  w.submit("solo", "alice1");
+  w.openReview("solo", [["frank1", 0.1]]);
+  const c = reviewConcentration(w.state);
+  assert.equal(c.reviewingOwners, 6);
+  assert.equal(c.share, 1);
+  assert.equal(c.owner, "bob", "alice's work also had frank; bob's came from exactly two owners");
+  assert.deepEqual(c.top, ["carol", "dave"], "author i is reviewed by i+1 and i+2");
+  rows = rowsOf(w);
+  const row = get(rows, "open-review concentration");
+  assert.equal(row.bad, true);
+  assert.match(
+    row.note,
+    /^1 of the 10 open reviews of bob's work came from carol and dave \(bad above 0\.8 once 6 owners give open reviews; 6 do\)$/,
+  );
 });
 
 test("reviewer quality: plant catch rate overall and per family, false findings, defective approvals", () => {
@@ -325,6 +414,26 @@ test("reviewer quality: plant catch rate overall and per family, false findings,
   assert.match(da.note, /2\/2 approvals/);
 });
 
+test("reviewer quality: a reproduced finding on the snapshot counts against approvals of the work it lists", () => {
+  // Regression: only findings that targeted the submission itself counted.
+  const w = people();
+  w.submit("s1", "carol1");
+  w.review("s1", [["alice1", 0.1]]);
+  w.merge("s1");
+  w.submit("s2", "carol1");
+  w.review("s2", [["bob1", 0.1]]);
+  w.merge("s2");
+  w.coordinator({ kind: "snapshot", id: "S1", commit: "c", previousSnapshotId: null, submissionIds: ["s1"] });
+  w.coordinator({ kind: "snapshot", id: "S2", commit: "c2", previousSnapshotId: "S1", submissionIds: ["s2"] });
+  let da = get(rowsOf(w), "approvals later found defective");
+  assert.equal(da.value, 0);
+  w.finding("f1", "dave1", { snapshotId: "S1" }, true);
+  da = get(rowsOf(w), "approvals later found defective");
+  assert.equal(da.value, 0.5, "S1 lists s1 only");
+  assert.equal(da.bad, true);
+  assert.match(da.note, /1\/2 approvals/);
+});
+
 test("flow: counts, merge rate, medians, open submissions per ring; plants and dead work excluded", () => {
   const w = people();
   w.plant("p1", "erin1", "alice1", 0.9);
@@ -355,6 +464,9 @@ test("flow: counts, merge rate, medians, open submissions per ring; plants and d
     w.agentKey("alice1"),
   );
   w.submit("s6", "alice1", ["anthill-backend/src/engine.ts", "anthill-frontend/src/A.tsx"], true, "T1"); // ring 0, open
+  // Dead too: the ledger refuses to merge after any failed gate, even once a re-run passes.
+  w.submit("s7", "erin1", undefined, false);
+  w.coordinator({ kind: "gateResult", submissionId: "s7", gate: "tests", pass: true, details: "re-run" });
   w.coordinator({ kind: "snapshot", id: "S1", commit: "c", previousSnapshotId: null, submissionIds: ["s1", "s2"] });
   w.advance(100);
   w.coordinator({ kind: "promotion", snapshotId: "S1", commit: "c" });
@@ -362,15 +474,15 @@ test("flow: counts, merge rate, medians, open submissions per ring; plants and d
   const rows = rowsOf(w);
   assert.equal(get(rows, "proposals").value, 1);
   assert.equal(get(rows, "tasks").value, 1);
-  assert.equal(get(rows, "submissions").value, 6, "the revealed plant is not organic work");
+  assert.equal(get(rows, "submissions").value, 7, "the revealed plant is not organic work");
   assert.equal(get(rows, "merged").value, 2);
-  assert.equal(get(rows, "merge rate").value, 0.333);
+  assert.equal(get(rows, "merge rate").value, 0.286);
   const toMerge = get(rows, "median hours submission→merge").value as number;
   assert.ok(toMerge > 20 && toMerge < 21, String(toMerge)); // (10.07 + 30.1) / 2
   const toPromo = get(rows, "median hours merge→promotion").value as number;
   assert.ok(toPromo > 100 && toPromo < 131, String(toPromo));
   assert.equal(get(rows, "open submissions (ring 0)").value, 1);
-  assert.equal(get(rows, "open submissions (ring 1)").value, 1, "s5 is dead");
+  assert.equal(get(rows, "open submissions (ring 1)").value, 1, "s5 and s7 are dead");
   assert.equal(get(rows, "open submissions (ring 2)").value, 1);
 });
 
@@ -415,6 +527,27 @@ test("trust: locked stake, slashes against payouts, Gini of merges and reveals",
   assert.equal(get(rows, "reputation slashed").bad, true, "more taken than paid");
 });
 
+test("trust: Gini rows ignore owners without agents (kernel signers, the custodian, new invitees)", () => {
+  // Regression: every registered owner used to count, so 2 equally busy
+  // owners among 6 registered read as 0.667, above the 0.6 threshold.
+  const w = new World();
+  w.person("alice", "claude");
+  w.person("bob", "gpt");
+  for (const o of ["erin", "frank", "cust", "newbie"]) {
+    w.append({ kind: "ownerKey", owner: o, publicKey: key().publicKey, inviter: null }, w.admin);
+  }
+  for (let i = 0; i < 5; i++) {
+    for (const a of ["alice1", "bob1"]) {
+      w.submit(`${a}-${i}`, a);
+      w.merge(`${a}-${i}`);
+    }
+  }
+  const row = get(rowsOf(w), "Gini of merges across owners");
+  assert.equal(row.value, 0);
+  assert.equal(row.bad, false);
+  assert.match(row.note, /over the 2 owners with an agent, 10 events/);
+});
+
 test("trust: owners the tree does not know are flagged", () => {
   const w = people();
   const partial = treeFromParents({ root: null, alice: "root", bob: "root", carol: "root" });
@@ -449,6 +582,34 @@ test("liveness: active agents and owners in the last 7 days; too few owners to s
   // A revoked agent is not active even if it acted recently.
   w.append({ kind: "agentRevoked", agent: w.agentKey("bob1").keyId, reason: "r" }, w.owners.get("bob") as Key);
   assert.equal(get(rowsOf(w), "active agents").value, 3);
+});
+
+test("liveness: the mean hides one owner running many agents of many declared families", () => {
+  const w = people();
+  for (const [i, f] of ["gpt", "qwen", "glm", "kimi"].entries()) w.agent(`alice${i + 2}`, "alice", f);
+  for (const a of ["alice1", "alice2", "alice3", "alice4", "alice5", "bob1", "carol1", "dave1", "erin1"]) {
+    w.proposal(`P-${a}`, a);
+  }
+  const rows = rowsOf(w);
+  assert.equal(get(rows, "agents per owner").value, 1.8);
+  assert.equal(get(rows, "agents per owner").bad, false);
+  const most = get(rows, "most active agents of one owner");
+  assert.equal(most.value, 5);
+  assert.equal(most.bad, true);
+  assert.match(most.note, /^alice /);
+  const fam = get(rows, "most model families of one owner");
+  assert.equal(fam.value, 5);
+  assert.equal(fam.bad, true);
+  assert.match(fam.note, /^alice, /);
+
+  // Revoked agents declare nothing any more; two families is not flagged.
+  for (const a of ["alice2", "alice3", "alice4"]) {
+    w.append({ kind: "agentRevoked", agent: w.agentKey(a).keyId, reason: "r" }, w.owners.get("alice") as Key);
+  }
+  const after = rowsOf(w);
+  assert.equal(get(after, "most model families of one owner").value, 2);
+  assert.equal(get(after, "most model families of one owner").bad, false);
+  assert.equal(get(after, "most active agents of one owner").value, 2);
 });
 
 test("direction: proposals without a task older than 14 days", () => {
@@ -506,6 +667,14 @@ test("safety: honeytokens, escapes and failed gates by gate", () => {
     rows.some((r) => r.metric === "failed gates"),
     false,
   );
+
+  // Regression: both rows counted all history, so one event was bad for ever.
+  const later = rowsOf(w, w.now(29 * 24));
+  for (const m of ["honeytoken triggers", "escapes"]) {
+    assert.equal(get(later, m).value, 0, m);
+    assert.equal(get(later, m).bad, false, m);
+    assert.match(get(later, m).note, /; 1 all time/, m);
+  }
 });
 
 test("metrics never mutate the state", () => {

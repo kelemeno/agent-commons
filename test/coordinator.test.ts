@@ -5,8 +5,11 @@ import { applyEntry, emptyState, genesisEntry, signEntry, type LedgerState, type
 import { defaultRules } from "../src/rules";
 import { treeFromParents } from "../src/tree";
 import {
+  BINDING_GATE,
   executeActions,
+  localReproducer,
   mergeReadiness,
+  patchBinding,
   planActions,
   runOnce,
   type Action,
@@ -17,12 +20,13 @@ import {
   type ReproductionOutcome,
   type SelectionApi,
   type SettlementBody,
+  type TaskBody,
 } from "../src/coordinator";
 import type { CommonsState, EntryBody, LedgerEntry, ReviewVerdict, Severity } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Fixture: an in-memory ledger with a minute clock, fake incentives /
-// selection / promotion (the real modules are written in parallel), and an
+// selection / promotion, a fake patch binder (bot head = "bot-<id>") and an
 // executor whose effects are recorded.
 // ---------------------------------------------------------------------------
 
@@ -68,7 +72,7 @@ const fakePromotion: PromotionApi = {
   evaluatePromotion: () => ({ pass: promotionPasses, checks: [{ name: "fake", pass: promotionPasses, detail: "" }] }),
 };
 
-// Every active agent whose owner differs from the author's, one per owner.
+// Every active agent whose owner differs from the author's, one per owner, two at most.
 const fakeSelection: SelectionApi = {
   computeBeacon: (state, sid, entropy) => sha256hex(`${state.headHash}:${sid}:${entropy}`),
   selectReviewers: (state, _tree, sid) => {
@@ -95,10 +99,16 @@ class World {
   state: LedgerState;
   entries: LedgerEntry[];
   approved = new Set<string>();
+  confirmed = new Set<string>();
   bridgeCalls: string[] = [];
   bridgeFails = false;
   reproductions = new Map<string, ReproductionOutcome>();
+  reproduceCalls: string[] = [];
+  harnessErrors = new Map<string, number>();
   gateResult = true;
+  unpatched = new Set<string>(); // the binder has no patch for these
+  unbindable = new Set<string>(); // the patch does not apply
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor() {
     const rules = { ...defaultRules(), kernelSigners: ["carol", "dave"] };
@@ -135,6 +145,10 @@ class World {
     return keyIdOf(this.key(name).publicKey);
   }
 
+  name(keyId: string): string {
+    return [...this.keys.keys()].find((n) => this.id(n) === keyId) ?? "";
+  }
+
   now(): string {
     return iso(this.minute);
   }
@@ -149,6 +163,13 @@ class World {
     applyEntry(this.state, e);
     this.entries.push(e);
     return e;
+  }
+
+  // Like LedgerStore.appendAsCoordinator: one locked call at a time.
+  appendLocked(body: EntryBody | ((s: CommonsState) => EntryBody | Promise<EntryBody>)): Promise<LedgerEntry> {
+    const run = this.queue.then(async () => this.apply(typeof body === "function" ? await body(this.state) : body, this.coord));
+    this.queue = run.catch(() => undefined);
+    return run;
   }
 
   submit(id: string, agent = "a1"): void {
@@ -168,9 +189,16 @@ class World {
     this.apply({ kind: "reviewReveal", submissionId: sid, verdict: verdictOf(p), salt: `salt-${agent}` }, this.key(agent));
   }
 
-  review(sid: string, agent: string, p = 0.1): void {
-    this.commit(sid, agent, p);
-    this.reveal(sid, agent, p);
+  reviewers(sid: string): string[] {
+    return (this.state.submissions.get(sid)?.assignment?.reviewers ?? []).map((r) => this.name(r));
+  }
+
+  // Every assigned reviewer commits, then the first `n` reveal.
+  reviewAll(sid: string, n = Infinity): void {
+    const rs = this.reviewers(sid);
+    assert.ok(rs.length > 0, `no reviewers on ${sid}`);
+    for (const r of rs) this.commit(sid, r);
+    for (const r of rs.slice(0, n)) this.reveal(sid, r);
   }
 
   finding(id: string, target: { submissionId: string } | { snapshotId: string }, severity: Severity, agent = "b1"): void {
@@ -184,6 +212,8 @@ class World {
     return {
       reviewWindowHours: 24,
       humanApproval: (sid) => this.approved.has(sid),
+      findingConfirmed: (fid) => this.confirmed.has(fid),
+      harnessErrors: (fid) => this.harnessErrors.get(fid) ?? 0,
       snapshotEvery: 2,
       entries: this.entries,
       incentives: fakeIncentives,
@@ -196,19 +226,29 @@ class World {
     return planActions(this.state, tree, this.now(), this.opts(extra));
   }
 
-  deps(): ExecuteDeps {
+  deps(extra: Partial<PlanOptions> = {}): ExecuteDeps {
     return {
       state: () => this.state,
-      append: async (body) => this.apply(typeof body === "function" ? await body(this.state) : body, this.coord),
+      append: (body) => this.appendLocked(body),
       tree,
+      recheck: { clock: () => this.now(), opts: this.opts(extra) },
       entropy: (sid) => `round-${sid}`,
+      bindPatch: async (s) => {
+        if (this.unpatched.has(s.id)) return null;
+        if (this.unbindable.has(s.id)) return { error: "hunk 1 does not apply" };
+        return { head: `bot-${s.id}`, patchSha256: sha256hex(s.id) };
+      },
       runGates: async (s, gates) =>
         (gates ?? ["size", "rings"]).map((gate) => ({ gate, pass: this.gateResult, details: `${gate} on ${s.headCommit}` })),
-      reproduce: async (a) => this.reproductions.get(a.findingId) ?? null,
+      reproduce: async (a) => {
+        this.reproduceCalls.push(`${a.findingId}@${a.headCommit}`);
+        return this.reproductions.get(a.findingId) ?? null;
+      },
+      harnessErrors: this.harnessErrors,
       bridge: {
-        merge: async (s) => {
+        merge: async (s, expected) => {
           if (this.bridgeFails) throw new Error("github down");
-          this.bridgeCalls.push(`merge ${s.id}`);
+          this.bridgeCalls.push(`merge ${s.id} ${expected}`);
           return `merge-${s.id}`;
         },
         fastForwardMain: async (commit) => {
@@ -219,56 +259,112 @@ class World {
     };
   }
 
+  exec(actions: readonly Action[], extra: Partial<PlanOptions> = {}) {
+    return executeActions(actions, this.deps(extra));
+  }
+
   // Plan + execute until nothing is left (bounded).
   async settle(extra: Partial<PlanOptions> = {}): Promise<void> {
     for (let i = 0; i < 20; i++) {
       const actions = this.plan(extra);
       if (actions.length === 0) return;
-      const log = await executeActions(actions, this.deps());
-      const failed = log.filter((l) => !l.ok);
-      if (failed.length === actions.length) return; // stuck on failures only
+      const log = await this.exec(actions, extra);
+      if (log.every((l) => !l.ok || l.detail.startsWith("skipped"))) return; // stuck
     }
     assert.fail("loop did not settle");
   }
+
+  // Submit, bind, gate and assign; approve in phase 1.
+  async ready(id: string, agent = "a1"): Promise<void> {
+    this.submit(id, agent);
+    this.approved.add(id);
+    await this.settle();
+    assert.ok(this.state.submissions.get(id)?.assignment, `${id} has reviewers`);
+  }
 }
 
-const kinds = (actions: Action[]) => actions.map((a) => a.kind);
+const kinds = (actions: readonly Action[]) => actions.map((a) => a.kind);
 
 // ---------------------------------------------------------------------------
-// Rules
+// Binding and gates
 // ---------------------------------------------------------------------------
 
-test("a new submission gets gates first, and nothing else", () => {
+test("a new submission is bound to its patch first; gates run on the bound head, never the declared one", async () => {
   const w = new World();
   w.submit("s1");
-  const actions = w.plan();
-  assert.deepEqual(actions, [{ kind: "runGates", submissionId: "s1", headCommit: "head-s1", gates: null }]);
-  assert.deepEqual(w.plan({ patchAvailable: () => false }), [], "no gates without the patch");
+  assert.deepEqual(w.plan(), [{ kind: "bindPatch", submissionId: "s1" }]);
+  assert.deepEqual(w.plan({ patchAvailable: () => false }), [], "nothing without the patch");
+  const log = await w.exec(w.plan());
+  assert.ok(log[0]?.ok, log[0]?.detail);
+  const s = w.state.submissions.get("s1");
+  assert.ok(s);
+  assert.deepEqual(patchBinding(s), { head: "bot-s1", patchSha256: sha256hex("s1") });
+  assert.deepEqual(w.plan(), [{ kind: "runGates", submissionId: "s1", headCommit: "bot-s1", gates: null }]);
+  await w.exec(w.plan());
+  assert.deepEqual(
+    w.state.submissions.get("s1")?.gates.map((g) => g.details),
+    [canonical({ head: "bot-s1", patchSha256: sha256hex("s1") }), "size on bot-s1", "rings on bot-s1"],
+  );
 });
 
-test("gates run once per submission head; required gates run only where missing", async () => {
+test("binding: no patch yet is retried, a patch that does not apply stops the submission, no binder fails loudly", async () => {
   const w = new World();
   w.submit("s1");
-  await executeActions(w.plan({ requiredGates: ["size"] }), w.deps());
+  w.unpatched.add("s1");
+  assert.equal((await w.exec(w.plan()))[0]?.detail, "skipped: no patch yet");
+  assert.deepEqual(kinds(w.plan()), ["bindPatch"]);
+
+  w.submit("s2");
+  w.unbindable.add("s2");
+  await w.exec(w.plan().filter((a) => "submissionId" in a && a.submissionId === "s2"));
+  assert.equal(w.state.submissions.get("s2")?.gates[0]?.pass, false);
+  assert.ok(!w.plan().some((a) => "submissionId" in a && a.submissionId === "s2"), "a failed binding is final");
+  assert.ok(mergeReadiness(w.state, "s2", w.now(), w.opts()).waiting.includes(`gate ${BINDING_GATE} failed`));
+
+  const noBinder = { ...w.deps(), bindPatch: undefined };
+  const log = await executeActions([{ kind: "bindPatch", submissionId: "s1" }], noBinder);
+  assert.equal(log[0]?.ok, false);
+  assert.match(log[0]?.detail ?? "", /no patch binder/);
+});
+
+test("a gate runner cannot forge the binding, and declared mode trusts headCommit only when asked", async () => {
+  const w = new World();
+  w.submit("s1");
+  assert.deepEqual(w.plan({ headBinding: "declared" }), [{ kind: "runGates", submissionId: "s1", headCommit: "head-s1", gates: null }]);
+  const deps = w.deps({ headBinding: "declared" });
+  deps.runGates = async () => [
+    { gate: BINDING_GATE, pass: true, details: canonical({ head: "evil", patchSha256: "x" }) },
+    { gate: "size", pass: true, details: "" },
+  ];
+  await executeActions(w.plan({ headBinding: "declared" }), deps);
   assert.deepEqual(w.state.submissions.get("s1")?.gates.map((g) => g.gate), ["size"]);
+});
+
+test("gates run once per bound head; required gates run only where missing", async () => {
+  const w = new World();
+  w.submit("s1");
+  await w.exec(w.plan()); // bind
+  await w.exec(w.plan({ requiredGates: ["size"] }), { requiredGates: ["size"] });
+  assert.deepEqual(w.state.submissions.get("s1")?.gates.map((g) => g.gate), [BINDING_GATE, "size"]);
   const again = w.plan({ requiredGates: ["size", "rings"] });
-  assert.deepEqual(again[0], { kind: "runGates", submissionId: "s1", headCommit: "head-s1", gates: ["rings"] });
-  await executeActions(again, w.deps());
+  assert.deepEqual(again[0], { kind: "runGates", submissionId: "s1", headCommit: "bot-s1", gates: ["rings"] });
+  await w.exec(again);
   assert.ok(!kinds(w.plan({ requiredGates: ["size", "rings"] })).includes("runGates"));
 });
 
-test("reviewers are assigned only after every gate passed", async () => {
+test("reviewers are assigned only after every gate passed; the entropy is in the log", async () => {
   const w = new World();
   w.submit("s1");
   w.gateResult = false;
-  await executeActions(w.plan(), w.deps());
+  await w.settle();
   assert.deepEqual(w.plan(), [], "a failed gate stops the submission");
 
   w.gateResult = true;
   w.submit("s2");
-  await executeActions(w.plan(), w.deps());
+  await w.exec(w.plan());
+  await w.exec(w.plan());
   assert.deepEqual(w.plan(), [{ kind: "assignReviewers", submissionId: "s2" }]);
-  const log = await executeActions(w.plan(), w.deps());
+  const log = await w.exec(w.plan());
   assert.ok(log[0]?.ok, log[0]?.detail);
   const a = w.state.submissions.get("s2")?.assignment;
   assert.ok(a);
@@ -276,21 +372,24 @@ test("reviewers are assigned only after every gate passed", async () => {
   // The beacon covers the head hash the assignment was appended to.
   const before = w.entries[a.seq - 1];
   assert.equal(a.beacon, sha256hex(`${before?.hash}:s2:round-s2`));
+  assert.match(log[0]?.detail ?? "", /entropy "round-s2"/);
 });
 
-test("merge waits for all reveals and human approval; phase 2 needs no human", async () => {
+// ---------------------------------------------------------------------------
+// Merges
+// ---------------------------------------------------------------------------
+
+test("merge waits for all reveals and human approval; phase 2 needs no human; the bridge gets the bound head", async () => {
   const w = new World();
   w.submit("s1");
   await w.settle();
-  const [r1, r2] = w.state.submissions.get("s1")?.assignment?.reviewers ?? [];
+  const [r1, r2] = w.reviewers("s1");
   assert.ok(r1 && r2);
-  const name = (keyId: string) => [...w.keys.keys()].find((n) => w.id(n) === keyId) ?? "";
-
-  w.commit("s1", name(r1));
-  w.commit("s1", name(r2));
-  w.reveal("s1", name(r1));
+  w.commit("s1", r1);
+  w.commit("s1", r2);
+  w.reveal("s1", r1);
   assert.deepEqual(w.plan(), [], "one reviewer has not revealed");
-  w.reveal("s1", name(r2));
+  w.reveal("s1", r2);
   assert.deepEqual(w.plan(), [], "phase 1: no merge without human approval");
   assert.deepEqual(mergeReadiness(w.state, "s1", w.now(), w.opts()).waiting, ["awaiting human approval"]);
   assert.deepEqual(w.plan({ phase: 2 }), [{ kind: "merge", submissionId: "s1" }]);
@@ -298,133 +397,246 @@ test("merge waits for all reveals and human approval; phase 2 needs no human", a
 
   w.approved.add("s1");
   assert.deepEqual(w.plan(), [{ kind: "merge", submissionId: "s1" }]);
-  await executeActions(w.plan(), w.deps());
+  await w.exec(w.plan());
   assert.equal(w.state.submissions.get("s1")?.merged?.commit, "merge-s1");
-  assert.deepEqual(w.bridgeCalls, ["merge s1"]);
+  assert.deepEqual(w.bridgeCalls, ["merge s1 bot-s1"]);
   // Next pass settles the first tranche, once.
   assert.deepEqual(kinds(w.plan()), ["settle"]);
-  await executeActions(w.plan(), w.deps());
+  await w.exec(w.plan());
   assert.deepEqual(w.plan(), []);
 });
 
-test("after the review window, non-revealers count as missing and the merge proceeds", async () => {
+test("after the review window a quorum of reveals merges; the rest count as missing", async () => {
   const w = new World();
-  w.submit("s1");
-  await w.settle();
-  w.approved.add("s1");
-  const [r1, r2] = w.state.submissions.get("s1")?.assignment?.reviewers ?? [];
-  const name = (keyId: string) => [...w.keys.keys()].find((n) => w.id(n) === keyId) ?? "";
-  w.review("s1", name(r1 ?? ""));
+  await w.ready("s1");
+  const ids = w.state.submissions.get("s1")?.assignment?.reviewers ?? [];
+  w.reviewAll("s1", 1);
   assert.deepEqual(w.plan(), []);
   w.advance(24 * 60);
   assert.deepEqual(w.plan(), [
-    { kind: "revealPhaseClose", submissionId: "s1", missing: [r2] },
+    { kind: "revealPhaseClose", submissionId: "s1", missing: [ids[1]] },
     { kind: "merge", submissionId: "s1" },
   ]);
+  assert.deepEqual(w.plan({ reviewQuorum: 2 }), [], "an explicit quorum of two is not met");
 });
 
-test("the review window runs from the assignment entry when entries are given", async () => {
+test("a window that closes with no reveal never merges, even in phase 2", async () => {
+  const w = new World();
+  await w.ready("s1");
+  w.reviewAll("s1", 0); // committed, nobody revealed
+  w.advance(48 * 60);
+  assert.deepEqual(w.plan({ phase: 2 }), []);
+  const r = mergeReadiness(w.state, "s1", w.now(), w.opts({ phase: 2 }));
+  assert.match(r.waiting.join("; "), /review quorum not met: 0 of 1/);
+});
+
+test("the review window fails closed: without entries it never counts as closed", async () => {
   const w = new World();
   w.submit("s1");
+  w.approved.add("s1");
   w.advance(23 * 60); // gates run late: the submission is 23h old at assignment
   await w.settle();
-  w.approved.add("s1");
+  w.reviewAll("s1", 1);
   w.advance(2 * 60);
   assert.deepEqual(w.plan(), [], "only ~2h since assignment");
-  assert.equal(kinds(w.plan({ entries: undefined })).includes("merge"), true, "fallback times from the submission");
+  w.advance(30 * 24 * 60);
+  assert.deepEqual(w.plan({ entries: undefined }), [], "unknown assignment time: not closed");
+  assert.deepEqual(kinds(w.plan()), ["revealPhaseClose", "merge"]);
 });
 
 test("never merges with a reproduced finding, even when approved", async () => {
   const w = new World();
-  w.submit("s1");
-  await w.settle();
-  w.approved.add("s1");
-  w.advance(25 * 60);
+  await w.ready("s1");
+  w.reviewAll("s1");
   const merge = w.plan();
-  assert.deepEqual(kinds(merge), ["revealPhaseClose", "merge"]);
+  assert.deepEqual(kinds(merge), ["merge"]);
   w.finding("f1", { submissionId: "s1" }, "low");
-  // Any undecided finding blocks (the ledger refuses finding-pending merges).
+  // Any undecided finding blocks (the ledger refuses finding-pending merges),
+  // and it is reproduced against the bound head.
   assert.deepEqual(w.plan(), [
-    {
-      kind: "reproduceFinding",
-      findingId: "f1",
-      baseCommit: "base-s1",
-      headCommit: "head-s1",
-      testPath: "test/f1.test.ts",
-      testCommand: "npm test",
-    },
+    { kind: "reproduceFinding", findingId: "f1", baseCommit: "base-s1", headCommit: "bot-s1", testPath: "test/f1.test.ts", testCommand: "npm test" },
   ]);
   // A merge planned before the finding arrived is re-checked against live
   // state before the bridge is called.
-  const stale = await executeActions(merge, w.deps());
-  assert.equal(stale[1]?.ok, false);
-  assert.match(stale[1]?.detail ?? "", /unresolved/);
+  const stale = await w.exec(merge);
+  assert.equal(stale[0]?.ok, false);
+  assert.match(stale[0]?.detail ?? "", /unresolved low finding f1/);
   w.reproductions.set("f1", { reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "d" });
-  const log = await executeActions([...w.plan(), ...merge], w.deps());
-  assert.equal(log[0]?.ok, true);
-  assert.equal(log[2]?.ok, false);
-  assert.match(log[2]?.detail ?? "", /reproduced/);
+  await w.exec(w.plan());
+  const after = await w.exec(merge);
+  assert.match(after[0]?.detail ?? "", /reproduced finding f1/);
   assert.deepEqual(w.bridgeCalls, []);
   assert.equal(w.state.submissions.get("s1")?.merged, undefined);
   for (let i = 0; i < 3; i++) {
-    const next = w.plan();
+    const next = w.plan({ phase: 2 });
     assert.ok(!kinds(next).includes("merge"));
-    await executeActions(next, w.deps());
+    await w.exec(next, { phase: 2 });
   }
   assert.ok(w.state.settlements.some((s) => s.reason === "bounty" && s.ref === "f1@dev"));
 });
 
-test("an unresolved finding blocks the merge until it is resolved", async () => {
+test("the merge re-asks the human under the lock: a withdrawn approval stops it", async () => {
   const w = new World();
-  w.submit("s1");
-  await w.settle();
-  w.approved.add("s1");
-  w.advance(25 * 60);
-  w.finding("f1", { submissionId: "s1" }, "high");
-  assert.deepEqual(kinds(w.plan()), ["reproduceFinding"]);
-  await executeActions(w.plan(), w.deps()); // reproducer not ready: skipped
-  assert.deepEqual(kinds(w.plan()), ["reproduceFinding"]);
-  w.reproductions.set("f1", { reproduced: false, failsOnHead: false, passesOnParent: true, logDigest: "d" });
-  await executeActions(w.plan(), w.deps());
-  assert.deepEqual(kinds(w.plan()), ["settle", "revealPhaseClose", "merge"]);
-  assert.equal((w.plan()[0] as Extract<Action, { kind: "settle" }>).bodies[0]?.reason, "falseFinding");
-});
-
-test("a harness error is never recorded as a result", async () => {
-  const w = new World();
-  w.submit("s1");
-  w.finding("f1", { submissionId: "s1" }, "low");
-  w.reproductions.set("f1", { reproduced: false, failsOnHead: false, passesOnParent: false, logDigest: "d", harnessError: "timeout" });
-  const log = await executeActions(w.plan().filter((a) => a.kind === "reproduceFinding"), w.deps());
+  await w.ready("s1");
+  w.reviewAll("s1");
+  const plan = w.plan();
+  assert.deepEqual(kinds(plan), ["merge"]);
+  w.approved.delete("s1");
+  const log = await w.exec(plan);
   assert.equal(log[0]?.ok, false);
-  assert.equal(w.state.findings.get("f1")?.result, undefined);
+  assert.match(log[0]?.detail ?? "", /awaiting human approval/);
+  assert.deepEqual(w.bridgeCalls, []);
+  // An async approver is consulted at merge time too.
+  const asked: string[] = [];
+  const deps = w.deps();
+  deps.recheck = { ...deps.recheck, humanApproval: async (sid) => (asked.push(sid), false) };
+  w.approved.add("s1");
+  assert.equal((await executeActions(plan, deps))[0]?.ok, false);
+  assert.deepEqual(asked, ["s1"]);
 });
 
 test("a failing bridge leaves no merge entry and the merge is retried", async () => {
   const w = new World();
-  w.submit("s1");
-  await w.settle();
-  w.approved.add("s1");
-  w.advance(25 * 60);
+  await w.ready("s1");
+  w.reviewAll("s1");
   w.bridgeFails = true;
-  const log = await executeActions(w.plan(), w.deps());
+  const log = await w.exec(w.plan());
   assert.ok(log.some((l) => l.action.kind === "merge" && !l.ok));
   assert.equal(w.state.submissions.get("s1")?.merged, undefined);
   assert.ok(kinds(w.plan()).includes("merge"));
 });
 
-test("snapshot after snapshotEvery merges, promotion when the rule passes, escape for a defect on main", async () => {
+test("a suspended author's open submissions stop where they are", async () => {
   const w = new World();
-  promotionPasses = false;
-  for (const id of ["s1", "s2", "s3"]) {
+  await w.ready("s1");
+  w.submit("s2");
+  w.reviewAll("s1");
+  w.apply({ kind: "agentRevoked", agent: w.id("a1"), reason: "honeytoken" }, w.coord);
+  assert.deepEqual(w.plan({ phase: 2 }), []);
+  assert.ok(mergeReadiness(w.state, "s1", w.now(), w.opts()).waiting.includes("author suspended"));
+});
+
+test("while a plant commitment is unrevealed, later merges wait for the window plus grace", async () => {
+  const w = new World();
+  w.apply({ kind: "plantCommit", commitment: sha256hex("s1:salt") }, w.admin);
+  await w.ready("s1");
+  w.reviewAll("s1");
+  assert.deepEqual(w.plan(), [], "all revealed, but the custodian may not have revealed yet");
+  assert.ok(mergeReadiness(w.state, "s1", w.now(), w.opts()).waiting.some((x) => x.startsWith("plant reveal grace")));
+  w.advance(24 * 60 + 61);
+  assert.deepEqual(kinds(w.plan()), ["merge"], "window + 1h grace passed");
+  w.apply({ kind: "plantReveal", submissionId: "s1", salt: "salt", description: "off by one", severity: "medium" }, w.admin);
+  assert.deepEqual(w.plan().filter((a) => a.kind === "merge"), [], "the revealed plant never merges");
+});
+
+// ---------------------------------------------------------------------------
+// Findings
+// ---------------------------------------------------------------------------
+
+test("a finding whose test never arrives is voided after the grace period, and the merge proceeds", async () => {
+  const w = new World();
+  await w.ready("s1");
+  w.reviewAll("s1");
+  w.finding("f1", { submissionId: "s1" }, "high");
+  const noTest = { findingTestAvailable: (fid: string) => fid !== "f1" };
+  assert.deepEqual(w.plan(noTest), [], "waits for the test within the grace period");
+  await w.exec(w.plan()); // unknown availability: reproducer has nothing, skipped
+  assert.deepEqual(kinds(w.plan()), ["reproduceFinding"]);
+  w.advance(24 * 60);
+  assert.deepEqual(w.plan(noTest), [{ kind: "voidFinding", findingId: "f1", reason: "no-test" }]);
+  await w.exec(w.plan(noTest));
+  assert.deepEqual(w.state.findings.get("f1")?.result, {
+    reproduced: false,
+    failsOnHead: false,
+    passesOnParent: false,
+    logDigest: "void:no-test",
+    seq: w.state.findings.get("f1")?.result?.seq,
+  });
+  const next = w.plan(noTest);
+  assert.deepEqual(kinds(next), ["settle", "merge"]);
+  assert.equal((next[0] as Extract<Action, { kind: "settle" }>).bodies[0]?.reason, "falseFinding");
+});
+
+test("harness errors are counted and the finding is voided after maxHarnessErrors", async () => {
+  const w = new World();
+  await w.ready("s1");
+  w.finding("f1", { submissionId: "s1" }, "low");
+  w.reproductions.set("f1", { reproduced: false, failsOnHead: false, passesOnParent: false, logDigest: "d", harnessError: "timeout" });
+  for (let i = 0; i < 3; i++) {
+    const log = await w.exec(w.plan());
+    assert.equal(log[0]?.ok, false);
+    assert.equal(w.state.findings.get("f1")?.result, undefined, "a harness error is never recorded as a result");
+  }
+  assert.equal(w.harnessErrors.get("f1"), 3);
+  assert.deepEqual(w.plan(), [{ kind: "voidFinding", findingId: "f1", reason: "harness-error" }]);
+  await w.exec(w.plan());
+  assert.equal(w.state.findings.get("f1")?.result?.logDigest, "void:harness-error");
+});
+
+test("reproductions per pass are capped, oldest first, and run beside the rest of the pass", async () => {
+  const w = new World();
+  await w.ready("s1");
+  for (const f of ["f1", "f2", "f3"]) w.finding(f, { submissionId: "s1" }, "low");
+  const plan = w.plan({ maxReproductionsPerPass: 2 });
+  assert.deepEqual(plan.filter((a) => a.kind === "reproduceFinding").map((a) => (a as { findingId: string }).findingId), ["f1", "f2"]);
+
+  // A hanging reproduction does not hold up an unrelated merge.
+  await w.ready("s2");
+  w.reviewAll("s2");
+  let release!: () => void;
+  const hang = new Promise<void>((r) => (release = r));
+  const deps = w.deps();
+  deps.reproduce = async () => {
+    await hang;
+    return null;
+  };
+  const actions: Action[] = [
+    { kind: "reproduceFinding", findingId: "f1", baseCommit: "base-s1", headCommit: "bot-s1", testPath: "t", testCommand: "c" },
+    { kind: "merge", submissionId: "s2" },
+  ];
+  const running = executeActions(actions, deps);
+  for (let i = 0; i < 50 && !w.state.submissions.get("s2")?.merged; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(w.state.submissions.get("s2")?.merged, "merged while the reproduction hangs");
+  release();
+  const log = await running;
+  assert.deepEqual(log.map((l) => l.action.kind), ["reproduceFinding", "merge"]);
+});
+
+test("phase 1: a reproduced finding pays, slashes and records an escape only after a human confirms it", async () => {
+  const w = new World();
+  await w.ready("s1");
+  w.finding("f1", { submissionId: "s1" }, "high");
+  w.reproductions.set("f1", { reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "d" });
+  await w.exec(w.plan());
+  assert.equal(w.state.findings.get("f1")?.result?.reproduced, true);
+  assert.deepEqual(w.plan(), [], "held: no bounty or slash without confirmation");
+  assert.ok(mergeReadiness(w.state, "s1", w.now(), w.opts()).waiting.includes("reproduced finding f1"), "still blocks the merge");
+  w.confirmed.add("f1");
+  assert.deepEqual(kinds(w.plan()), ["settle"]);
+  assert.deepEqual(kinds(w.plan({ phase: 2, findingConfirmed: undefined })), ["settle"], "phase 2 is mechanical");
+});
+
+// ---------------------------------------------------------------------------
+// Snapshots and promotion
+// ---------------------------------------------------------------------------
+
+async function mergedWorld(ids: string[]): Promise<World> {
+  const w = new World();
+  for (const id of ids) {
     w.submit(id);
     w.approved.add(id);
   }
+  await w.settle({ snapshotEvery: undefined });
+  for (const id of ids) w.reviewAll(id);
+  await w.settle({ snapshotEvery: undefined });
+  for (const id of ids) assert.ok(w.state.submissions.get(id)?.merged, `${id} merged`);
+  return w;
+}
+
+test("snapshot after snapshotEvery merges, promotion when the rule passes, escape for a defect on main", async () => {
+  promotionPasses = false;
+  const w = await mergedWorld(["s1", "s2", "s3"]);
   await w.settle();
-  w.advance(25 * 60);
-  await w.settle();
-  const merged = ["s1", "s2", "s3"].filter((id) => w.state.submissions.get(id)?.merged);
-  assert.equal(merged.length, 3);
   const snap = w.state.snapshots.get("snapshot-1");
   assert.ok(snap, "one snapshot of all three");
   assert.deepEqual(snap.submissionIds, ["s1", "s2", "s3"]);
@@ -439,10 +651,12 @@ test("snapshot after snapshotEvery merges, promotion when the rule passes, escap
   assert.ok(w.bridgeCalls.includes(`ff ${snap.commit}`));
   assert.deepEqual(w.plan(), [], "promoted snapshot is not promoted again");
 
-  // A defect in a promoted submission: escape and a main-stage bounty.
+  // A defect in a promoted submission: escape and a main-stage bounty, once confirmed.
   w.finding("f9", { submissionId: "s2" }, "critical", "c1");
   w.reproductions.set("f9", { reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "x" });
-  await executeActions(w.plan(), w.deps());
+  await w.exec(w.plan());
+  assert.deepEqual(w.plan(), [], "phase 1: waits for confirmation");
+  w.confirmed.add("f9");
   const next = w.plan();
   assert.deepEqual(next[0], { kind: "escape", findingId: "f9", snapshotId: "snapshot-1" });
   const settle = next.find((a): a is Extract<Action, { kind: "settle" }> => a.kind === "settle");
@@ -453,14 +667,87 @@ test("snapshot after snapshotEvery merges, promotion when the rule passes, escap
   promotionPasses = false;
 });
 
+test("snapshots cover only a clean prefix: a pending finding waits, a defect blocks", async () => {
+  const w = await mergedWorld(["s1", "s2", "s3"]);
+  w.finding("f2", { submissionId: "s2" }, "medium", "c1");
+  const plan = w.plan({ snapshotEvery: 1 });
+  const snap = plan.find((a): a is Extract<Action, { kind: "snapshot" }> => a.kind === "snapshot");
+  assert.deepEqual(snap?.submissionIds, ["s1"], "s3's merge commit contains s2, so it waits too");
+  assert.equal(snap?.commit, w.state.submissions.get("s1")?.merged?.commit);
+  assert.equal(w.plan({ snapshotEvery: 2 }).some((a) => a.kind === "snapshot"), false);
+  // Reproduced: a known defect is never frozen into a snapshot.
+  w.reproductions.set("f2", { reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "d" });
+  await w.exec(w.plan({ snapshotEvery: undefined }));
+  const after = w.plan({ snapshotEvery: 1 }).find((a): a is Extract<Action, { kind: "snapshot" }> => a.kind === "snapshot");
+  assert.deepEqual(after?.submissionIds, ["s1"]);
+  // A stale snapshot action naming s2 is refused under the lock.
+  const stale: Action = { kind: "snapshot", id: "snapshot-x", commit: "c", previousSnapshotId: null, submissionIds: ["s1", "s2"] };
+  const log = await w.exec([stale]);
+  assert.equal(log[0]?.ok, false);
+  assert.match(log[0]?.detail ?? "", /s2 is defective/);
+});
+
+test("promotion is re-checked under the lock: a finding reproduced in the same pass stops main moving", async () => {
+  promotionPasses = true;
+  const w = await mergedWorld(["s1", "s2"]);
+  await w.exec(w.plan()); // settle + snapshot
+  assert.ok(w.state.snapshots.get("snapshot-1"));
+  w.finding("f1", { snapshotId: "snapshot-1" }, "high", "c1");
+  assert.ok(!kinds(w.plan()).includes("promote"), "an open finding on the snapshot blocks planning");
+  // A promote planned before the finding arrived, executed with its reproduction.
+  const snap = w.state.snapshots.get("snapshot-1");
+  assert.ok(snap);
+  w.reproductions.set("f1", { reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "d" });
+  const actions: Action[] = [...w.plan(), { kind: "promote", snapshotId: "snapshot-1", commit: snap.commit }];
+  const log = await w.exec(actions);
+  const promote = log.find((l) => l.action.kind === "promote");
+  assert.equal(promote?.ok, false);
+  assert.match(promote?.detail ?? "", /reproduced finding f1/);
+  assert.ok(!w.bridgeCalls.some((c) => c.startsWith("ff")), "main never moved");
+  assert.equal(w.state.snapshots.get("snapshot-1")?.promoted, undefined);
+  // And the rule itself is re-evaluated against live state.
+  promotionPasses = false;
+  const w2 = await mergedWorld(["s1", "s2"]);
+  await w2.exec(w2.plan());
+  const snap2 = w2.state.snapshots.get("snapshot-1");
+  assert.ok(snap2);
+  const log2 = await w2.exec([{ kind: "promote", snapshotId: "snapshot-1", commit: snap2.commit }]);
+  assert.match(log2[0]?.detail ?? "", /promotion rule fails: fake/);
+  assert.deepEqual(w2.bridgeCalls.filter((c) => c.startsWith("ff")), []);
+});
+
+// ---------------------------------------------------------------------------
+// Coordinator entries from outside facts, and honeytokens
+// ---------------------------------------------------------------------------
+
+test("approved tasks and observed honeytoken hits are appended once each", async () => {
+  const w = new World();
+  w.apply({ kind: "proposal", id: "p1", title: "t", evidence: [{ kind: "location", file: "src/x.ts", line: 1, note: "n" }] }, w.key("a1"));
+  const task: TaskBody = { kind: "task", id: "t1", proposalId: "p1", ring: 1, acceptanceTestPaths: ["test/t1.test.ts"], sizeEstimate: 10, specAuthor: "bob" };
+  const orphan = { ...task, id: "t2", proposalId: "nope" };
+  const hits = [{ agent: w.id("b1"), tokenId: "tok-1" }, { agent: "unknown", tokenId: "x" }];
+  const extra = { approvedTasks: [task, orphan], honeytokenHits: hits };
+  assert.deepEqual(kinds(w.plan(extra)), ["task", "honeytoken"]);
+  await w.exec(w.plan(extra));
+  assert.ok(w.state.tasks.has("t1"));
+  assert.deepEqual(kinds(w.plan(extra)), ["settle", "suspend"]);
+  await w.exec(w.plan(extra));
+  assert.equal(w.state.agents.get(w.id("b1"))?.active, false);
+  assert.deepEqual(w.plan(extra), []);
+});
+
 test("an agent that obeyed a honeytoken is settled and suspended once", async () => {
   const w = new World();
   w.apply({ kind: "honeytokenTriggered", agent: w.id("b1"), tokenId: "tok-1" }, w.coord);
   assert.deepEqual(kinds(w.plan()), ["settle", "suspend"]);
-  await executeActions(w.plan(), w.deps());
+  await w.exec(w.plan());
   assert.equal(w.state.agents.get(w.id("b1"))?.active, false);
   assert.deepEqual(w.plan(), []);
 });
+
+// ---------------------------------------------------------------------------
+// Whole-loop properties
+// ---------------------------------------------------------------------------
 
 test("idempotency: planning again after executing repeats nothing", async () => {
   const w = new World();
@@ -471,8 +758,8 @@ test("idempotency: planning again after executing repeats nothing", async () => 
   w.finding("f1", { submissionId: "s1" }, "medium", "c1");
   w.reproductions.set("f1", { reproduced: false, failsOnHead: false, passesOnParent: true, logDigest: "d" });
   const seen: string[] = [];
-  for (let i = 0; i < 10; i++) {
-    if (i === 3) w.advance(25 * 60);
+  for (let i = 0; i < 12; i++) {
+    if (i === 4) for (const id of ["s1", "s2"]) w.reviewAll(id);
     const actions = w.plan();
     for (const a of actions) {
       // Only settlements may recur, and only with new bodies.
@@ -480,46 +767,60 @@ test("idempotency: planning again after executing repeats nothing", async () => 
       assert.ok(!seen.includes(key), `planned twice: ${key}`);
       seen.push(key);
     }
-    await executeActions(actions, w.deps());
+    await w.exec(actions);
   }
   assert.deepEqual(w.plan(), []);
   const refs = w.state.settlements.map((s) => `${s.owner}/${s.reason}/${s.ref}`);
   assert.equal(new Set(refs).size, refs.length, "no settlement twice");
-  assert.ok(w.state.snapshots.size === 1);
+  assert.equal(w.state.snapshots.size, 1);
 });
 
-test("plan order: settlements, suspensions, reproductions, gates, assignments, merges", async () => {
+test("plan order: settlements, suspensions, reproductions, binding, gates, assignments", async () => {
   const w = new World();
   w.submit("s1");
   w.submit("s2");
-  await executeActions(w.plan().filter((a) => a.kind === "runGates" && a.submissionId === "s1"), w.deps());
+  w.submit("s3");
+  await w.exec(w.plan().filter((a) => "submissionId" in a && a.submissionId !== "s3"));
+  await w.exec(w.plan().filter((a) => "submissionId" in a && a.submissionId === "s1"));
   w.apply({ kind: "honeytokenTriggered", agent: w.id("d1"), tokenId: "t" }, w.coord);
   w.finding("f1", { submissionId: "s2" }, "low");
-  assert.deepEqual(kinds(w.plan()), ["settle", "suspend", "reproduceFinding", "assignReviewers", "runGates"]);
+  assert.deepEqual(kinds(w.plan()), ["settle", "suspend", "reproduceFinding", "assignReviewers", "runGates", "bindPatch"]);
 });
 
-test("runOnce resolves async approvals before planning", async () => {
+test("runOnce resolves async approvals and confirmations, defaults uploads from patchesDir, keeps harness counts", async () => {
   const w = new World();
-  w.submit("s1");
-  await w.settle();
+  await w.ready("s1");
+  w.reviewAll("s1");
+  w.finding("f1", { submissionId: "s1" }, "low");
   w.advance(25 * 60);
   const asked: string[] = [];
+  const harness = new Map<string, number>();
+  const deps = w.deps();
   const run = () =>
     runOnce({
-      ...w.deps(),
+      ...deps,
+      harnessErrors: harness,
       clock: () => w.now(),
       entries: () => w.entries,
+      patchesDir: "/nonexistent/patches",
       plan: { reviewWindowHours: 24, incentives: fakeIncentives, promotion: fakePromotion },
       humanApproval: async (sid) => {
         asked.push(sid);
         return true;
       },
     });
+  // No test file under patchesDir and past the grace period: voided.
+  const first = await run();
+  assert.deepEqual(kinds(first.actions), ["voidFinding"]);
   const { actions, log } = await run();
-  assert.deepEqual(asked, ["s1"]);
-  assert.deepEqual(kinds(actions), ["revealPhaseClose", "merge"]);
-  assert.ok(log.every((l) => l.ok));
+  assert.deepEqual(kinds(actions), ["settle", "merge"]);
+  assert.ok(log.every((l) => l.ok), JSON.stringify(log));
+  assert.ok(asked.filter((s) => s === "s1").length >= 2, "asked before planning and again at merge time");
   assert.ok(w.state.submissions.get("s1")?.merged);
+
+  // Without a patch on disk, a new submission is not even bound.
+  w.submit("s2");
+  assert.deepEqual((await run()).actions.filter((a) => "submissionId" in a && a.submissionId === "s2"), []);
 });
 
 test("planActions does not mutate the state", () => {
@@ -529,4 +830,22 @@ test("planActions does not mutate the state", () => {
   const before = structuredClone(w.state);
   w.plan();
   assert.deepStrictEqual(w.state, before);
+});
+
+test("localReproducer refuses to run without a sandbox and forwards sandbox and timeout", async () => {
+  const calls: Record<string, unknown>[] = [];
+  const reproduceFinding = async (o: Record<string, unknown>) => {
+    calls.push(o);
+    return { reproduced: false, failsOnHead: false, passesOnParent: true, logDigest: "d" };
+  };
+  const action = { kind: "reproduceFinding", findingId: "f1", baseCommit: "b", headCommit: "h", testPath: "t", testCommand: "c" } as const;
+  const bare = localReproducer({ repoDir: "/r", testFile: () => __filename, reproduceFinding });
+  await assert.rejects(bare(action), /without a sandbox/);
+  assert.equal(calls.length, 0, "nothing ran");
+  const boxed = localReproducer({ repoDir: "/r", testFile: () => __filename, reproduceFinding, sandbox: ["box"], timeoutMs: 5000 });
+  await boxed(action);
+  assert.deepEqual(calls[0]?.sandbox, ["box"]);
+  assert.equal(calls[0]?.timeoutMs, 5000);
+  const missing = localReproducer({ repoDir: "/r", testFile: () => "/nonexistent/test", reproduceFinding, sandbox: ["box"] });
+  assert.equal(await missing(action), null, "no test file yet");
 });

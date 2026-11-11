@@ -1,42 +1,68 @@
 // The GitHub bridge: the only module that talks to GitHub. Code reaches the
 // project repo through here and nowhere else: participants submit a unified
 // diff, and the coordinator bot turns it into a branch `commons/<submissionId>`
-// and a pull request with its own token. Participants' credentials never touch
-// the repo.
+// in a bot-owned fork and a pull request from that fork, with its own token.
+// Participants' credentials never touch the repo.
+//
+// Why a fork: a branch pushed into the project repo itself fires `push` and
+// `pull_request` workflows with the repo's secrets and a write-scoped token,
+// before any gate or review has run. A PR from a fork runs with no secrets and
+// a read-only token, and outside contributors' workflows wait for approval.
+// The bot token must not have the `workflow` scope, Actions should be disabled
+// on the fork, and `.github/` changes are refused unless the caller allows them.
+//
+// What lands is bound to what the ledger names. openPullRequest refuses a base
+// commit that is not already in the base branch (otherwise a submission could
+// parent its tiny patch on someone else's unreviewed branch and a squash merge
+// would land all of it), and refuses a patch whose resulting tree is not the
+// tree of the submission's signed headCommit. The PR head is therefore "parent
+// = submission.baseCommit, tree = tree(submission.headCommit)", which anyone
+// with the repo can check; its commit sha is GitHub's and is not in the ledger.
+// Ring and airlock decisions on a live PR use listChangedFiles with the head
+// sha they were made for; mergePullRequest merges only that sha.
 //
 // REST only (api.github.com v3); GraphQL is not available to the bot. Every
 // request goes through the injected fetch, so tests run without a network.
 //
 // The token is a secret held by the coordinator process. It is sent only in the
 // Authorization header to `apiBase`, never logged, and scrubbed from every error
-// message. Pagination therefore never follows URLs from Link headers: it builds
-// page URLs itself, so a response cannot redirect the token to another host.
+// message. Redirects are never followed (a renamed repo must be renamed in the
+// config, not silently acted on) and pagination builds its own page URLs, so a
+// response cannot steer the token or a write to another host or repo. Every
+// request has a timeout: the coordinator merges under the ledger lock.
 //
 // The patch applier is deliberately strict. A patch applies byte-exactly at the
 // line numbers its hunk headers state or not at all: no fuzz, no offsets, no
-// whitespace leniency. What lands in the PR is exactly what reviewers read in
-// the submitted diff, and anything the applier cannot represent exactly
-// (binary files, symlinks, submodules, quoted paths) is refused rather than
-// approximated.
+// whitespace leniency. Anything it cannot represent exactly (binary files,
+// symlinks, submodules, quoted or non-ASCII paths) is refused rather than
+// approximated, and a patch's structure is checked when it is parsed, so the
+// server refuses a malformed patch at upload rather than at PR time.
 
 export const TOKEN_ENV = "COMMONS_GITHUB_TOKEN";
 export const DEFAULT_API_BASE = "https://api.github.com";
+export const DEFAULT_TIMEOUT_MS = 30_000;
+
+// Caps checked before any request. Every file costs base-tree reads, and the
+// bot token's request budget is shared by every participant.
+export const PATCH_LIMITS = { files: 300, lines: 100_000 } as const;
 
 // The subset of global fetch the bridge uses. Global fetch satisfies it.
 export type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
+  init: { method: string; headers: Record<string, string>; body?: string; redirect: "manual"; signal: AbortSignal },
 ) => Promise<{ status: number; headers: { get(name: string): string | null }; text(): Promise<string> }>;
 
 export type GitHubOptions = {
   token?: string; // default: process.env.COMMONS_GITHUB_TOKEN
   fetch?: FetchLike; // default: global fetch
   apiBase?: string; // default: https://api.github.com
+  timeoutMs?: number; // per request, including reading the body; default 30s
   log?: (line: string) => void; // one line per request: method, path, status. Never the token.
 };
 
 // status is the HTTP status, or 0 when no HTTP status applies (no token,
-// network failure, a response that is not the shape GitHub documents).
+// network failure, timeout, a response that is not the shape GitHub documents,
+// a guard the bridge checks itself).
 export class GitHubError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -46,7 +72,7 @@ export class GitHubError extends Error {
   }
 }
 
-// A patch the strict applier refuses. Never retried with leniency.
+// A patch (or submission) the bridge refuses. Never retried with leniency.
 export class PatchError extends Error {
   constructor(message: string) {
     super(message);
@@ -54,26 +80,39 @@ export class PatchError extends Error {
   }
 }
 
+export type RepoRef = { owner: string; repo: string };
+
 export type OpenPullRequestArgs = {
   owner: string;
   repo: string;
   baseBranch: string;
   submissionId: string;
   patch: string; // `git diff` output (git format, a/ and b/ prefixes) against the base commit
-  title: string;
-  body: string;
-  // The commit the patch was made against. Defaults to the current head of
-  // baseBranch. Pass the submission's baseCommit so the branch is the author's
-  // change on the author's base, even if baseBranch moved since.
+  title: string; // one line, at most 256 characters
+  body: string; // participant text in here must be fenced by the caller (fenceUntrusted)
+  // Where the bot creates commons/<submissionId>: its fork of owner/repo.
+  headRepo: RepoRef;
+  // Opening from a branch in owner/repo itself runs the project's CI with its
+  // secrets on unreviewed code. Refused unless this is set.
+  allowSameRepoHead?: boolean;
+  // The commit the patch was made against (the submission's baseCommit). Must
+  // be in baseBranch. Defaults to the current head of baseBranch.
   baseCommit?: string;
+  // The tree of the submission's headCommit (`git rev-parse <headCommit>^{tree}`
+  // in the coordinator's clone). The patch must produce exactly this tree.
+  expectedTree: string;
+  // `.github/` is where CI and repo automation live. A path there is refused
+  // unless this returns true for it (e.g. after airlock approval).
+  allowDotGithub?: (path: string) => boolean;
 };
 
 export type OpenedPullRequest = {
   number: number;
   url: string;
-  branch: string; // commons/<submissionId>
+  branch: string; // commons/<submissionId>, in headRepo
   baseSha: string;
-  headSha: string; // the commit the bot created; the submission's headCommit
+  headSha: string; // the bot's commit: parent baseSha, tree treeSha
+  treeSha: string; // equals args.expectedTree
   files: string[]; // every path the patch writes or deletes, sorted
 };
 
@@ -87,24 +126,46 @@ export type ChangedFile = {
   previousPath?: string;
 };
 
+export type PullRequestInfo = {
+  number: number;
+  url: string;
+  state: string; // open | closed
+  merged: boolean;
+  mergeCommitSha: string | null; // for a merged squash PR: the commit on the base branch
+  headSha: string;
+  headLabel: string; // owner:branch
+  baseRef: string;
+};
+
+export type MergeOptions = {
+  title?: string; // squash commit title
+  body?: string; // squash commit message
+  // Refuse unless the head commit has this tree (the submission's head tree).
+  expectedTree?: string;
+  // Refuse unless the base branch is at this commit, so the squash tree is
+  // exactly the head tree rather than a merge with commits nobody gated.
+  expectedBase?: string;
+};
+
 export type GitHub = {
   openPullRequest(args: OpenPullRequestArgs): Promise<OpenedPullRequest>;
-  listChangedFiles(owner: string, repo: string, prNumber: number): Promise<ChangedFile[]>;
-  mergePullRequest(
-    owner: string,
-    repo: string,
-    prNumber: number,
-    sha: string,
-    message?: { title?: string; body?: string },
-  ): Promise<{ sha: string }>;
+  // The PR for commons/<submissionId> from headOwner (default: owner), or null.
+  // Prefers a merged PR, then an open one, then the newest.
+  findPullRequest(owner: string, repo: string, submissionId: string, headOwner?: string): Promise<PullRequestInfo | null>;
+  // Refuses unless the PR head is expectedHeadSha before and after listing.
+  listChangedFiles(owner: string, repo: string, prNumber: number, expectedHeadSha: string): Promise<ChangedFile[]>;
+  // Squash-merges only if the PR head is `sha`. Idempotent: a PR already merged
+  // at `sha` returns its merge commit.
+  mergePullRequest(owner: string, repo: string, prNumber: number, sha: string, opts?: MergeOptions): Promise<{ sha: string }>;
   fastForward(owner: string, repo: string, branch: string, sha: string): Promise<{ sha: string }>;
   commentOnPullRequest(owner: string, repo: string, prNumber: number, body: string): Promise<{ id: number; url: string }>;
 };
 
 export function createGitHub(opts: GitHubOptions = {}): GitHub {
   const token = opts.token ?? process.env[TOKEN_ENV] ?? "";
-  const doFetch: FetchLike = opts.fetch ?? (globalThis.fetch as FetchLike);
+  const doFetch: FetchLike = opts.fetch ?? (globalThis.fetch as unknown as FetchLike);
   const apiBase = (opts.apiBase ?? DEFAULT_API_BASE).replace(/\/+$/, "");
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const redact = (s: string): string => (token === "" ? s : s.split(token).join("[redacted]"));
   const log = (line: string): void => opts.log?.(redact(line));
 
@@ -118,23 +179,41 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
       "User-Agent": "anthill-commons",
       "X-GitHub-Api-Version": "2022-11-28",
     };
-    const init: { method: string; headers: Record<string, string>; body?: string } = { method, headers };
+    const controller = new AbortController();
+    const init: Parameters<FetchLike>[1] = { method, headers, redirect: "manual", signal: controller.signal };
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(body);
     }
+    // Raced as well as signalled: an injected fetch may ignore the signal.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new GitHubError(0, `${method} ${path}: timeout after ${timeoutMs} ms`));
+      }, timeoutMs);
+    });
     let res: Awaited<ReturnType<FetchLike>>;
     let text: string;
     try {
-      res = await doFetch(apiBase + path, init);
-      text = await res.text();
+      res = await Promise.race([doFetch(apiBase + path, init), timeout]);
+      text = await Promise.race([res.text(), timeout]);
     } catch (e) {
+      if (e instanceof GitHubError) {
+        log(`${method} ${path} timeout`);
+        throw e;
+      }
       // Only the message: an error object from the fetch layer may carry the request.
       const msg = e instanceof Error ? e.message : String(e);
       log(`${method} ${path} network error`);
       throw new GitHubError(0, redact(`${method} ${path}: network error: ${msg}`));
+    } finally {
+      clearTimeout(timer);
     }
     log(`${method} ${path} ${res.status}`);
+    if (res.status >= 300 && res.status <= 399) {
+      throw new GitHubError(res.status, `${method} ${path} -> ${res.status}: redirect not followed (repository renamed or moved?)`);
+    }
     let data: unknown = null;
     let parsed = true;
     if (text !== "") {
@@ -151,31 +230,73 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     return { status: res.status, data, link: res.headers.get("link") };
   }
 
-  const repoPath = (owner: string, repo: string): string => {
-    if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo) || owner.startsWith(".") || repo.startsWith(".")) {
-      throw new GitHubError(0, `invalid repository ${JSON.stringify(owner)}/${JSON.stringify(repo)}`);
-    }
-    return `/repos/${owner}/${repo}`;
-  };
+  async function branchHead(rp: string, branch: string): Promise<string> {
+    const ref = await request("GET", `${rp}/git/ref/heads/${refUrl(branch)}`);
+    const object = get(ref.data, "object");
+    if (get(object, "type") !== "commit") throw shape(`ref heads/${branch} does not point at a commit`);
+    return getString(object, "sha");
+  }
+
+  async function commitInfo(rp: string, sha: string): Promise<{ tree: string; parents: string[] }> {
+    const c = await request("GET", `${rp}/git/commits/${sha}`);
+    const parents = get(c.data, "parents");
+    return {
+      tree: getString(get(c.data, "tree"), "sha"),
+      parents: Array.isArray(parents) ? parents.map((p) => getString(p, "sha")) : [],
+    };
+  }
+
+  async function getPull(rp: string, prNumber: number): Promise<PullRequestInfo & { changedFiles: number }> {
+    const r = await request("GET", `${rp}/pulls/${prNumber}`);
+    return { ...pullInfo(r.data), changedFiles: getNumber(r.data, "changed_files") };
+  }
+
+  async function findPullRequest(owner: string, repo: string, submissionId: string, headOwner = owner): Promise<PullRequestInfo | null> {
+    const rp = repoPath(owner, repo);
+    repoPath(headOwner, repo); // validates headOwner
+    checkSubmissionId(submissionId);
+    const label = `${headOwner}:commons/${submissionId}`;
+    const r = await request("GET", `${rp}/pulls?head=${encodeURIComponent(label)}&state=all&per_page=100`);
+    if (!Array.isArray(r.data)) throw shape("pull request list is not an array");
+    // GitHub filters by head already; checked again so a lookup never returns
+    // another submission's PR.
+    const prs = r.data.map(pullInfo).filter((p) => p.headLabel.toLowerCase() === label.toLowerCase());
+    return prs.find((p) => p.merged) ?? prs.find((p) => p.state === "open") ?? prs[0] ?? null;
+  }
 
   async function openPullRequest(args: OpenPullRequestArgs): Promise<OpenedPullRequest> {
     const rp = repoPath(args.owner, args.repo);
+    const hp = repoPath(args.headRepo.owner, args.headRepo.repo);
+    const sameRepo = hp.toLowerCase() === rp.toLowerCase();
+    if (sameRepo && args.allowSameRepoHead !== true) {
+      throw new GitHubError(0, `refusing to push commons/${args.submissionId} into ${args.owner}/${args.repo} itself: its CI would run unreviewed code with the repo's secrets; use a bot-owned fork as headRepo`);
+    }
     checkBranch(args.baseBranch);
     checkSubmissionId(args.submissionId);
+    checkTitle(args.title);
     if (args.baseCommit !== undefined) checkSha(args.baseCommit);
+    checkSha(args.expectedTree);
     const branch = `commons/${args.submissionId}`;
     // Parse before any request: a refused patch costs no API calls.
     const patches = parsePatch(args.patch);
-
-    let baseSha = args.baseCommit;
-    if (baseSha === undefined) {
-      const ref = await request("GET", `${rp}/git/ref/heads/${refUrl(args.baseBranch)}`);
-      const object = get(ref.data, "object");
-      if (get(object, "type") !== "commit") throw shape(`ref heads/${args.baseBranch} does not point at a commit`);
-      baseSha = getString(object, "sha");
+    const files = [...new Set(patches.flatMap(touchedPaths))].sort();
+    for (const f of files) {
+      if (/^\.github(\/|$)/i.test(f) && args.allowDotGithub?.(f) !== true) {
+        throw new PatchError(`${f}: changes under .github/ need explicit approval`);
+      }
     }
-    const baseCommit = await request("GET", `${rp}/git/commits/${baseSha}`);
-    const baseTree = getString(get(baseCommit.data, "tree"), "sha");
+
+    // Reads only until every file is validated: a refused patch writes nothing.
+    const tip = await branchHead(rp, args.baseBranch);
+    const baseSha = args.baseCommit ?? tip;
+    if (baseSha !== tip) {
+      const cmp = await request("GET", `${rp}/compare/${baseSha}...${tip}?per_page=1`);
+      const status = getString(cmp.data, "status");
+      // ahead: the branch contains baseSha and more. Anything else means the
+      // parent would bring in commits the branch does not have.
+      if (status !== "ahead") throw new PatchError(`base commit ${baseSha} is not in ${args.baseBranch} (${status})`);
+    }
+    const baseTree = (await commitInfo(rp, baseSha)).tree;
 
     const trees = new Map<string, TreeItem[]>();
     async function readTree(sha: string): Promise<TreeItem[]> {
@@ -228,24 +349,20 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     async function absent(path: string): Promise<void> {
       if ((await lookup(path)) !== null) throw new PatchError(`${path}: already exists at the base commit`);
     }
-    async function blob(text: string): Promise<string> {
-      const r = await request("POST", `${rp}/git/blobs`, {
-        content: Buffer.from(text, "utf8").toString("base64"),
-        encoding: "base64",
-      });
-      return getString(r.data, "sha");
-    }
 
-    const entries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
+    // New contents go inline in the tree request (`content`), so a patch costs
+    // four writes whatever its size: tree, commit, ref, pull request.
+    type Entry = { path: string; mode: string; type: "blob"; sha?: string | null; content?: string };
+    const entries: Entry[] = [];
     for (const p of patches) {
       if (p.kind === "add") {
         await absent(p.newPath);
-        const text = p.hunks.length > 0 ? applyHunks("", p.hunks, p.newPath) : "";
-        entries.push({ path: p.newPath, mode: p.newMode, type: "blob", sha: await blob(text) });
+        const content = p.hunks.length > 0 ? applyHunks("", parseHunks(p.hunks, p.newPath), p.newPath) : "";
+        entries.push({ path: p.newPath, mode: p.newMode, type: "blob", content });
       } else if (p.kind === "delete") {
         const old = await existing(p.oldPath);
         checkMode(p.oldPath, old.mode, p.oldMode);
-        const rest = p.hunks.length > 0 ? applyHunks(old.text, p.hunks, p.oldPath) : old.text;
+        const rest = p.hunks.length > 0 ? applyHunks(old.text, parseHunks(p.hunks, p.oldPath), p.oldPath) : old.text;
         if (rest !== "") throw new PatchError(`${p.oldPath}: deletion does not remove the whole file`);
         entries.push({ path: p.oldPath, mode: old.mode, type: "blob", sha: null });
       } else {
@@ -253,43 +370,77 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
         checkMode(p.oldPath, old.mode, p.oldMode);
         if (p.kind !== "modify") await absent(p.newPath);
         const mode = p.newMode ?? old.mode;
-        const sha = p.hunks.length > 0 ? await blob(applyHunks(old.text, p.hunks, p.oldPath)) : old.sha;
         if (p.kind === "rename") entries.push({ path: p.oldPath, mode: old.mode, type: "blob", sha: null });
-        entries.push({ path: p.newPath, mode, type: "blob", sha });
+        if (p.hunks.length > 0) {
+          entries.push({ path: p.newPath, mode, type: "blob", content: applyHunks(old.text, parseHunks(p.hunks, p.oldPath), p.oldPath) });
+        } else {
+          entries.push({ path: p.newPath, mode, type: "blob", sha: old.sha });
+        }
       }
     }
 
-    const tree = await request("POST", `${rp}/git/trees`, { base_tree: baseTree, tree: entries });
+    const tree = await request("POST", `${hp}/git/trees`, { base_tree: baseTree, tree: entries });
     const treeSha = getString(tree.data, "sha");
     if (treeSha === baseTree) throw new PatchError("patch changes nothing");
-    const commit = await request("POST", `${rp}/git/commits`, {
+    if (treeSha !== args.expectedTree) {
+      throw new PatchError(`patch produces tree ${treeSha}, but the submission's head commit has tree ${args.expectedTree}`);
+    }
+    const commit = await request("POST", `${hp}/git/commits`, {
       message: `${args.title}\n\nCommons-Submission: ${args.submissionId}\n`,
       tree: treeSha,
       parents: [baseSha],
     });
-    const headSha = getString(commit.data, "sha");
-    await request("POST", `${rp}/git/refs`, { ref: `refs/heads/${branch}`, sha: headSha });
-    let pr: Reply;
+    let headSha = getString(commit.data, "sha");
+
+    // Nothing below deletes the branch. A branch left by a failed or lost
+    // request is reused by the retry when it holds this change; deleting it
+    // after an ambiguous failure could close a PR that was in fact opened.
     try {
-      pr = await request("POST", `${rp}/pulls`, { title: args.title, head: branch, base: args.baseBranch, body: args.body });
+      await request("POST", `${hp}/git/refs`, { ref: `refs/heads/${branch}`, sha: headSha });
     } catch (e) {
-      // Leave no orphan branch behind: it would block a retry with the same id.
-      await request("DELETE", `${rp}/git/refs/heads/${refUrl(branch)}`).catch(() => undefined);
-      throw e;
+      if (!(e instanceof GitHubError && e.status === 422)) throw e;
+      const there = await branchHead(hp, branch);
+      const c = await commitInfo(hp, there);
+      if (c.tree !== treeSha || c.parents.length !== 1 || c.parents[0] !== baseSha) {
+        throw new GitHubError(422, `${branch} already exists in ${args.headRepo.owner}/${args.headRepo.repo} with a different change (${there})`);
+      }
+      headSha = there;
     }
-    return {
-      number: getNumber(pr.data, "number"),
-      url: getString(pr.data, "html_url"),
-      branch,
-      baseSha,
-      headSha,
-      files: [...new Set(entries.map((e) => e.path))].sort(),
-    };
+
+    const head = sameRepo ? branch : `${args.headRepo.owner}:${branch}`;
+    const prBody: Record<string, string | boolean> = { title: args.title, head, base: args.baseBranch, body: args.body };
+    if (!sameRepo) {
+      // Only the bot may move the head: maintainers pushing to the fork branch
+      // would change what the head-sha guard protects.
+      prBody.maintainer_can_modify = false;
+      // GitHub needs head_repo for a cross-repo PR within one owner.
+      if (args.headRepo.owner.toLowerCase() === args.owner.toLowerCase()) prBody.head_repo = args.headRepo.repo;
+    }
+    let number: number;
+    let url: string;
+    try {
+      const pr = await request("POST", `${rp}/pulls`, prBody);
+      number = getNumber(pr.data, "number");
+      url = getString(pr.data, "html_url");
+    } catch (e) {
+      // 422 "already exists" (an earlier attempt opened it) or a lost reply:
+      // the PR may be there. Return it only if it is exactly this change.
+      if (!(e instanceof GitHubError) || (e.status !== 0 && e.status !== 422)) throw e;
+      const found = await findPullRequest(args.owner, args.repo, args.submissionId, args.headRepo.owner).catch(() => null);
+      if (!found || found.state !== "open" || found.headSha !== headSha || found.baseRef !== args.baseBranch) throw e;
+      number = found.number;
+      url = found.url;
+    }
+    return { number, url, branch, baseSha, headSha, treeSha, files };
   }
 
-  async function listChangedFiles(owner: string, repo: string, prNumber: number): Promise<ChangedFile[]> {
+  async function listChangedFiles(owner: string, repo: string, prNumber: number, expectedHeadSha: string): Promise<ChangedFile[]> {
     const rp = repoPath(owner, repo);
     checkPrNumber(prNumber);
+    checkSha(expectedHeadSha);
+    const moved = (sha: string) => new GitHubError(409, `pull ${prNumber}: head is ${sha}, expected ${expectedHeadSha}`);
+    const before = await getPull(rp, prNumber);
+    if (before.headSha !== expectedHeadSha) throw moved(before.headSha);
     const files: ChangedFile[] = [];
     for (let page = 1; ; page++) {
       if (page > MAX_PAGES) throw new GitHubError(0, `pull ${prNumber}: more than ${MAX_PAGES} pages of files`);
@@ -308,13 +459,14 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
       }
       if (!hasNextPage(r.link)) break;
     }
-    // GitHub silently stops listing at 3000 files. An incomplete list would let
-    // a change hide files from ring and airlock checks, so compare against the
-    // count GitHub reports for the PR and refuse any mismatch.
-    const pr = await request("GET", `${rp}/pulls/${prNumber}`);
-    const expected = getNumber(pr.data, "changed_files");
-    if (expected !== files.length) {
-      throw new GitHubError(0, `pull ${prNumber}: listed ${files.length} files but GitHub reports ${expected}`);
+    // The pages are separate reads: a push in between would mix two heads.
+    // GitHub also silently stops listing at 3000 files, and an incomplete list
+    // would hide files from ring and airlock checks. Re-read the PR and
+    // require the same head and GitHub's own file count.
+    const after = await getPull(rp, prNumber);
+    if (after.headSha !== expectedHeadSha) throw moved(after.headSha);
+    if (after.changedFiles !== files.length) {
+      throw new GitHubError(0, `pull ${prNumber}: listed ${files.length} files but GitHub reports ${after.changedFiles}`);
     }
     return files;
   }
@@ -324,7 +476,7 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     repo: string,
     prNumber: number,
     sha: string,
-    message: { title?: string; body?: string } = {},
+    m: MergeOptions = {},
   ): Promise<{ sha: string }> {
     const rp = repoPath(owner, repo);
     checkPrNumber(prNumber);
@@ -332,10 +484,41 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     // the commit that passed gates and review (409 otherwise), so a push after
     // review can never ride along.
     checkSha(sha);
+    if (m.expectedTree !== undefined) checkSha(m.expectedTree);
+    if (m.expectedBase !== undefined) checkSha(m.expectedBase);
+    const alreadyMerged = (pr: PullRequestInfo): { sha: string } | null =>
+      pr.merged && pr.headSha === sha && pr.mergeCommitSha !== null ? { sha: pr.mergeCommitSha } : null;
+
+    if (m.expectedTree !== undefined || m.expectedBase !== undefined) {
+      const pr = await getPull(rp, prNumber);
+      const done = alreadyMerged(pr);
+      if (done) return done;
+      if (pr.headSha !== sha) throw new GitHubError(409, `pull ${prNumber}: head is ${pr.headSha}, expected ${sha}`);
+      if (m.expectedTree !== undefined) {
+        const tree = (await commitInfo(rp, sha)).tree;
+        if (tree !== m.expectedTree) throw new GitHubError(0, `pull ${prNumber}: head tree is ${tree}, expected ${m.expectedTree}`);
+      }
+      if (m.expectedBase !== undefined) {
+        const tip = await branchHead(rp, pr.baseRef);
+        if (tip !== m.expectedBase) throw new GitHubError(409, `pull ${prNumber}: ${pr.baseRef} is at ${tip}, expected ${m.expectedBase}`);
+      }
+    }
     const body: Record<string, string> = { sha, merge_method: "squash" };
-    if (message.title !== undefined) body.commit_title = message.title;
-    if (message.body !== undefined) body.commit_message = message.body;
-    const r = await request("PUT", `${rp}/pulls/${prNumber}/merge`, body);
+    if (m.title !== undefined) body.commit_title = m.title;
+    if (m.body !== undefined) body.commit_message = m.body;
+    let r: Reply;
+    try {
+      r = await request("PUT", `${rp}/pulls/${prNumber}/merge`, body);
+    } catch (e) {
+      // An earlier attempt may have merged and lost the reply, or merged and
+      // then failed to record it: GitHub refuses a second merge (405).
+      if (e instanceof GitHubError && (e.status === 405 || e.status === 409 || e.status === 422)) {
+        const pr = await getPull(rp, prNumber).catch(() => null);
+        const done = pr && alreadyMerged(pr);
+        if (done) return done;
+      }
+      throw e;
+    }
     if (get(r.data, "merged") !== true) {
       const why = get(r.data, "message");
       throw new GitHubError(r.status, redact(`pull ${prNumber} not merged: ${typeof why === "string" ? why : "no reason given"}`));
@@ -367,24 +550,41 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     return { id: getNumber(r.data, "id"), url: getString(r.data, "html_url") };
   }
 
-  return { openPullRequest, listChangedFiles, mergePullRequest, fastForward, commentOnPullRequest };
+  return { openPullRequest, findPullRequest, listChangedFiles, mergePullRequest, fastForward, commentOnPullRequest };
 }
 
 // One-shot forms of the client methods, for callers that do not keep a client.
+// Same parameters as the client methods, plus the client options last.
 export function openPullRequest(args: OpenPullRequestArgs, opts?: GitHubOptions): Promise<OpenedPullRequest> {
   return createGitHub(opts).openPullRequest(args);
 }
-export function listChangedFiles(owner: string, repo: string, prNumber: number, opts?: GitHubOptions): Promise<ChangedFile[]> {
-  return createGitHub(opts).listChangedFiles(owner, repo, prNumber);
+export function findPullRequest(
+  owner: string,
+  repo: string,
+  submissionId: string,
+  headOwner?: string,
+  opts?: GitHubOptions,
+): Promise<PullRequestInfo | null> {
+  return createGitHub(opts).findPullRequest(owner, repo, submissionId, headOwner);
+}
+export function listChangedFiles(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  expectedHeadSha: string,
+  opts?: GitHubOptions,
+): Promise<ChangedFile[]> {
+  return createGitHub(opts).listChangedFiles(owner, repo, prNumber, expectedHeadSha);
 }
 export function mergePullRequest(
   owner: string,
   repo: string,
   prNumber: number,
   sha: string,
+  merge?: MergeOptions,
   opts?: GitHubOptions,
 ): Promise<{ sha: string }> {
-  return createGitHub(opts).mergePullRequest(owner, repo, prNumber, sha);
+  return createGitHub(opts).mergePullRequest(owner, repo, prNumber, sha, merge);
 }
 export function fastForward(owner: string, repo: string, branch: string, sha: string, opts?: GitHubOptions): Promise<{ sha: string }> {
   return createGitHub(opts).fastForward(owner, repo, branch, sha);
@@ -399,6 +599,16 @@ export function commentOnPullRequest(
   return createGitHub(opts).commentOnPullRequest(owner, repo, prNumber, body);
 }
 
+// Participant text for a PR body or comment, as a fenced code block: GitHub
+// renders it verbatim, @mentions inside do not notify, and readers (people and
+// reviewer agents) can see where the coordinator's words end. The fence is
+// longer than any backtick run in the text, so the text cannot close it.
+export function fenceUntrusted(text: string): string {
+  const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}text\n${text.replace(/\r/g, "")}\n${fence}`;
+}
+
 // ---------------------------------------------------------------------------
 // Patch parsing and application. Pure.
 // ---------------------------------------------------------------------------
@@ -411,33 +621,38 @@ export type FilePatch =
 
 const FILE_MODES = new Set(["100644", "100755"]);
 
+// Every path a section writes or deletes. A copy leaves its source untouched.
+function touchedPaths(p: FilePatch): string[] {
+  if (p.kind === "add") return [p.newPath];
+  if (p.kind === "delete") return [p.oldPath];
+  return p.kind === "rename" ? [p.oldPath, p.newPath] : [p.newPath];
+}
+
 // Parse `git diff` output into file sections. Strict: every section starts with
 // `diff --git a/<p> b/<p>`, only the extended headers git emits for text files
-// are accepted, and every path is checked by checkRepoPath. Hunk bodies are
-// validated when applied (applyHunks), not here.
+// are accepted, every path is checked by checkRepoPath, and every hunk is
+// checked for structure (header syntax, line tags, counts, order). Only the
+// match against file content is left to application.
 export function parsePatch(patch: string): FilePatch[] {
   if (patch === "") throw new PatchError("empty patch");
   const lines = (patch.endsWith("\n") ? patch.slice(0, -1) : patch).split("\n");
+  if (lines.length > PATCH_LIMITS.lines) throw new PatchError(`patch has more than ${PATCH_LIMITS.lines} lines`);
   if (!lines[0]?.startsWith("diff --git ")) throw new PatchError("patch must start with a `diff --git` line");
   const starts: number[] = [];
   lines.forEach((l, i) => {
     if (l.startsWith("diff --git ")) starts.push(i);
   });
+  if (starts.length > PATCH_LIMITS.files) throw new PatchError(`patch touches more than ${PATCH_LIMITS.files} files`);
   const result: FilePatch[] = [];
   const touched = new Set<string>();
-  const touch = (path: string): void => {
-    if (touched.has(path)) throw new PatchError(`${path}: appears more than once in the patch`);
-    touched.add(path);
-  };
   for (let s = 0; s < starts.length; s++) {
     const section = lines.slice(starts[s], starts[s + 1] ?? lines.length);
     const p = parseSection(section);
-    if (p.kind === "add") touch(p.newPath);
-    else if (p.kind === "delete") touch(p.oldPath);
-    else {
-      touch(p.newPath);
-      if (p.kind === "rename") touch(p.oldPath);
+    for (const path of touchedPaths(p)) {
+      if (touched.has(path)) throw new PatchError(`${path}: appears more than once in the patch`);
+      touched.add(path);
     }
+    if (p.hunks.length > 0) parseHunks(p.hunks, section[0] as string);
     result.push(p);
   }
   return result;
@@ -574,20 +789,28 @@ function checkMode(path: string, actual: string, stated: string | undefined): vo
   }
 }
 
-// A path the bridge will write: relative, POSIX, no traversal, nothing git or
-// GitHub would reinterpret. Throws PatchError.
+// A path the bridge will write: relative, POSIX, no traversal, and nothing git
+// on any filesystem would read as `.git` or `.gitmodules` (git's verify_path:
+// NTFS drops trailing dots and spaces and has 8.3 names like GIT~1 and ADS
+// names after `:`; HFS+ ignores invisible codepoints). Printable ASCII only,
+// which also rules out bidi and invisible characters that make a name read
+// differently in review; git quotes non-ASCII names in diffs anyway, and quoted
+// paths are refused. Throws PatchError.
 export function checkRepoPath(path: string): void {
   const bad = (why: string): never => {
     throw new PatchError(`${JSON.stringify(path)}: ${why}`);
   };
   if (path === "") bad("empty path");
   if (path.startsWith("/")) bad("absolute path");
-  if (/[\u0000-\u001f\u007f\\]/.test(path)) bad("control character or backslash in path");
-  if (path.startsWith('"')) bad("quoted path");
+  if (!/^[\x20-\x7e]+$/.test(path)) bad("path must be printable ASCII (no control, non-ASCII or invisible characters)");
+  if (/[\\:"]/.test(path)) bad("backslash, colon or quote in path");
   for (const segment of path.split("/")) {
     if (segment === "") bad("empty path segment");
     if (segment === "." || segment === "..") bad("path traversal");
-    if (segment.toLowerCase() === ".git") bad("path inside .git");
+    if (/[. ]$/.test(segment)) bad("path segment ends with a dot or space");
+    const lower = segment.toLowerCase();
+    if (lower === ".git" || lower === "git~1") bad("path inside .git");
+    if (lower === ".gitmodules" || lower === "gitmod~1") bad(".gitmodules is not supported");
   }
 }
 
@@ -616,22 +839,22 @@ export function applyUnifiedDiff(original: string, diff: string): string {
   }
   const hunks = lines.slice(i);
   if (hunks.length === 0 || (hunks.length === 1 && hunks[0] === "")) throw new PatchError("diff has no hunks");
-  return applyHunks(original, hunks, "file");
+  return applyHunks(original, parseHunks(hunks, "file"), "file");
 }
 
 type Line = { text: string; nl: boolean }; // nl: the line ends with "\n"
+type Hunk = { header: string; at: number; oldSide: Line[]; newSide: Line[] };
 
-// Apply hunk lines (starting at an @@ header) to `original`. Each hunk must
-// sit exactly where its header says, its context and removed lines must match
-// byte for byte (including the end-of-file newline state), and its header
-// counts must match its body.
-function applyHunks(original: string, lines: string[], name: string): string {
+// Parse hunk lines (starting at an @@ header). Checks everything that does not
+// need the file: header syntax, line tags, body length against the header
+// counts, order, and that each new-side start follows from the hunks before
+// it (no offsets). `at` is the 0-based old-side index the hunk replaces from.
+function parseHunks(lines: string[], name: string): Hunk[] {
   const bad = (why: string): never => {
     throw new PatchError(`${name}: ${why}`);
   };
-  const source = toLines(original);
-  const out: Line[] = [];
-  let cursor = 0; // next unconsumed index in source
+  const hunks: Hunk[] = [];
+  let cursor = 0; // first old-side index not covered by an earlier hunk
   let delta = 0; // new-side line count minus old-side line count so far
   let i = 0;
   if (lines.length === 0) bad("no hunks");
@@ -651,7 +874,6 @@ function applyHunks(original: string, lines: string[], name: string): string {
     // A zero-length side names the line *after which* it applies.
     const at = oldCount === 0 ? oldStart : oldStart - 1;
     if (at < cursor) bad(`hunk out of order or overlapping: ${header}`);
-    if (at + oldCount > source.length) bad(`hunk extends past the end of the file: ${header}`);
     const expectedNew = at + delta + (newCount === 0 ? 0 : 1);
     if (newStart !== expectedNew) bad(`hunk header offset: ${header} (expected +${expectedNew})`);
     i++;
@@ -677,17 +899,38 @@ function applyHunks(original: string, lines: string[], name: string): string {
       }
       for (const side of targets) side.push({ text, nl });
     }
-    for (let k = 0; k < oldSide.length; k++) {
-      const want = source[at + k] as Line;
-      const got = oldSide[k] as Line;
-      if (want.text !== got.text || want.nl !== got.nl) bad(`context mismatch at line ${at + k + 1}`);
-    }
-    out.push(...source.slice(cursor, at), ...newSide);
+    hunks.push({ header, at, oldSide, newSide });
     cursor = at + oldCount;
     delta += newCount - oldCount;
     if (i < lines.length && !lines[i]!.startsWith("@@")) bad(`unexpected line after hunk: ${JSON.stringify(lines[i])}`);
   }
-  out.push(...source.slice(cursor));
+  return hunks;
+}
+
+// Apply parsed hunks to `original`. Each hunk must sit exactly where its header
+// says, and its context and removed lines must match byte for byte, including
+// the end-of-file newline state.
+function applyHunks(original: string, hunks: Hunk[], name: string): string {
+  const bad = (why: string): never => {
+    throw new PatchError(`${name}: ${why}`);
+  };
+  const source = toLines(original);
+  // Appended one at a time: spreading a large slice into push() overflows the
+  // call stack on files of ~100k lines.
+  const out: Line[] = [];
+  let cursor = 0;
+  for (const h of hunks) {
+    if (h.at + h.oldSide.length > source.length) bad(`hunk extends past the end of the file: ${h.header}`);
+    for (let k = 0; k < h.oldSide.length; k++) {
+      const want = source[h.at + k] as Line;
+      const got = h.oldSide[k] as Line;
+      if (want.text !== got.text || want.nl !== got.nl) bad(`context mismatch at line ${h.at + k + 1}`);
+    }
+    for (let k = cursor; k < h.at; k++) out.push(source[k] as Line);
+    for (const l of h.newSide) out.push(l);
+    cursor = h.at + h.oldSide.length;
+  }
+  for (let k = cursor; k < source.length; k++) out.push(source[k] as Line);
   for (let k = 0; k < out.length - 1; k++) {
     if (!out[k]!.nl) bad("a line without a trailing newline is not at the end of the file");
   }
@@ -728,6 +971,20 @@ function errorText(data: unknown, text: string, parsed: boolean): string {
   return text.slice(0, 500) || "(empty response)";
 }
 
+function pullInfo(v: unknown): PullRequestInfo {
+  const merge = get(v, "merge_commit_sha");
+  return {
+    number: getNumber(v, "number"),
+    url: getString(v, "html_url"),
+    state: getString(v, "state"),
+    merged: get(v, "merged_at") !== null && get(v, "merged_at") !== undefined,
+    mergeCommitSha: typeof merge === "string" ? merge : null,
+    headSha: getString(get(v, "head"), "sha"),
+    headLabel: getString(get(v, "head"), "label"),
+    baseRef: getString(get(v, "base"), "ref"),
+  };
+}
+
 function shape(what: string): GitHubError {
   return new GitHubError(0, `unexpected GitHub response: ${what}`);
 }
@@ -749,12 +1006,26 @@ function getNumber(v: unknown, key: string): number {
   return n;
 }
 
+function repoPath(owner: string, repo: string): string {
+  if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo) || owner.startsWith(".") || repo.startsWith(".")) {
+    throw new GitHubError(0, `invalid repository ${JSON.stringify(owner)}/${JSON.stringify(repo)}`);
+  }
+  return `/repos/${owner}/${repo}`;
+}
+
 function checkSha(sha: string): void {
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) throw new GitHubError(0, `invalid commit sha ${JSON.stringify(sha)}`);
 }
 
 function checkPrNumber(n: number): void {
   if (!Number.isSafeInteger(n) || n <= 0) throw new GitHubError(0, `invalid pull request number ${n}`);
+}
+
+// The title becomes the commit subject: a newline would let it forge trailers.
+function checkTitle(title: string): void {
+  if (title.trim() === "" || title.length > 256 || /[\u0000-\u001f\u007f‪-‮⁦-⁩]/.test(title)) {
+    throw new GitHubError(0, `title must be one line of 1-256 characters without control characters`);
+  }
 }
 
 // Submission ids become branch names, so they are held to ref-name rules.

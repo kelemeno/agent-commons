@@ -7,6 +7,7 @@ import { canonical, generateKeyPair, keyIdOf, sha256hex } from "../src/crypto";
 import { Ledger, type Signer } from "../src/ledger";
 import { defaultRules } from "../src/rules";
 import {
+  MAX_WEIGHT,
   computeBeacon,
   drawFraction,
   selectReviewers,
@@ -19,11 +20,11 @@ import type { CommonsState, EntryBody, KeyId, OwnerId, Rules, TreeView } from ".
 // ---------------------------------------------------------------------------
 // Fixture. Twelve owners o0..o11; the author is o7:
 //
-//   o0 ─┬─ o1 ─┬─ o3 ─┬─ o7 (author)       distance from o7, weight (N = 2)
+//   o0 ─┬─ o1 ─┬─ o3 ─┬─ o7 (author)       distance from o7, weight (N = 2, cap 2)
 //       │      │      └─ o8                 o3 1 ✗, o1 2 ✗, o8 2 ✗
-//       │      └─ o4                        o4 3 w1, o0 3 w1, o2 4 w2
-//       └─ o2 ─┬─ o5 ─┬─ o9                 o5 5 w3, o6 5 w3
-//              │      └─ o10                o9 6 w4, o10 6 w4, o11 6 w4
+//       │      └─ o4                        o4 3 w1, o0 3 w1 (lineal), o2 4 w2
+//       └─ o2 ─┬─ o5 ─┬─ o9                 o5 5 w2, o6 5 w2
+//              │      └─ o10                o9 6 w2, o10 6 w2, o11 6 w2
 //              └─ o6 ─── o11
 // ---------------------------------------------------------------------------
 
@@ -44,7 +45,7 @@ const PARENTS: Record<OwnerId, OwnerId | null> = {
 const TREE = treeFromParents(PARENTS);
 const OWNERS = Object.keys(PARENTS);
 const NEAR = ["o1", "o3", "o8"];
-const WEIGHT: Record<string, number> = { o0: 1, o4: 1, o2: 2, o5: 3, o6: 3, o9: 4, o10: 4, o11: 4 };
+const WEIGHT: Record<string, number> = { o0: 1, o4: 1, o2: 2, o5: 2, o6: 2, o9: 2, o10: 2, o11: 2 };
 const ELIGIBLE = Object.keys(WEIGHT);
 
 const T0 = Date.UTC(2026, 0, 1);
@@ -137,10 +138,15 @@ class World {
 
 // Every owner registered; one agent each (`ag-<owner>`). The author agent is
 // `ag-o7` (claude); everyone else is "gpt" unless `families` says otherwise.
-function world(opts: { rules?: Partial<Rules>; families?: Record<string, string> } = {}): World {
+// `owners` and `author` replace the fixture's for tests with their own tree.
+function world(
+  opts: { rules?: Partial<Rules>; families?: Record<string, string>; owners?: string[]; author?: string } = {},
+): World {
   const w = new World(opts.rules);
-  for (const o of OWNERS) w.owner(o);
-  for (const o of OWNERS) w.agent(`ag-${o}`, o, opts.families?.[o] ?? (o === "o7" ? "claude" : "gpt"));
+  const owners = opts.owners ?? OWNERS;
+  const author = opts.author ?? "o7";
+  for (const o of owners) w.owner(o);
+  for (const o of owners) w.agent(`ag-${o}`, o, opts.families?.[o] ?? (o === author ? "claude" : "gpt"));
   return w;
 }
 
@@ -237,7 +243,7 @@ test("never picks the author's owner, near owners, inactive agents, or owners ou
   }
 });
 
-test("distant owners are drawn more often, in proportion to distance minus N", (t) => {
+test("distant owners are drawn more often, in proportion to the capped weight", (t) => {
   // One seat: with Efraimidis–Spirakis the top score wins with probability w_i / Σw.
   const w = world({ rules: { assignedReviewers: 1, requireOtherModelFamily: false } }).submit("s1", "ag-o7");
   t.after(() => w.cleanup());
@@ -261,7 +267,8 @@ test("distant owners are drawn more often, in proportion to distance minus N", (
   for (const o of NEAR) assert.equal(counts.get(o) ?? 0, 0);
   const far = (counts.get("o9") ?? 0) + (counts.get("o10") ?? 0) + (counts.get("o11") ?? 0);
   const close = (counts.get("o0") ?? 0) + (counts.get("o4") ?? 0);
-  assert.ok(far > 4 * close, `far ${far} vs close ${close}`);
+  // Weights 6 vs 2: three times as many seats, give or take sampling noise.
+  assert.ok(far > 2.4 * close, `far ${far} vs close ${close}`);
 });
 
 test("with three seats, distant owners still fill more seats than close ones", (t) => {
@@ -276,8 +283,8 @@ test("with three seats, distant owners still fill more seats than close ones", (
     }
   }
   const c = (o: string) => counts.get(o) ?? 0;
-  assert.ok(c("o9") > c("o2") && c("o2") > c("o4"), `o9 ${c("o9")}, o2 ${c("o2")}, o4 ${c("o4")}`);
-  assert.ok(c("o11") > 1.5 * c("o0"));
+  assert.ok(c("o9") > 1.3 * c("o4") && c("o2") > 1.3 * c("o4"), `o9 ${c("o9")}, o2 ${c("o2")}, o4 ${c("o4")}`);
+  assert.ok(c("o11") > 1.3 * c("o0"));
 });
 
 test("gaming: registering many agents does not buy an owner more seats", (t) => {
@@ -480,4 +487,220 @@ test("verifyAssignmentInLedger audits an old assignment after the agent pool cha
   w.append({ kind: "agentRevoked", agent: seated, reason: "left" }, w.key(seatedOwner));
   assert.equal(verifyAssignment(w.state, TREE, "s1"), false, "current-state check is only exact while the pool is unchanged");
   assert.equal(verifyAssignmentInLedger(w.ledger.entries(), TREE, "s1"), true);
+});
+
+test("verifyAssignmentInLedger with the entropy also checks how the beacon was derived", (t) => {
+  const w = world().submit("s1", "ag-o7");
+  t.after(() => w.cleanup());
+  const beacon = computeBeacon(w.state, "s1", "drand-7");
+  w.assign("s1", beacon, selectReviewers(w.state, TREE, "s1", beacon).reviewers);
+  assert.equal(verifyAssignmentInLedger(w.ledger.entries(), TREE, "s1", "drand-7"), true);
+  assert.equal(verifyAssignmentInLedger(w.ledger.entries(), TREE, "s1", "drand-8"), false);
+});
+
+test("gaming: a beacon chosen by the coordinator fails the entropy check even with a matching draw", (t) => {
+  const w = world().submit("s1", "ag-o7");
+  t.after(() => w.cleanup());
+  // The coordinator grinds arbitrary beacons and records one; the draw itself is consistent.
+  const ground = sha256hex("ground-42");
+  w.assign("s1", ground, selectReviewers(w.state, TREE, "s1", ground).reviewers);
+  assert.equal(verifyAssignmentInLedger(w.ledger.entries(), TREE, "s1"), true, "without the entropy this passes");
+  assert.equal(verifyAssignmentInLedger(w.ledger.entries(), TREE, "s1", "drand-7"), false);
+});
+
+// ---------------------------------------------------------------------------
+// The documented algorithm, reimplemented from the header of selection.ts, as
+// a third-party verifier would. Exact integer comparison throughout.
+// ---------------------------------------------------------------------------
+
+function referenceRanking(tree: TreeView, author: OwnerId, owners: OwnerId[], beacon: string, n: number): OwnerId[] {
+  const SPAN = 16n ** 13n;
+  const scored: { owner: OwnerId; U: bigint; w: bigint }[] = [];
+  for (const o of owners) {
+    if (o === author) continue;
+    const d = tree.distance(o, author);
+    if (d <= n) continue;
+    const lineal = d === Math.abs(tree.depth(o) - tree.depth(author));
+    const w = lineal ? 1 : Math.min(d - n, MAX_WEIGHT);
+    const raw = BigInt(`0x${sha256hex(`${beacon}:owner:${o}`).slice(0, 13)}`);
+    scored.push({ owner: o, U: raw === 0n ? 1n : raw, w: BigInt(w) });
+  }
+  scored.sort((a, b) => {
+    const l = a.U ** b.w * SPAN ** a.w;
+    const r = b.U ** a.w * SPAN ** b.w;
+    return l > r ? -1 : l < r ? 1 : 0;
+  });
+  return scored.map((x) => x.owner);
+}
+
+test("the draw matches an independent reimplementation of the documented algorithm", (t) => {
+  const w = world({ rules: { requireOtherModelFamily: false } }).submit("s1", "ag-o7");
+  t.after(() => w.cleanup());
+  const st = w.state;
+  for (const b of beacons(300)) {
+    const expected = referenceRanking(TREE, "o7", OWNERS, b, st.rules.minTreeDistance).slice(0, 3);
+    const got = selectReviewers(st, TREE, "s1", b).reviewers.map((k) => ownerOf(st, k));
+    assert.deepEqual(got, expected, `beacon ${b}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Gaming: long invite chains. Probe from review: socks at increasing distance
+// used to hold increasing weights, so the longest chain won the most seats.
+// ---------------------------------------------------------------------------
+
+// r ─┬─ A (author) ── s1 ── s2 ── … ── s8          (a chain the author built)
+//    ├─ q1 ── q2 ── … ── q8                         (a chain on a side branch)
+//    ├─ h1 ── h1a ── h1b    (and h2…, h3…)          (ordinary members)
+function chainTree() {
+  const parents: Record<OwnerId, OwnerId | null> = { r: null, A: "r" };
+  for (let i = 1; i <= 8; i++) parents[`s${i}`] = i === 1 ? "A" : `s${i - 1}`;
+  for (let i = 1; i <= 8; i++) parents[`q${i}`] = i === 1 ? "r" : `q${i - 1}`;
+  for (const h of ["h1", "h2", "h3"]) {
+    parents[h] = "r";
+    parents[`${h}a`] = h;
+    parents[`${h}b`] = `${h}a`;
+  }
+  return { tree: treeFromParents(parents), owners: Object.keys(parents) };
+}
+
+test("gaming: a deep chain of invitees gains nothing from its depth", (t) => {
+  const { tree, owners } = chainTree();
+  const w = world({ owners, author: "A", rules: { assignedReviewers: 1, requireOtherModelFamily: false } });
+  w.submit("s1", "ag-A");
+  t.after(() => w.cleanup());
+  const st = w.state;
+  const counts = new Map<OwnerId, number>();
+  const n = 4000;
+  for (const b of beacons(n)) {
+    const [k] = selectReviewers(st, tree, "s1", b).reviewers;
+    assert.ok(k);
+    const o = ownerOf(st, k);
+    counts.set(o, (counts.get(o) ?? 0) + 1);
+  }
+  const c = (o: string) => counts.get(o) ?? 0;
+  // Lineal socks s3..s8 (weight 1 each, however deep) vs an ordinary weight-1 member.
+  for (const s of ["s3", "s8"]) assert.ok(Math.abs(c(s) - c("h1a")) < 90, `${s} ${c(s)} vs h1a ${c("h1a")}`);
+  // The side chain: q3 and q8 both sit past the cap, so they hold the same weight.
+  assert.ok(Math.abs(c("q8") - c("q3")) < 120, `q8 ${c("q8")} vs q3 ${c("q3")}`);
+  assert.ok(c("h1b") > 1.4 * c("s8"), `a distant member beats the deepest lineal sock (${c("h1b")} vs ${c("s8")})`);
+  // Total weight: s3..s8 = 6, q2 = 1, q3..q8 = 12, h*a = 3, h*b = 6 → 28. The
+  // author's own chain is entitled to 6/28 of the seats, not the 21/42 an
+  // uncapped weight would give it.
+  const lineal = ["s3", "s4", "s5", "s6", "s7", "s8"].reduce((a, s) => a + c(s), 0);
+  assert.ok(lineal < 0.27 * n, `lineal socks took ${lineal} of ${n}`);
+});
+
+test("gaming: with three seats the author's own chain rarely fills the panel", (t) => {
+  const { tree, owners } = chainTree();
+  const w = world({ owners, author: "A", rules: { requireOtherModelFamily: false } });
+  w.submit("s1", "ag-A");
+  t.after(() => w.cleanup());
+  const st = w.state;
+  let allSocks = 0;
+  const n = 2000;
+  for (const b of beacons(n)) {
+    const owners = selectReviewers(st, tree, "s1", b).reviewers.map((k) => ownerOf(st, k));
+    assert.equal(owners.length, 3);
+    if (owners.every((o) => /^s\d$/.test(o))) allSocks += 1;
+  }
+  assert.ok(allSocks < 0.03 * n, `all-sock panels: ${allSocks} of ${n}`);
+});
+
+// ---------------------------------------------------------------------------
+// Model family: which seat the rule takes and who gets it
+// ---------------------------------------------------------------------------
+
+test("model family: the lowest pick is replaced by the best-scored other-family agent", (t) => {
+  // claude everywhere except o4, o0 (weight 1) and o2 (weight 2), which are gpt.
+  const gpt = new Set(["o4", "o0", "o2"]);
+  const families = Object.fromEntries(OWNERS.map((o) => [o, gpt.has(o) ? "gpt" : "claude"]));
+  const on = world({ families }).submit("s1", "ag-o7");
+  const off = world({ families, rules: { requireOtherModelFamily: false, assignedReviewers: OWNERS.length } });
+  off.submit("s1", "ag-o7");
+  t.after(() => {
+    on.cleanup();
+    off.cleanup();
+  });
+  // The same keys are not shared between worlds, so compare by owner.
+  const ranked = (b: string) => selectReviewers(off.state, TREE, "s1", b).reviewers.map((k) => ownerOf(off.state, k));
+  let intervened = 0;
+  const bestOther = new Map<OwnerId, number>();
+  for (const b of beacons(400)) {
+    const full = ranked(b); // every eligible owner, best first
+    const got = selectReviewers(on.state, TREE, "s1", b).reviewers.map((k) => ownerOf(on.state, k));
+    const top = full.slice(0, 3);
+    if (top.some((o) => gpt.has(o))) {
+      assert.deepEqual(got, top, "no intervention when a gpt owner is drawn anyway");
+      continue;
+    }
+    intervened += 1;
+    const other = full.find((o) => gpt.has(o));
+    assert.ok(other);
+    bestOther.set(other, (bestOther.get(other) ?? 0) + 1);
+    assert.deepEqual(got, [...top.slice(0, 2), other], `beacon ${b}: top two kept, third seat to ${other}`);
+  }
+  assert.ok(intervened > 100, `the rule intervened ${intervened} times`);
+  assert.ok(bestOther.size > 1, "the test covers more than one possible other-family owner");
+});
+
+test("model family: case and spaces do not make a different family", (t) => {
+  const families = Object.fromEntries(OWNERS.map((o, i) => [o, ["Claude", "claude ", " CLAUDE", "claude"][i % 4] as string]));
+  const w = world({ families }).submit("s1", "ag-o7");
+  t.after(() => w.cleanup());
+  const { notes } = selectReviewers(w.state, TREE, "s1", "b");
+  assert.ok(notes.some((n) => /no eligible reviewer has a model family other than the author's \(claude\)/.test(n)), notes.join("; "));
+  assert.ok(!notes.some((n) => n.startsWith("seat given")));
+});
+
+// ---------------------------------------------------------------------------
+// Owner identity follows the tree
+// ---------------------------------------------------------------------------
+
+// Mimics the Anthill readers: ids are case-insensitive, queries fold to lowercase.
+function foldingTree(parents: Record<OwnerId, OwnerId | null>): TreeView {
+  const t = treeFromParents(parents);
+  const f = (id: OwnerId) => id.toLowerCase();
+  return {
+    root: () => t.root(),
+    has: (id) => t.has(f(id)),
+    parent: (id) => t.parent(f(id)),
+    children: (id) => t.children(f(id)),
+    depth: (id) => t.depth(f(id)),
+    distance: (a, b) => t.distance(f(a), f(b)),
+    members: () => t.members(),
+    reputation: (id) => t.reputation(f(id)),
+  };
+}
+
+test("gaming: one member registered under two spellings holds one ticket and one seat", (t) => {
+  const tree = foldingTree(PARENTS);
+  const base = world({ rules: { requireOtherModelFamily: false } }).submit("s1", "ag-o7");
+  const twice = world({ rules: { requireOtherModelFamily: false } });
+  twice.owner("O9").agent("ag-O9", "O9", "gpt").submit("s1", "ag-o7");
+  t.after(() => {
+    base.cleanup();
+    twice.cleanup();
+  });
+  const seats = (st: CommonsState, b: string) =>
+    selectReviewers(st, tree, "s1", b)
+      .reviewers.map((k) => ownerOf(st, k).toLowerCase())
+      .sort();
+  for (const b of beacons(400)) {
+    const sel = selectReviewers(twice.state, tree, "s1", b);
+    assert.equal(sel.candidates, ELIGIBLE.length, "O9 and o9 are one candidate");
+    const owners = seats(twice.state, b);
+    assert.equal(new Set(owners).size, owners.length, `two seats for o9: ${owners.join(",")}`);
+    assert.deepEqual(owners, seats(base.state, b), "the second spelling buys no extra ticket");
+  }
+});
+
+test("an author registered under another spelling is still excluded", (t) => {
+  const tree = foldingTree(PARENTS);
+  const w = world();
+  t.after(() => w.cleanup());
+  w.owner("O7").agent("ag-O7", "O7", "gpt").submit("s1", "ag-o7");
+  for (const b of beacons(200)) {
+    assert.ok(!selectReviewers(w.state, tree, "s1", b).reviewers.includes(w.id("ag-O7")));
+  }
 });

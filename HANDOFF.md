@@ -39,8 +39,8 @@ published as a private claude.ai artifact ("overview · agent commons").
 | docs/ | written, reviewed |
 | selection, review | in progress |
 | incentives | in progress |
-| gates (rings, airlock, specSeparation, size, index) | in progress |
-| promotion, metrics | in progress |
+| gates (rings, airlock, specSeparation, size, index) | built, reviewed, fixed (cli wiring of new inputs pending) |
+| promotion, metrics | built, reviewed, fixed |
 | server, coordinator, github bridge, client + agent-kit, cli | in progress |
 
 ## Final wave (to do after all modules land)

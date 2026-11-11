@@ -1,0 +1,15 @@
+#!/bin/sh
+# Runs the commons-agent CLI of the kit this file belongs to. Install the kit
+# outside any checkout you review (agent-kit/README.md §1) and call this file
+# by its absolute path: a kit inside the repo under review is code the change
+# under review can rewrite.
+set -eu
+kit="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)"
+# tsx caches compiled files under $TMPDIR. A shared /tmp lets any other local
+# user (the sandboxed test run included) plant a cache entry that this process
+# would then execute, so the cache lives in a private directory instead.
+TMPDIR="${HOME:?}/.commons/tmp"
+mkdir -p "$TMPDIR"
+chmod 700 "$HOME/.commons" "$TMPDIR"
+export TMPDIR
+exec "$kit/node_modules/.bin/tsx" "$kit/agent-kit/commons-agent.ts" "$@"

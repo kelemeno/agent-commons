@@ -40,9 +40,13 @@ const MAX_HOURS_TO_PROMOTION = 14 * 24;
 const MAX_OPEN_PER_RING = 20; // a queue reviewers are not keeping up with
 const MAX_GINI = 0.6; // one or two owners doing nearly everything; judged from:
 const MIN_EVENTS_FOR_GINI = 10;
-const MAX_RECIPROCITY = 0.3; // share of all reviews exchanged within one owner pair; judged from:
-const MIN_REVIEWS_FOR_RECIPROCITY = 10;
-const MAX_AGENTS_PER_OWNER = 3; // average active agents per active owner
+const MAX_RECIPROCITY = 0.3; // share of a pair's own open reviews that go to each other; judged from:
+const MIN_REVIEWS_FOR_RECIPROCITY = 10; // open reviews given by the pair together
+const MAX_CONCENTRATION = 0.8; // share of an owner's incoming open reviews from their top two reviewing owners; judged
+const MIN_INCOMING_FOR_CONCENTRATION = 10; // per owner, and only once this many owners give open reviews:
+const MIN_REVIEWING_OWNERS = 6; // below it, two reviewers per owner is all a small commons has
+const MAX_AGENTS_PER_OWNER = 3; // active agents per active owner, on average and for any one owner
+const MAX_FAMILIES_PER_OWNER = 2; // model families declared by one owner's unrevoked agents
 const MAX_STALE_PROPOSALS = 5;
 const MAX_GATE_FAILURE_RATE = 0.5; // a gate failing most runs is broken or being probed; judged from:
 const MIN_GATE_RUNS = 10;
@@ -70,35 +74,89 @@ export function gini(xs: readonly number[]): number {
   return (2 * weighted) / (n * total) - (n + 1) / n;
 }
 
-// Reviews exchanged inside the most reciprocal owner pair, as a share of all
-// revealed reviews. Only the reciprocated part counts: 2·min(a→b, b→a). One
-// owner reviewing another a lot is just a busy reviewer; two owners reviewing
-// each other is what a collusion ring looks like.
-export function reciprocity(state: CommonsState): { share: number; total: number; pair: [OwnerId, OwnerId] | null } {
-  const counts = new Map<string, number>(); // "reviewer\0author"
-  let total = 0;
+// Open reviews between owners: revealed reviews the reviewer chose to give,
+// i.e. not drawn by the beacon (assigned seats cannot be steered to a friend),
+// on organic work (the custodian never reviews back, so plant reviews would
+// only dilute a ring). Keyed "reviewer\0author".
+function openReviewEdges(state: CommonsState): Map<string, number> {
+  const edges = new Map<string, number>();
   for (const s of state.submissions.values()) {
+    if (s.planted !== undefined) continue;
     const author = state.agents.get(s.author)?.owner;
+    const assigned = new Set(s.assignment?.reviewers ?? []);
     for (const r of s.reviews) {
       const reviewer = state.agents.get(r.reviewer)?.owner;
-      if (r.verdict === undefined || author === undefined || reviewer === undefined || reviewer === author) continue;
-      total += 1;
+      if (r.verdict === undefined || assigned.has(r.reviewer)) continue;
+      if (author === undefined || reviewer === undefined || reviewer === author) continue;
       const key = `${reviewer}\0${author}`;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
+      edges.set(key, (edges.get(key) ?? 0) + 1);
     }
   }
-  let best = 0;
-  let pair: [OwnerId, OwnerId] | null = null;
-  for (const [key, n] of [...counts].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+  return edges;
+}
+
+const byKey = <T>([a]: [string, T], [b]: [string, T]) => (a < b ? -1 : a > b ? 1 : 0);
+
+// The most reciprocal owner pair: of the open reviews a and b gave in total,
+// the share they gave each other, counting only the reciprocated part
+// 2·min(a→b, b→a). Normalised by the pair's own reviews, not the commons', so
+// a pair that reviews only each other scores 1 however large the commons is;
+// one owner reviewing another a lot is just a busy reviewer and scores 0.
+// Pairs that gave fewer than `minReviews` together are only reported when no
+// pair has that many.
+export function reciprocity(
+  state: CommonsState,
+  minReviews = MIN_REVIEWS_FOR_RECIPROCITY,
+): { share: number; mutual: number; given: number; pair: [OwnerId, OwnerId] | null } {
+  const edges = openReviewEdges(state);
+  const given = new Map<OwnerId, number>();
+  for (const [key, n] of edges) {
+    const reviewer = key.split("\0")[0] as OwnerId;
+    given.set(reviewer, (given.get(reviewer) ?? 0) + n);
+  }
+  let best = { share: 0, mutual: 0, given: 0, pair: null as [OwnerId, OwnerId] | null, judged: false };
+  for (const [key, n] of [...edges].sort(byKey)) {
     const [a, b] = key.split("\0") as [OwnerId, OwnerId];
     if (!(a < b)) continue; // each unordered pair once
-    const mutual = 2 * Math.min(n, counts.get(`${b}\0${a}`) ?? 0);
-    if (mutual > best) {
-      best = mutual;
-      pair = [a, b];
+    const mutual = 2 * Math.min(n, edges.get(`${b}\0${a}`) ?? 0);
+    if (mutual === 0) continue;
+    const pairGiven = (given.get(a) ?? 0) + (given.get(b) ?? 0);
+    const share = mutual / pairGiven;
+    const judged = pairGiven >= minReviews;
+    if ((judged && !best.judged) || (judged === best.judged && share > best.share)) {
+      best = { share, mutual, given: pairGiven, pair: [a, b], judged };
     }
   }
-  return { share: total === 0 ? 0 : best / total, total, pair };
+  return { share: best.share, mutual: best.mutual, given: best.given, pair: best.pair };
+}
+
+// Rings larger than a pair: an owner whose incoming open reviews nearly all
+// come from the same two owners, as in a 4-owner ring or a 5-owner round robin
+// where nobody reviews back directly. Owners with fewer than `minIncoming`
+// incoming open reviews are not judged.
+export function reviewConcentration(
+  state: CommonsState,
+  minIncoming = MIN_INCOMING_FOR_CONCENTRATION,
+): { share: number; owner: OwnerId | null; top: OwnerId[]; incoming: number; reviewingOwners: number } {
+  const edges = openReviewEdges(state);
+  const incoming = new Map<OwnerId, Map<OwnerId, number>>();
+  const reviewingOwners = new Set<OwnerId>();
+  for (const [key, n] of edges) {
+    const [reviewer, author] = key.split("\0") as [OwnerId, OwnerId];
+    reviewingOwners.add(reviewer);
+    const m = incoming.get(author) ?? new Map<OwnerId, number>();
+    m.set(reviewer, (m.get(reviewer) ?? 0) + n);
+    incoming.set(author, m);
+  }
+  let best = { share: 0, owner: null as OwnerId | null, top: [] as OwnerId[], incoming: 0 };
+  for (const [owner, from] of [...incoming].sort(byKey)) {
+    const total = [...from.values()].reduce((a, b) => a + b, 0);
+    if (total < minIncoming) continue;
+    const ranked = [...from].sort(([a, x], [b, y]) => y - x || (a < b ? -1 : 1)).slice(0, 2);
+    const share = ranked.reduce((a, [, n]) => a + n, 0) / total;
+    if (share > best.share) best = { share, owner, top: ranked.map(([o]) => o), incoming: total };
+  }
+  return { ...best, reviewingOwners: reviewingOwners.size };
 }
 
 // Upper bound on the time of any seq, from the entries whose time the state
@@ -141,9 +199,14 @@ function submissionRing(s: SubmissionState, state: CommonsState): Ring {
   return s.changedFiles.reduce<Ring>((low, f) => Math.min(low, ringOf(f, state.rules)) as Ring, 2);
 }
 
-// Dead submissions can never merge: a reproduced finding or a revealed plant.
+// Dead submissions can never merge (the ledger's merge rule): a failed gate
+// (a later passing run does not erase it), a reproduced finding, or a revealed plant.
 function isDead(state: CommonsState, s: SubmissionState): boolean {
-  return s.planted !== undefined || s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true);
+  return (
+    s.planted !== undefined ||
+    s.gates.some((g) => !g.pass) ||
+    s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true)
+  );
 }
 
 // When each snapshot's content first reached main: its own promotion or the
@@ -172,6 +235,9 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     rows.push({ group, metric, value, bad, note });
   const ownerOf = (k: KeyId): OwnerId | undefined => state.agents.get(k)?.owner;
   const ownerIds = [...state.owners.keys()].sort();
+  // Owners who can merge or review at all; kernel signers, the custodian and
+  // fresh invitees without agents would add structural zeros to a Gini.
+  const workers = [...new Set([...state.agents.values()].map((a) => a.owner))].sort();
   const subs = [...state.submissions.values()];
   // Revealed plants are the custodian's, not organic work; they stay out of
   // flow and trust counts. Unrevealed plants cannot be told apart and stay in.
@@ -212,12 +278,25 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     judged.length > 0 && falseFindings / judged.length > MAX_FALSE_FINDING_RATE,
     `${falseFindings}/${judged.length} judged findings did not reproduce (bad above ${MAX_FALSE_FINDING_RATE})`,
   );
-  // An approval is a revealed p below the catch threshold on organic work that merged.
+  // An approval is a revealed p below the catch threshold on organic work that
+  // merged. It was defective if a reproduced finding hit that work, directly
+  // or through the snapshot listing it (a snapshot finding is about that
+  // snapshot's own diff; it cannot say which submission, so all are hit).
+  // Escapes need a reproduced finding, so they are already among these.
+  const hitSnapshots = new Set<string>();
+  for (const f of state.findings.values()) {
+    if (f.result?.reproduced === true && "snapshotId" in f.target) hitSnapshots.add(f.target.snapshotId);
+  }
+  const hitViaSnapshot = new Set<string>();
+  for (const snap of state.snapshots.values()) {
+    if (hitSnapshots.has(snap.id)) for (const id of snap.submissionIds) hitViaSnapshot.add(id);
+  }
   let approvals = 0;
   let defective = 0;
   for (const s of organic) {
     if (!s.merged) continue;
-    const hit = s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true);
+    const hit =
+      hitViaSnapshot.has(s.id) || s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true);
     for (const r of s.reviews) {
       if (r.verdict === undefined || r.verdict.defectProbability >= CATCH_THRESHOLD) continue;
       approvals += 1;
@@ -229,7 +308,7 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     "approvals later found defective",
     ratio(defective, approvals),
     approvals > 0 && defective / approvals > MAX_DEFECTIVE_APPROVAL_RATE,
-    `${defective}/${approvals} approvals of merged work were followed by a reproduced finding (bad above ${MAX_DEFECTIVE_APPROVAL_RATE})`,
+    `${defective}/${approvals} approvals of merged work were followed by a reproduced finding on it or its snapshot (bad above ${MAX_DEFECTIVE_APPROVAL_RATE})`,
   );
 
   // --- flow ---------------------------------------------------------------
@@ -300,12 +379,12 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   );
   // Bad when the commons takes more than it pays: participating is then a losing bet.
   row(tr, "reputation slashed", slashed, slashed > paid, `sum of negative settlements; ${paid} paid out`);
-  const mergesBy = new Map<OwnerId, number>(ownerIds.map((o) => [o, 0]));
+  const mergesBy = new Map<OwnerId, number>(workers.map((o) => [o, 0]));
   for (const s of merged) {
     const o = ownerOf(s.author);
     if (o !== undefined) mergesBy.set(o, (mergesBy.get(o) ?? 0) + 1);
   }
-  const revealsBy = new Map<OwnerId, number>(ownerIds.map((o) => [o, 0]));
+  const revealsBy = new Map<OwnerId, number>(workers.map((o) => [o, 0]));
   let reveals = 0;
   for (const s of organic) {
     for (const r of s.reviews) {
@@ -325,7 +404,7 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
       metric,
       g,
       n >= MIN_EVENTS_FOR_GINI && g > MAX_GINI,
-      `over ${by.size} owners, ${n} events (bad above ${MAX_GINI} from ${MIN_EVENTS_FOR_GINI} events)`,
+      `over the ${by.size} owners with an agent, ${n} events (bad above ${MAX_GINI} from ${MIN_EVENTS_FOR_GINI} events)`,
     );
   }
   const rec = reciprocity(state);
@@ -333,10 +412,22 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     tr,
     "reciprocity",
     round(rec.share),
-    rec.total >= MIN_REVIEWS_FOR_RECIPROCITY && rec.share > MAX_RECIPROCITY,
+    rec.given >= MIN_REVIEWS_FOR_RECIPROCITY && rec.share > MAX_RECIPROCITY,
     rec.pair === null
-      ? `${rec.total} reviews, no owner pair reviews each other`
-      : `${rec.pair[0]} ↔ ${rec.pair[1]} exchanged ${Math.round(rec.share * rec.total)} of ${rec.total} reviews (bad above ${MAX_RECIPROCITY} from ${MIN_REVIEWS_FOR_RECIPROCITY} reviews)`,
+      ? "no owner pair gave each other open reviews"
+      : `${rec.pair[0]} ↔ ${rec.pair[1]}: ${rec.mutual} of the ${rec.given} open reviews they gave went to each other (bad above ${MAX_RECIPROCITY} from ${MIN_REVIEWS_FOR_RECIPROCITY} reviews)`,
+  );
+  const conc = reviewConcentration(state);
+  const judgedConc = conc.reviewingOwners >= MIN_REVIEWING_OWNERS;
+  row(
+    tr,
+    "open-review concentration",
+    conc.owner === null ? NA : round(conc.share),
+    judgedConc && conc.share > MAX_CONCENTRATION,
+    (conc.owner === null
+      ? `no owner has ${MIN_INCOMING_FOR_CONCENTRATION} incoming open reviews`
+      : `${round(conc.share)} of the ${conc.incoming} open reviews of ${conc.owner}'s work came from ${conc.top.join(" and ")}`) +
+      ` (bad above ${MAX_CONCENTRATION} once ${MIN_REVIEWING_OWNERS} owners give open reviews; ${conc.reviewingOwners} do)`,
   );
   // Distance exclusion cannot be computed for an owner the tree does not know.
   const outside = ownerIds.filter((o) => !tree.has(o));
@@ -383,6 +474,35 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     activeOwners.size > 0 && activeAgents.length / activeOwners.size > MAX_AGENTS_PER_OWNER,
     `active agents per active owner (bad above ${MAX_AGENTS_PER_OWNER})`,
   );
+  // The mean hides one owner with many agents. Coverage counts model families,
+  // and a family is the owner's own claim at registration.
+  const agentsOf = new Map<OwnerId, number>();
+  for (const a of activeAgents) agentsOf.set(a.owner, (agentsOf.get(a.owner) ?? 0) + 1);
+  const familiesOf = new Map<OwnerId, Set<string>>();
+  for (const a of state.agents.values()) {
+    if (!a.active) continue;
+    const f = familiesOf.get(a.owner) ?? new Set<string>();
+    f.add(a.modelFamily);
+    familiesOf.set(a.owner, f);
+  }
+  const maxOf = <T>(m: Map<OwnerId, T>, size: (x: T) => number): [OwnerId | null, number] =>
+    [...m].sort(byKey).reduce<[OwnerId | null, number]>((b, [o, x]) => (size(x) > b[1] ? [o, size(x)] : b), [null, 0]);
+  const [busiest, most] = maxOf(agentsOf, (n) => n);
+  row(
+    cl,
+    "most active agents of one owner",
+    most,
+    most > MAX_AGENTS_PER_OWNER,
+    `${busiest ?? "nobody"} (bad above ${MAX_AGENTS_PER_OWNER})`,
+  );
+  const [widest, families] = maxOf(familiesOf, (f) => f.size);
+  row(
+    cl,
+    "most model families of one owner",
+    families,
+    families > MAX_FAMILIES_PER_OWNER,
+    `${widest ?? "nobody"}, over unrevoked agents (bad above ${MAX_FAMILIES_PER_OWNER})`,
+  );
 
   // --- direction ----------------------------------------------------------
   const tasked = new Set([...state.tasks.values()].map((t) => t.proposalId));
@@ -398,14 +518,15 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
 
   // --- safety -------------------------------------------------------------
   const sa = "safety";
-  row(
-    sa,
-    "honeytoken triggers",
-    state.honeytokens.length,
-    state.honeytokens.length > 0,
-    "agents that obeyed a decoy instruction",
-  );
-  row(sa, "escapes", state.escapes.length, state.escapes.length > 0, "reproduced defects found in main");
+  // Windowed like reviewer quality, so one old event does not mark the table bad for ever.
+  const inWindow = (at: string) => instantMs(at) >= now - rules.promotion.recallWindowDays * DAY_MS;
+  for (const [metric, events, what] of [
+    ["honeytoken triggers", state.honeytokens, "agents that obeyed a decoy instruction"],
+    ["escapes", state.escapes, "reproduced defects found in main"],
+  ] as const) {
+    const recentN = events.filter((e) => inWindow(e.at)).length;
+    row(sa, metric, recentN, recentN > 0, `${what} since ${since}; ${events.length} all time (bad above 0)`);
+  }
   const gates = new Map<string, { runs: number; failed: number }>();
   for (const s of subs) {
     for (const g of s.gates) {
