@@ -204,7 +204,11 @@ export function evaluatePromotion(
     const merged = s.merged ? instantMs(s.merged.at) : Number.NaN;
     const hours = (now - merged) / HOUR_MS;
     if (!(hours >= p.soakFloorHours)) {
-      young.push(s.merged ? `${s.id} merged ${Number.isNaN(hours) ? "at an unreadable time" : `${hours.toFixed(1)}h ago`}` : `${s.id} not merged`);
+      young.push(
+        s.merged
+          ? `${s.id} merged ${Number.isNaN(hours) ? "at an unreadable time" : `${hours.toFixed(1)}h ago`}`
+          : `${s.id} not merged`,
+      );
     }
   }
   checks.push({

@@ -26,9 +26,10 @@
 //
 // Isolation: each checkout is replayed in its own child process (this file,
 // run with --worker) in its own process group, with a fresh temp dir and copy
-// of the log, a minimal environment and a timeout. The old side runs to
-// completion and its temp dir is deleted before the new side starts, so the
-// new code cannot copy or rewrite the old side's result. A child process is
+// of the log, a minimal environment and a timeout. The result comes back over
+// the IPC channel, never through a file, and the old side runs to completion
+// before the new side starts, so the new code cannot find, copy or rewrite
+// the old side's result (or that of any other run of this gate). A child process is
 // NOT a sandbox: the new code runs as the coordinator's user, can read and
 // write what that user can (the old checkout, this file), can escape the
 // process group, and can forge its own result. Run the coordinator unprivileged
@@ -45,15 +46,16 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import type { GateReport } from "../types";
 
 export const GATE = "behaviourDelta";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const STDERR_TAIL = 4000;
-// How long to wait for stderr to drain after the worker exits. Bounded: a
-// grandchild holding the pipe open must not hold the gate open.
-const STDERR_GRACE_MS = 250;
+// How long to wait, after the worker exits, for its result message and stderr
+// to arrive. Bounded: a grandchild holding a pipe open must not hold the gate.
+const EXIT_GRACE_MS = 250;
 
 export type DeclaredDelta = { community: string; fromEntry: number; note: string };
 export type Manifest = { declared: DeclaredDelta[] };
@@ -290,9 +292,10 @@ function tsxLoaderUrl(): string {
   return pathToFileURL(require.resolve("tsx")).href;
 }
 
-// Settles on the worker's exit or the deadline, whichever comes first; never
-// on stdio EOF, which a grandchild can hold off forever. On settling, the
-// worker's process group is killed and its temp dir removed.
+// Settles on the worker's exit (plus a bounded grace for its last message) or
+// the deadline, whichever comes first; never on stdio EOF, which a grandchild
+// can hold off forever. On settling, the worker's process group is killed and
+// its temp dir removed.
 async function replayInChild(checkoutDir: string, logPath: string, timeoutMs: number): Promise<ChildOutcome> {
   const work = mkdtempSync(join(tmpdir(), "behaviour-delta-"));
   try {
@@ -301,22 +304,23 @@ async function replayInChild(checkoutDir: string, logPath: string, timeoutMs: nu
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(home, { recursive: true });
     copyFileSync(logPath, join(dataDir, "log.jsonl"));
-    const resultPath = join(work, "result.json");
     return await new Promise<ChildOutcome>((done) => {
       let stderr = "";
       let settled = false;
+      let message: { result: unknown } | undefined;
       const child = spawn(
         process.execPath,
-        ["--import", tsxLoaderUrl(), __filename, "--worker", checkoutDir, dataDir, resultPath],
+        ["--import", tsxLoaderUrl(), __filename, "--worker", checkoutDir, dataDir],
         {
           cwd: work,
           // Minimal and fixed, so replay cannot depend on the coordinator's
           // environment and the checkout cannot read its secrets from it.
           env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: work },
-          stdio: ["ignore", "ignore", "pipe"],
+          stdio: ["ignore", "ignore", "pipe", "ipc"],
           detached: true, // its own process group, so a timeout kills its children too
         },
       );
+      const errPipe = child.stderr as Readable; // stdio[2] is "pipe"
       const settle = (outcome: ChildOutcome) => {
         if (settled) return;
         settled = true;
@@ -328,30 +332,37 @@ async function replayInChild(checkoutDir: string, logPath: string, timeoutMs: nu
             // the group is already gone
           }
         }
-        child.stderr.destroy();
+        errPipe.destroy();
         done(outcome);
       };
-      child.stderr.on("data", (chunk: Buffer) => {
+      errPipe.on("data", (chunk: Buffer) => {
         stderr = (stderr + chunk.toString()).slice(-STDERR_TAIL);
+      });
+      // The first message is the result; a well-behaved worker sends one.
+      child.on("message", (m: unknown) => {
+        message ??= { result: m };
       });
       const timer = setTimeout(() => settle({ error: `replay timed out after ${timeoutMs} ms` }), timeoutMs);
       child.on("error", (e) => settle({ error: `cannot start the replay: ${e.message}` }));
       child.on("exit", (code, signal) => {
         const finish = () => {
-          let result: unknown;
-          try {
-            result = JSON.parse(readFileSync(resultPath, "utf8"));
-          } catch {
-            const how = signal !== null ? `signal ${signal}` : `exit code ${code}`;
-            return settle({ error: `replay died (${how}) without a result${stderr ? `\n${stderr.trim()}` : ""}` });
-          }
-          settle(validResult(result));
+          if (message !== undefined) return settle(validResult(message.result));
+          const how = signal !== null ? `signal ${signal}` : `exit code ${code}`;
+          settle({ error: `replay died (${how}) without a result${stderr ? `\n${stderr.trim()}` : ""}` });
         };
-        const grace = setTimeout(finish, STDERR_GRACE_MS);
-        child.stderr.once("end", () => {
-          clearTimeout(grace);
-          finish();
-        });
+        // Both the message and stderr's end usually arrive before or right
+        // after 'exit'; wait for the two, but never past the grace.
+        const grace = setTimeout(finish, EXIT_GRACE_MS);
+        let pending = 2;
+        const arrived = () => {
+          if (--pending === 0) {
+            clearTimeout(grace);
+            finish();
+          }
+        };
+        errPipe.once("end", arrived);
+        if (message !== undefined || !child.connected) arrived();
+        else child.once("disconnect", arrived);
       });
     });
   } finally {
@@ -511,14 +522,19 @@ function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-// Exits explicitly: checkout code that leaves a timer or socket open must not
-// turn a finished replay into a timeout.
+// Exits explicitly once the result is sent: checkout code that leaves a timer
+// or socket open must not turn a finished replay into a timeout.
 if (require.main === module && process.argv[2] === "--worker") {
-  const [checkoutDir, dataDir, resultPath] = process.argv.slice(3) as [string, string, string];
-  replayCheckout(checkoutDir, dataDir)
-    .then(
-      (r) => writeFileSync(resultPath, JSON.stringify({ entries: r.entries, communities: [...r.communities] })),
-      (e: unknown) => writeFileSync(resultPath, JSON.stringify({ error: errorMessage(e) })),
-    )
-    .finally(() => process.exit(0));
+  const [checkoutDir, dataDir] = process.argv.slice(3) as [string, string];
+  const send = (payload: unknown) => {
+    if (process.send === undefined) {
+      process.stderr.write("the worker needs an IPC channel to its coordinator\n");
+      process.exit(1);
+    }
+    process.send(payload, () => process.exit(0));
+  };
+  replayCheckout(checkoutDir, dataDir).then(
+    (r) => send({ entries: r.entries, communities: [...r.communities] }),
+    (e: unknown) => send({ error: errorMessage(e) }),
+  );
 }

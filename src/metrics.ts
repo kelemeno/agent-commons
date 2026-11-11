@@ -7,13 +7,15 @@
 // unmeasured recall is bad, an absent promotion lag is not).
 //
 // Time of entries. CommonsState stores `at` for submissions, merges,
-// findings, snapshots, promotions, honeytokens, escapes and settlements, but
-// only `seq` for proposals, claims, reviews and attestations. Since `at` never
-// decreases along the chain, an entry's time is at least the time of the
-// latest entry before it whose time is known; that lower bound is used for
-// the others. So "active in the last 7 days" can miss activity right after a
-// sparse stretch, and "older than 14 days" can include a proposal made just
-// after it. Both err towards raising a flag rather than hiding one.
+// findings, snapshots, promotions, honeytokens, escapes and settlements (and
+// a replayed LedgerState carries the head's time), but only `seq` for
+// proposals, claims, reviews and attestations. Since `at` never decreases
+// along the chain, an entry is no later than the next entry whose time is
+// known; that upper bound stands in for the others. A lower bound would need
+// an earlier anchor, and with none (a ledger of proposals only) everything
+// would look infinitely old. The cost: "active in the last 7 days" can count
+// an agent whose last entry came just before a stretch with no timed entries,
+// and "older than 14 days" can miss a proposal in such a stretch.
 
 import { CATCH_THRESHOLD, instantMs, plantStats } from "./plants";
 import { seededRecall } from "./risk";
@@ -99,8 +101,9 @@ export function reciprocity(state: CommonsState): { share: number; total: number
   return { share: total === 0 ? 0 : best / total, total, pair };
 }
 
-// Lower bound on the time of any seq, from the entries whose time the state keeps.
-function seqTimes(state: CommonsState): (seq: number) => number {
+// Upper bound on the time of any seq, from the entries whose time the state
+// keeps; `fallback` (the caller's now) past the last of them.
+function seqTimes(state: CommonsState, fallback: number): (seq: number) => number {
   const anchors: [number, string][] = [];
   for (const s of state.submissions.values()) {
     anchors.push([s.submittedSeq, s.submittedAt]);
@@ -116,19 +119,21 @@ function seqTimes(state: CommonsState): (seq: number) => number {
   if (typeof headAt === "string") anchors.push([state.length - 1, headAt]);
   const sorted = anchors.map(([seq, at]) => [seq, instantMs(at)] as const).filter(([, ms]) => !Number.isNaN(ms));
   sorted.sort((a, b) => a[0] - b[0]);
-  // Running maximum, so one bad timestamp cannot pull later bounds backwards.
+  // Running minimum from the end, so one bad timestamp cannot push earlier bounds forwards.
   const seqs = sorted.map(([seq]) => seq);
-  const best: number[] = [];
-  sorted.forEach(([, ms], i) => best.push(Math.max(ms, best[i - 1] ?? Number.NEGATIVE_INFINITY)));
+  const bound: number[] = new Array<number>(sorted.length);
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    bound[i] = Math.min((sorted[i] as readonly [number, number])[1], bound[i + 1] ?? fallback);
+  }
   return (seq) => {
     let lo = 0;
-    let hi = seqs.length; // first index with seqs[i] > seq
+    let hi = seqs.length; // first index with seqs[i] >= seq
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if ((seqs[mid] as number) <= seq) lo = mid + 1;
+      if ((seqs[mid] as number) < seq) lo = mid + 1;
       else hi = mid;
     }
-    return lo === 0 ? Number.NEGATIVE_INFINITY : (best[lo - 1] as number);
+    return bound[lo] ?? fallback;
   };
 }
 
@@ -171,7 +176,7 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   // Revealed plants are the custodian's, not organic work; they stay out of
   // flow and trust counts. Unrevealed plants cannot be told apart and stay in.
   const organic = subs.filter((s) => s.planted === undefined);
-  const timeOf = seqTimes(state);
+  const timeOf = seqTimes(state, now);
 
   // --- reviewer quality ---------------------------------------------------
   const q = "reviewer quality";
@@ -272,7 +277,13 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   const open: Record<Ring, number> = { 0: 0, 1: 0, 2: 0 };
   for (const s of organic) if (!s.merged && !isDead(state, s)) open[submissionRing(s, state)] += 1;
   for (const r of [0, 1, 2] as const) {
-    row(fl, `open submissions (ring ${r})`, open[r], open[r] > MAX_OPEN_PER_RING, `not merged and not dead (bad above ${MAX_OPEN_PER_RING})`);
+    row(
+      fl,
+      `open submissions (ring ${r})`,
+      open[r],
+      open[r] > MAX_OPEN_PER_RING,
+      `not merged and not dead (bad above ${MAX_OPEN_PER_RING})`,
+    );
   }
 
   // --- trust --------------------------------------------------------------
@@ -280,7 +291,13 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   const locked = [...state.owners.values()].reduce((a, o) => a + o.lockedStake, 0);
   const slashed = state.settlements.reduce((a, s) => a + (s.delta < 0 ? -s.delta : 0), 0);
   const paid = state.settlements.reduce((a, s) => a + (s.delta > 0 ? s.delta : 0), 0);
-  row(tr, "reputation staked (locked)", locked, false, "points locked in open claims, reviews, attestations and findings");
+  row(
+    tr,
+    "reputation staked (locked)",
+    locked,
+    false,
+    "points locked in open claims, reviews, attestations and findings",
+  );
   // Bad when the commons takes more than it pays: participating is then a losing bet.
   row(tr, "reputation slashed", slashed, slashed > paid, `sum of negative settlements; ${paid} paid out`);
   const mergesBy = new Map<OwnerId, number>(ownerIds.map((o) => [o, 0]));
@@ -303,7 +320,13 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     ["Gini of review reveals across owners", revealsBy, reveals],
   ] as const) {
     const g = round(gini([...by.values()]));
-    row(tr, metric, g, n >= MIN_EVENTS_FOR_GINI && g > MAX_GINI, `over ${by.size} owners, ${n} events (bad above ${MAX_GINI} from ${MIN_EVENTS_FOR_GINI} events)`);
+    row(
+      tr,
+      metric,
+      g,
+      n >= MIN_EVENTS_FOR_GINI && g > MAX_GINI,
+      `over ${by.size} owners, ${n} events (bad above ${MAX_GINI} from ${MIN_EVENTS_FOR_GINI} events)`,
+    );
   }
   const rec = reciprocity(state);
   row(
@@ -338,7 +361,13 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   const activeAgents = [...state.agents.values()].filter((a) => a.active && recent(a.keyId));
   const activeOwners = new Set<OwnerId>(activeAgents.map((a) => a.owner));
   for (const o of state.owners.values()) if (recent(o.keyId)) activeOwners.add(o.id);
-  row(cl, "active agents", activeAgents.length, activeAgents.length === 0, `signed an entry in the last ${ACTIVE_DAYS} days`);
+  row(
+    cl,
+    "active agents",
+    activeAgents.length,
+    activeAgents.length === 0,
+    `signed an entry in the last ${ACTIVE_DAYS} days`,
+  );
   // A full review panel needs assignedReviewers owners besides the author's.
   row(
     cl,
@@ -369,7 +398,13 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
 
   // --- safety -------------------------------------------------------------
   const sa = "safety";
-  row(sa, "honeytoken triggers", state.honeytokens.length, state.honeytokens.length > 0, "agents that obeyed a decoy instruction");
+  row(
+    sa,
+    "honeytoken triggers",
+    state.honeytokens.length,
+    state.honeytokens.length > 0,
+    "agents that obeyed a decoy instruction",
+  );
   row(sa, "escapes", state.escapes.length, state.escapes.length > 0, "reproduced defects found in main");
   const gates = new Map<string, { runs: number; failed: number }>();
   for (const s of subs) {

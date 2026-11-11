@@ -165,7 +165,9 @@ export function settleFinding(state: CommonsState, tree: TreeView, findingId: st
     for (const a of subject.approvals) {
       const owner = ownerOf(state, a.reviewer);
       const p = clamp01(a.p);
-      if (owner !== undefined) book.slash(owner, "approverSlash", ref, Math.round(bounty * multiplier * (1 - p)));
+      // bm − bm·p, not bm·(1 − p): 1 − 0.9 is 0.0999…, which would round 1.5 down to 1.
+      const bm = bounty * multiplier;
+      if (owner !== undefined) book.slash(owner, "approverSlash", ref, Math.round(bm - bm * p));
     }
   }
   return book.bodies();
@@ -385,9 +387,8 @@ export function settleHoneytoken(state: CommonsState, agent: KeyId): SettlementB
   const owner = ownerOf(state, agent);
   if (owner === undefined) return [];
   const book = new Book(state);
-  for (const h of state.honeytokens) {
-    if (h.agent === agent) book.slash(owner, "honeytoken", `honeytoken:${agent}:${h.tokenId}`, state.rules.rewards.honeytokenPenalty);
-  }
+  const tokens = new Set(state.honeytokens.filter((h) => h.agent === agent).map((h) => h.tokenId));
+  for (const t of tokens) book.slash(owner, "honeytoken", `honeytoken:${agent}:${t}`, state.rules.rewards.honeytokenPenalty);
   return book.bodies();
 }
 

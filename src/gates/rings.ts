@@ -119,9 +119,9 @@ export function checkRingImports(repoDir: string, files: string[], rules: Rules)
 }
 
 // Gate details end up in a ledger entry; a crafted file must not bloat it.
-export function listProblems(problems: string[], max = 20): string {
-  const shown = problems.slice(0, max).join("; ");
-  return problems.length > max ? `${shown}; and ${problems.length - max} more` : shown;
+export function listProblems(problems: string[], sep = "; ", max = 20): string {
+  const shown = problems.slice(0, max).join(sep);
+  return problems.length > max ? `${shown}${sep}and ${problems.length - max} more` : shown;
 }
 
 // Repo-relative real location of an existing path, following every symlink
@@ -191,7 +191,6 @@ function checkGlob(root: string, dir: string, pattern: string, rules: Rules): st
   while (stack.length > 0) {
     const rel = stack.pop() as string;
     if (++seen > GLOB_WALK_LIMIT) return `matches more than ${GLOB_WALK_LIMIT} paths and cannot be checked`;
-    if (ruleRingOf(rel, rules) === 0) return `can match ring-0 ${rel}`;
     const abs = path.join(root, rel);
     let lst: fs.Stats;
     try {
@@ -199,6 +198,9 @@ function checkGlob(root: string, dir: string, pattern: string, rules: Rules): st
     } catch {
       continue;
     }
+    // Directories are not classified: `anthill-frontend` the submodule
+    // pointer is ring 0, the files under it are not.
+    if (!lst.isDirectory() && ruleRingOf(rel, rules) === 0) return `can match ring-0 ${rel}`;
     if (lst.isSymbolicLink()) {
       const real = realLocation(root, abs, lst);
       if (real === null || ruleRingOf(real, rules) !== 2) return `can match ${rel}, a symlink outside ring 2`;
@@ -332,7 +334,7 @@ function unescape(body: string): string | null {
       const hex = (cp ?? u4 ?? x2) as string | undefined;
       if (hex !== undefined) return String.fromCodePoint(parseInt(hex, 16));
       const c = ch as string;
-      if (c === "\n" || c === "\r" || c === "\r\n" || c === " " || c === " ") return "";
+      if (c === "\n" || c === "\r" || c === "\r\n" || c === "\u2028" || c === "\u2029") return "";
       if (c === "u" || c === "x") throw new Error("bad escape");
       return simple[c] ?? c;
     });
@@ -349,25 +351,30 @@ function skipper(src: string): (i: number) => number {
   const lineEnds: number[] = [];
   for (let i = 0; i < src.length; i++) {
     const c = src[i];
-    if (c === "\n" || c === "\r" || c === " " || c === " ") lineEnds.push(i);
+    if (c === "\n" || c === "\r" || c === "\u2028" || c === "\u2029") lineEnds.push(i);
   }
   const memo = new Map<number, number>();
   return (start) => {
+    // Every position passed through is memoised, so no stretch of whitespace
+    // or comments is walked twice, however many keywords lead into it.
     const visited: number[] = [];
     let i = start;
     for (;;) {
-      const known = memo.get(i);
+      let known = memo.get(i);
+      if (known === undefined) {
+        visited.push(i);
+        while (i < src.length && /\s/.test(src[i] as string)) i++;
+        known = memo.get(i);
+      }
       if (known !== undefined) {
         i = known;
         break;
       }
-      while (i < src.length && /\s/.test(src[i] as string)) i++;
+      visited.push(i);
       if (src.startsWith("/*", i)) {
-        visited.push(i);
         const c = firstAtLeast(closes, i + 2);
         i = c === undefined ? src.length : c + 2;
       } else if (src.startsWith("//", i)) {
-        visited.push(i);
         i = firstAtLeast(lineEnds, i) ?? src.length;
       } else break;
     }

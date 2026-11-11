@@ -27,7 +27,7 @@ export function checkAirlock(files: string[], rules: Rules, opts: { dependencyTr
   if (invalid.length > 0) return { gate: GATE, pass: false, details: listProblems(invalid) };
   if (locked.length === 0) return { gate: GATE, pass: true, details: "no locked paths changed" };
   if (opts.dependencyTrack) {
-    return { gate: GATE, pass: true, details: `dependency track: locked paths changed: ${listProblems(locked)}` };
+    return { gate: GATE, pass: true, details: `dependency track: locked paths changed: ${listProblems(locked, ", ")}` };
   }
-  return { gate: GATE, pass: false, details: `locked paths need the dependency track: ${listProblems(locked)}` };
+  return { gate: GATE, pass: false, details: `locked paths need the dependency track: ${listProblems(locked, ", ")}` };
 }

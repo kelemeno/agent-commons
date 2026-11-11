@@ -89,7 +89,15 @@ class World {
 
   submit(id: string, author: string, files: string[], taskId: string | null = null): void {
     this.append(
-      { kind: "submission", id, taskId, baseCommit: "base", headCommit: `head-${id}`, changedFiles: files, linesChanged: 20 },
+      {
+        kind: "submission",
+        id,
+        taskId,
+        baseCommit: "base",
+        headCommit: `head-${id}`,
+        changedFiles: files,
+        linesChanged: 20,
+      },
       this.agentKey(author),
     );
     this.coordinator({ kind: "gateResult", submissionId: id, gate: "tests", pass: true, details: "ok" });
@@ -168,7 +176,10 @@ class World {
     this.submit(id, "k1", ring1("plant"));
     this.assign(id, [reviewer]);
     this.reviews(id, [[reviewer, p]]);
-    this.append({ kind: "plantReveal", submissionId: id, salt, description: "off by one", severity: "high" }, this.admin);
+    this.append(
+      { kind: "plantReveal", submissionId: id, salt, description: "off by one", severity: "high" },
+      this.admin,
+    );
   }
   plants(count: number, missed = 0): void {
     const reviewers = ["b1", "c1", "d1"];
@@ -251,7 +262,10 @@ test("unknown snapshot fails; a nowIso without a zone throws", () => {
   const w = people();
   const r = evaluatePromotion(w.state, tree, "nope", "2026-10-02T00:00:00.000Z");
   assert.equal(r.pass, false);
-  assert.deepEqual(r.checks.map((c) => c.name), ["snapshot"]);
+  assert.deepEqual(
+    r.checks.map((c) => c.name),
+    ["snapshot"],
+  );
   assert.throws(() => evaluatePromotion(w.state, tree, "nope", "2026-10-02T00:00:00"), RangeError);
   assert.throws(() => evaluatePromotion(w.state, tree, "nope", "yesterday"), RangeError);
 });
@@ -334,7 +348,10 @@ test("coverage: one owner's two agents are one owner (Sybil seats)", () => {
 test("coverage: a revoked reviewer's verdict stops vouching", () => {
   const w = healthy();
   assert.equal(check(w, "S1", "coverage").pass, true);
-  w.append({ kind: "agentRevoked", agent: w.agentKey("c1").keyId, reason: "obeyed a honeytoken" }, w.owners.get("carol") as Key);
+  w.append(
+    { kind: "agentRevoked", agent: w.agentKey("c1").keyId, reason: "obeyed a honeytoken" },
+    w.owners.get("carol") as Key,
+  );
   const c = check(w, "S1", "coverage");
   assert.equal(c.pass, false);
   assert.match(c.detail, /s1: 2\/3 families/);
@@ -515,7 +532,12 @@ test("openIssues: a plant revealed after it merged is a known defect in the snap
 function kernelWorld(r: Rules = rules()): World {
   const w = healthy({ rules: r });
   w.append(
-    { kind: "proposal", id: "P1", title: "fix engine", evidence: [{ kind: "location", file: "anthill-backend/src/engine.ts", line: 1, note: "n" }] },
+    {
+      kind: "proposal",
+      id: "P1",
+      title: "fix engine",
+      evidence: [{ kind: "location", file: "anthill-backend/src/engine.ts", line: 1, note: "n" }],
+    },
     w.agentKey("a1"),
   );
   w.coordinator({
@@ -527,7 +549,10 @@ function kernelWorld(r: Rules = rules()): World {
     sizeEstimate: 50,
     specAuthor: "carol",
   });
-  w.append({ kind: "claim", taskId: "T1", until: w.nowPlus(24), stake: claimStake(50, 0, w.state.rules) }, w.agentKey("a1"));
+  w.append(
+    { kind: "claim", taskId: "T1", until: w.nowPlus(24), stake: claimStake(50, 0, w.state.rules) },
+    w.agentKey("a1"),
+  );
   w.submit("sk", "a1", ["anthill-backend/src/engine.ts"], "T1");
   w.assign("sk", ["b1", "c1"]);
   w.reviews("sk", [
