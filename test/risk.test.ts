@@ -342,7 +342,7 @@ function sub(s: CommonsState, id: string, opts: { planted?: Severity; p?: number
     submittedSeq: 1,
     submittedAt: opts.at ?? "2026-10-05T00:00:00Z",
     gates: [],
-    ...(opts.p === undefined ? {} : { assignment: { beacon: "b", reviewers: ["R"], seq: 1 } }),
+    ...(opts.p === undefined ? {} : { assignment: { beacon: "b", entropy: "e", treeDigest: "t", reviewers: ["R"], seq: 1 } }),
     reviews:
       opts.p === undefined
         ? []

@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -92,8 +92,15 @@ function worktreeCount(): number {
     .filter((l) => l.startsWith("worktree ")).length;
 }
 
-function harnessTempDirs(): string[] {
-  return readdirSync(tmpdir()).filter((n) => n.startsWith("anthill-finding-"));
+// The harness's temp roots under `root`. Tests that count them pass their own
+// tmpRoot: other test files run the harness concurrently in os.tmpdir(), so a
+// count there changes under the test (that made it fail at random).
+function harnessTempDirs(root: string): string[] {
+  return readdirSync(root).filter((n) => n.startsWith("commons-finding-"));
+}
+
+function ownTmpRoot(): string {
+  return mkdtempSync(join(tmpdir(), "findings-own-root-"));
 }
 
 test("a test that fails on head and passes on the parent reproduces", async () => {
@@ -118,7 +125,7 @@ test("the log digest is stable across runs: no temp paths or timings leak into t
   const b = await reproduceFinding(opts({ testContent: ADD_TEST }));
   assert.equal(a.logDigest, b.logDigest);
   assert.match(a.log, /<worktree>/);
-  assert.doesNotMatch(a.log, /anthill-finding-/);
+  assert.doesNotMatch(a.log, /commons-finding-/);
 });
 
 test("commits may be given as any commit-ish and are logged as full shas", async () => {
@@ -314,15 +321,15 @@ test("each run's output is truncated to 64 KiB with a marker", async () => {
 });
 
 test("the test file overwrites nothing in the main checkout and worktrees and temp dirs are always removed", async () => {
-  const tempBefore = harnessTempDirs().length;
-  await reproduceFinding(opts({ testContent: ADD_TEST }));
-  await reproduceFinding(opts({ testContent: "process.exit(1);\n", baseCommit: "nope" }));
-  await reproduceFinding(opts({ testContent: "rm -rf .", testCommand: "rm -rf ./* && exit 1" }));
+  const tmpRoot = ownTmpRoot();
+  await reproduceFinding(opts({ testContent: ADD_TEST, tmpRoot }));
+  await reproduceFinding(opts({ testContent: "process.exit(1);\n", baseCommit: "nope", tmpRoot }));
+  await reproduceFinding(opts({ testContent: "rm -rf .", testCommand: "rm -rf ./* && exit 1", tmpRoot }));
   assert.equal(worktreeCount(), 1);
   assert.equal(sh(["worktree", "list"]).split("\n").length, 1);
   assert.equal(existsSync(join(repo, "test")), false);
   assert.equal(sh(["status", "--porcelain"]), "");
-  assert.equal(harnessTempDirs().length, tempBefore);
+  assert.deepEqual(harnessTempDirs(tmpRoot), []);
 });
 
 test("rejects a timeout outside (0, MAX_TIMEOUT_MS]", async () => {
@@ -485,9 +492,10 @@ test("a spawn failure is a harness error, never a reproduction", async () => {
 });
 
 test("cleanup survives a command that fakes .git and locks directories, and never replaces the result", async () => {
-  const tempBefore = harnessTempDirs().length;
+  const tmpRoot = ownTmpRoot();
   const r = await reproduceFinding(
     opts({
+      tmpRoot,
       testContent: ADD_TEST,
       testCommand: `echo 'gitdir: /x' > .git; mkdir -p locked/inner; touch locked/inner/f; chmod 000 locked/inner locked; chmod 000 "$HOME"; node test/finding-1.test.js`,
     }),
@@ -496,10 +504,19 @@ test("cleanup survives a command that fakes .git and locks directories, and neve
   assert.equal(r.cleanupError, null);
   assert.equal(worktreeCount(), 1);
   assert.equal(sh(["worktree", "list"]).split("\n").length, 1);
-  assert.equal(harnessTempDirs().length, tempBefore);
-  // removeTree reports instead of throwing when something truly cannot go.
-  const err = await removeTree("/proc/self/fdinfo");
-  assert.match(err ?? "", /could not remove/);
+  assert.deepEqual(harnessTempDirs(tmpRoot), []);
+  // removeTree reports instead of throwing when something truly cannot go:
+  // here a directory whose parent we may not write (root ignores that, so
+  // as root use a /proc directory, which nobody can remove).
+  const stuckParent = join(scratch, "stuck-parent");
+  mkdirSync(join(stuckParent, "stuck", "inner"), { recursive: true });
+  chmodSync(stuckParent, 0o500);
+  try {
+    const err = await removeTree(process.getuid?.() === 0 ? "/proc/self/fdinfo" : join(stuckParent, "stuck"));
+    assert.match(err ?? "", /could not remove/);
+  } finally {
+    chmodSync(stuckParent, 0o700);
+  }
 });
 
 test("redact replaces secret values and drops a secret's prefix left at a truncation cut", () => {
@@ -527,13 +544,19 @@ reproduceFinding(JSON.parse(process.argv[2] ?? "{}")).then((r) => process.stdout
   return JSON.parse(out);
 }
 
-test("a secret in the coordinator's launch environment, read through /proc/$PPID/environ, is redacted from the log", () => {
+// How a same-uid command reads its parent's launch environment: Linux's
+// /proc/<pid>/environ, or BSD/macOS `ps -E`.
+const READ_PARENT_ENV = existsSync("/proc/self/environ")
+  ? `tr '\\0' '\\n' < /proc/$PPID/environ | grep LAUNCH_SECRET; cat /proc/$PPID/environ > "$OUT"`
+  : `ps -Eww -o command= -p $PPID | tr ' ' '\\n' | grep LAUNCH_SECRET; ps -Eww -o command= -p $PPID > "$OUT"`;
+
+test("a secret in the coordinator's launch environment, read from the parent process, is redacted from the log", () => {
   const secret = "launch-secret-value-5678";
   const out = join(scratch, "proc-dump-plain");
   const r = runInChild(
     {
       testContent: ADD_TEST,
-      testCommand: `tr '\\0' '\\n' < /proc/$PPID/environ | grep LAUNCH_SECRET; cat /proc/$PPID/environ > "$OUT"; node test/finding-1.test.js`,
+      testCommand: `${READ_PARENT_ENV}; node test/finding-1.test.js`,
       env: { PATH, OUT: out },
     },
     secret,
@@ -621,3 +644,164 @@ function alive(pid: number): boolean {
     return false;
   }
 }
+
+test("a sandbox that cannot use its checkout is a harness error, never a false finding", async () => {
+  // A stand-in for a uid switch that cannot enter the harness's 0700 temp
+  // directory: the sandbox runs the command somewhere else entirely.
+  const elsewhere = mkdtempSync(join(tmpdir(), "findings-elsewhere-"));
+  const r = await reproduceFinding(opts({ testContent: ADD_TEST, sandbox: ["/bin/sh", "-c", `cd ${elsewhere} && exec "$@"`, "box"] }));
+  assert.equal(r.reproduced, false);
+  assert.match(r.harnessError ?? "", /cannot read and write its checkout/);
+  assert.equal(r.passesOnParent, false, "the test never ran");
+  rmSync(elsewhere, { recursive: true, force: true });
+});
+
+test("setupCommand runs in each checkout before the test; a failed setup is a harness error", async () => {
+  const withDeps = await reproduceFinding(
+    opts({
+      testContent: ADD_TEST,
+      setupCommand: "echo installed > deps.txt",
+      testCommand: "test -f deps.txt && node test/finding-1.test.js",
+    }),
+  );
+  assert.equal(withDeps.reproduced, true, withDeps.log);
+  const broken = await reproduceFinding(opts({ testContent: ADD_TEST, setupCommand: "exit 3" }));
+  assert.equal(broken.reproduced, false);
+  assert.match(broken.harnessError ?? "", /setup command failed \(exit 3\)/);
+});
+
+test("regression: a commit holding the harness's old probe names cannot turn findings into harness errors", async () => {
+  // A head that is the buggy head plus files named after the probe's former
+  // fixed sentinel and write target (one a file, one a directory).
+  sh(["checkout", "-q", "-b", "probe-names", head]);
+  writeFileSync(join(repo, ".commons-harness-sentinel"), "taken\n");
+  mkdirSync(join(repo, ".commons-harness-write"));
+  writeFileSync(join(repo, ".commons-harness-write", "x"), "x\n");
+  sh(["add", "."]);
+  sh(["commit", "-q", "-m", "squat the probe names"]);
+  const squatter = sh(["rev-parse", "HEAD"]);
+  sh(["checkout", "-q", "main"]);
+  const r = await reproduceFinding(opts({ testContent: ADD_TEST, headCommit: squatter }));
+  assert.equal(r.harnessError, null, r.log);
+  assert.equal(r.reproduced, true);
+});
+
+test("regression: with shareCheckout, files the setup step made that the harness cannot chmod do not break the run", { skip: spawnSync("chflags", ["-h"]).error ? "needs chflags (BSD, macOS) to make a file the coordinator cannot chmod" : false }, async () => {
+  // An immutable file stands in for one the sandbox uid created during setup
+  // (node_modules from `npm ci` under scripts/sandbox-docker on Linux).
+  const tmpRoot = mkdtempSync(join(tmpdir(), "findings-setup-"));
+  try {
+    const r = await reproduceFinding(
+      opts({
+        testContent: ADD_TEST,
+        tmpRoot,
+        shareCheckout: true,
+        setupCommand: "mkdir -p node_modules/dep && echo x > node_modules/dep/index.js && chflags uchg node_modules/dep/index.js",
+      }),
+    );
+    assert.equal(r.harnessError, null, r.log);
+    assert.equal(r.reproduced, true);
+  } finally {
+    spawnSync("chflags", ["-R", "nouchg", tmpRoot]);
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("regression: leftovers only the sandbox can remove are cleaned up through the sandbox", { skip: spawnSync("chflags", ["-h"]).error ? "needs chflags (BSD, macOS) to make a file the coordinator cannot remove" : false }, async () => {
+  // Stand-in for a sandbox uid's 0700 directories on a Linux bind mount: an
+  // immutable file the coordinator cannot delete, which every run under this
+  // sandbox can undo (as the sandbox uid could chmod its own files).
+  const tmpRoot = mkdtempSync(join(tmpdir(), "findings-cleanup-"));
+  const sandbox = ["/bin/sh", "-c", 'chflags -R nouchg . 2>/dev/null; exec "$@"', "box"];
+  try {
+    const r = await reproduceFinding(
+      opts({
+        testContent: ADD_TEST,
+        tmpRoot,
+        sandbox,
+        shareCheckout: true,
+        testCommand: "node test/finding-1.test.js; rc=$?; mkdir -p junk && echo x > junk/f && chflags uchg junk/f; exit $rc",
+      }),
+    );
+    assert.equal(r.reproduced, true, r.log);
+    assert.equal(r.cleanupError, null);
+    assert.deepEqual(harnessTempDirs(tmpRoot), []);
+  } finally {
+    spawnSync("chflags", ["-R", "nouchg", tmpRoot]);
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+// A writer outside the harness's process group (as a container runs under
+// dockerd) that keeps swapping directories of `root` for symlinks to `victim`.
+const SWAPPER = `const fs = require("node:fs"), path = require("node:path");
+const [root, victim, ms] = process.argv.slice(1);
+const end = Date.now() + Number(ms);
+const dirs = Array.from({ length: 40 }, (_, i) => path.join(root, "d" + i));
+const mk = (d) => { try { fs.mkdirSync(d); fs.writeFileSync(path.join(d, "f"), "x"); } catch {} };
+dirs.forEach(mk);
+while (Date.now() < end) {
+  for (const d of dirs) { try { fs.renameSync(d, d + ".x"); } catch {} try { fs.symlinkSync(victim, d); } catch {} }
+  for (const d of dirs) { try { fs.unlinkSync(d); } catch {} try { fs.rmSync(d + ".x", { recursive: true, force: true }); } catch {} mk(d); }
+}`;
+
+test("regression: removeTree never deletes through a symlink a still-running writer swaps in", async () => {
+  const base = mkdtempSync(join(tmpdir(), "findings-swap-"));
+  const root = join(base, "root");
+  const victim = join(base, "victim");
+  mkdirSync(root);
+  mkdirSync(victim);
+  for (let i = 0; i < 500; i++) writeFileSync(join(victim, `canary-${i}`), "x");
+  const writer = spawn(process.execPath, ["-e", SWAPPER, root, victim, "4000"], { detached: true, stdio: "ignore" });
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    const until = Date.now() + 3000;
+    while (Date.now() < until) {
+      await removeTree(root);
+      mkdirSync(root, { recursive: true });
+    }
+  } finally {
+    try {
+      process.kill(-(writer.pid as number), "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+  assert.equal(readdirSync(victim).length, 500, "cleanup deleted files outside the tree it was removing");
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("regression: a timed-out run's sandbox gets SIGTERM first, so it can stop a command that runs outside the harness's group", async () => {
+  // The fake sandbox starts the command in its own session (as docker runs a
+  // container under its daemon, beyond the client's process group) and stops
+  // it on SIGTERM, as scripts/sandbox-docker kills its container.
+  const dir = mkdtempSync(join(tmpdir(), "findings-term-"));
+  const box = join(dir, "box.js");
+  const ticks = join(dir, "ticks");
+  writeFileSync(
+    box,
+    `const { spawn } = require("node:child_process");
+const c = spawn(process.argv[2], process.argv.slice(3), { detached: true, stdio: "inherit" });
+require("node:fs").appendFileSync(${JSON.stringify(join(dir, "pids"))}, c.pid + "\\n");
+process.on("SIGTERM", () => { try { process.kill(-c.pid, "SIGKILL"); } catch {} });
+c.on("exit", (code) => process.exit(code ?? 143));\n`,
+  );
+  try {
+    const r = await reproduceFinding(
+      opts({ testContent: ADD_TEST, sandbox: [process.execPath, box], testCommand: `node test/finding-1.test.js && while :; do echo x >> ${ticks}; sleep 0.05; done`, timeoutMs: 1500 }),
+    );
+    assert.match(r.harnessError ?? "", /timed out/);
+    const size = readFileSync(ticks).length;
+    await new Promise((res) => setTimeout(res, 500));
+    assert.equal(readFileSync(ticks).length, size, "the sandboxed command kept running after the harness returned");
+  } finally {
+    for (const pid of readFileSync(join(dir, "pids"), "utf8").trim().split("\n").map(Number)) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -18,9 +18,12 @@
 // and "older than 14 days" can miss a proposal in such a stretch.
 
 import { CATCH_THRESHOLD, instantMs, plantStats } from "./plants";
-import { seededRecall } from "./risk";
-import { ringOf } from "./rules";
-import type { CommonsState, KeyId, OwnerId, Ring, SubmissionState, TreeView } from "./types";
+import { isConfirmedDefect } from "./findingStatus";
+import { submissionDead } from "./ledger";
+import { isFalseFinding } from "./review";
+import { firstShipped, seededRecall } from "./risk";
+import { submissionRing as ringOfChange } from "./gates/rings";
+import type { CommonsState, KeyId, OwnerId, Ring, SubmissionState } from "./types";
 
 export type MetricRow = { group: string; metric: string; value: number | string; bad: boolean; note: string };
 
@@ -32,7 +35,7 @@ const NA = "n/a";
 
 // Thresholds that are not in Rules: they flag, they never decide anything.
 const MAX_FALSE_FINDING_RATE = 0.3; // most findings should reproduce; above this the harness is being flooded
-const MAX_DEFECTIVE_APPROVAL_RATE = 0.1; // approvals of work a reproduced finding later hit
+const MAX_DEFECTIVE_APPROVAL_RATE = 0.1; // approvals of work a confirmed finding later hit
 const MIN_MERGE_RATE = 0.3; // judged once there are this many submissions:
 const MIN_SUBMISSIONS_FOR_RATE = 10;
 const MAX_HOURS_TO_MERGE = 7 * 24;
@@ -76,8 +79,9 @@ export function gini(xs: readonly number[]): number {
 
 // Open reviews between owners: revealed reviews the reviewer chose to give,
 // i.e. not drawn by the beacon (assigned seats cannot be steered to a friend),
-// on organic work (the custodian never reviews back, so plant reviews would
-// only dilute a ring). Keyed "reviewer\0author".
+// on organic work (a plant's reviewers did not choose its author, the
+// custodian, as a friend; counting them would only dilute a ring). Keyed
+// "reviewer\0author".
 function openReviewEdges(state: CommonsState): Map<string, number> {
   const edges = new Map<string, number>();
   for (const s of state.submissions.values()) {
@@ -196,37 +200,17 @@ function seqTimes(state: CommonsState, fallback: number): (seq: number) => numbe
 }
 
 function submissionRing(s: SubmissionState, state: CommonsState): Ring {
-  return s.changedFiles.reduce<Ring>((low, f) => Math.min(low, ringOf(f, state.rules)) as Ring, 2);
+  return ringOfChange(s.changedFiles, state.rules);
 }
 
-// Dead submissions can never merge (the ledger's merge rule): a failed gate
-// (a later passing run does not erase it), a reproduced finding, or a revealed plant.
+// Dead submissions can never merge (ledger.submissionDead): a failed gate
+// (a later passing run does not erase it), a confirmed defect, or a revealed plant.
 function isDead(state: CommonsState, s: SubmissionState): boolean {
-  return (
-    s.planted !== undefined ||
-    s.gates.some((g) => !g.pass) ||
-    s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true)
-  );
+  return !s.merged && submissionDead(state, s.id);
 }
 
-// When each snapshot's content first reached main: its own promotion or the
-// earliest of a descendant's.
-function firstShipped(state: CommonsState): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const snap of state.snapshots.values()) {
-    if (!snap.promoted) continue;
-    const at = instantMs(snap.promoted.at);
-    const seen = new Set<string>();
-    for (let cur: string | null = snap.id; cur !== null && !seen.has(cur); ) {
-      seen.add(cur);
-      if (!(at >= (out.get(cur) ?? Number.POSITIVE_INFINITY))) out.set(cur, at);
-      cur = state.snapshots.get(cur)?.previousSnapshotId ?? null;
-    }
-  }
-  return out;
-}
 
-export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: string): MetricRow[] {
+export function computeMetrics(state: CommonsState, nowIso: string): MetricRow[] {
   const now = instantMs(nowIso);
   if (Number.isNaN(now)) throw new RangeError(`invalid nowIso (need an ISO date-time with Z or ±HH:MM): ${nowIso}`);
   const rules = state.rules;
@@ -234,7 +218,6 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   const row = (group: string, metric: string, value: number | string, bad: boolean, note: string) =>
     rows.push({ group, metric, value, bad, note });
   const ownerOf = (k: KeyId): OwnerId | undefined => state.agents.get(k)?.owner;
-  const ownerIds = [...state.owners.keys()].sort();
   // Owners who can merge or review at all; kernel signers, the custodian and
   // fresh invitees without agents would add structural zeros to a Gini.
   const workers = [...new Set([...state.agents.values()].map((a) => a.owner))].sort();
@@ -269,8 +252,9 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
       `${t.caught}/${t.seen} plants seen by a ${family} agent were caught by one`,
     );
   }
-  const judged = [...state.findings.values()].filter((f) => f.result !== undefined);
-  const falseFindings = judged.filter((f) => f.result?.reproduced !== true).length;
+  // A harness error judged nothing, so it is in neither count.
+  const judged = [...state.findings.values()].filter((f) => f.result !== undefined && f.result.harnessError === undefined);
+  const falseFindings = judged.filter(isFalseFinding).length;
   row(
     q,
     "false-finding rate",
@@ -279,13 +263,13 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     `${falseFindings}/${judged.length} judged findings did not reproduce (bad above ${MAX_FALSE_FINDING_RATE})`,
   );
   // An approval is a revealed p below the catch threshold on organic work that
-  // merged. It was defective if a reproduced finding hit that work, directly
+  // merged. It was defective if a confirmed finding hit that work, directly
   // or through the snapshot listing it (a snapshot finding is about that
   // snapshot's own diff; it cannot say which submission, so all are hit).
   // Escapes need a reproduced finding, so they are already among these.
   const hitSnapshots = new Set<string>();
   for (const f of state.findings.values()) {
-    if (f.result?.reproduced === true && "snapshotId" in f.target) hitSnapshots.add(f.target.snapshotId);
+    if (isConfirmedDefect(f) && "snapshotId" in f.target) hitSnapshots.add(f.target.snapshotId);
   }
   const hitViaSnapshot = new Set<string>();
   for (const snap of state.snapshots.values()) {
@@ -296,7 +280,11 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   for (const s of organic) {
     if (!s.merged) continue;
     const hit =
-      hitViaSnapshot.has(s.id) || s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true);
+      hitViaSnapshot.has(s.id) ||
+      s.findingIds.some((id) => {
+        const f = state.findings.get(id);
+        return f !== undefined && isConfirmedDefect(f);
+      });
     for (const r of s.reviews) {
       if (r.verdict === undefined || r.verdict.defectProbability >= CATCH_THRESHOLD) continue;
       approvals += 1;
@@ -308,7 +296,7 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
     "approvals later found defective",
     ratio(defective, approvals),
     approvals > 0 && defective / approvals > MAX_DEFECTIVE_APPROVAL_RATE,
-    `${defective}/${approvals} approvals of merged work were followed by a reproduced finding on it or its snapshot (bad above ${MAX_DEFECTIVE_APPROVAL_RATE})`,
+    `${defective}/${approvals} approvals of merged work were followed by a confirmed finding on it or its snapshot (bad above ${MAX_DEFECTIVE_APPROVAL_RATE})`,
   );
 
   // --- flow ---------------------------------------------------------------
@@ -337,8 +325,9 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
   const shipped = firstShipped(state);
   const toPromotion: number[] = [];
   for (const snap of state.snapshots.values()) {
-    const at = shipped.get(snap.id);
-    if (at === undefined) continue;
+    const first = shipped.get(snap.id);
+    if (first === undefined) continue;
+    const at = instantMs(first.at);
     for (const id of snap.submissionIds) {
       const m = state.submissions.get(id)?.merged;
       const h = m ? (at - instantMs(m.at)) / HOUR_MS : Number.NaN;
@@ -429,9 +418,6 @@ export function computeMetrics(state: CommonsState, tree: TreeView, nowIso: stri
       : `${round(conc.share)} of the ${conc.incoming} open reviews of ${conc.owner}'s work came from ${conc.top.join(" and ")}`) +
       ` (bad above ${MAX_CONCENTRATION} once ${MIN_REVIEWING_OWNERS} owners give open reviews; ${conc.reviewingOwners} do)`,
   );
-  // Distance exclusion cannot be computed for an owner the tree does not know.
-  const outside = ownerIds.filter((o) => !tree.has(o));
-  row(tr, "owners outside the tree", outside.length, outside.length > 0, outside.length > 0 ? outside.join(", ") : "");
 
   // --- cost & liveness ----------------------------------------------------
   const cl = "cost & liveness";

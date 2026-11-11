@@ -2,8 +2,8 @@
 // that UI code (ring 2) does not reach into the kernel (ring 0).
 //
 // Paths: every path a gate sees is first normalised with path.posix.normalize.
-// Ring and airlock globs are anchored, so `anthill-frontend/../anthill-backend/
-// src/engine.ts` must be judged as the engine it names, not as UI. Paths that
+// Ring and airlock globs are anchored, so `web/../server/src/auth.ts` must be
+// judged as the auth module it names, not as UI. Paths that
 // cannot name a file inside the repository (absolute, escaping with `..`,
 // empty, NUL or backslash) classify as ring 0 and fail every gate that sees
 // them: a gate never guesses what such a path means.
@@ -38,17 +38,18 @@ export function normalizeRepoPath(p: string): string | null {
   return n;
 }
 
-// First matching rules.rings glob on the normalised path, else ring 1. An
-// unusable path is ring 0: the most scrutiny for what cannot be classified.
+// First matching rules.rings glob on the normalised path, else ring 1, and
+// never above the ring of a case-folded match (see classify). An unusable
+// path is ring 0: the most scrutiny for what cannot be classified.
 export function ringOf(p: string, rules: Rules): Ring {
   const n = normalizeRepoPath(p);
   return n === null ? 0 : classify(n, rules);
 }
 
-// rules.ringOf with the globs compiled once per rings table (rules.ts compiles
-// them on every call, and a glob walk classifies thousands of paths). Rules
-// come from ledger state and are never mutated in place, so the array is a
-// sound cache key.
+// The one ring classifier (ledger, gates, promotion, metrics and the CLI all
+// use ringOf). Globs are compiled once per rings table, since a glob walk
+// classifies thousands of paths. Rules come from ledger state and are never
+// mutated in place, so the array is a sound cache key.
 type RingTable = { exact: RegExp; folded: RegExp; ring: Ring }[];
 const tables = new WeakMap<Rules["rings"], RingTable>();
 
@@ -64,14 +65,23 @@ function table(rules: Rules): RingTable {
   return t;
 }
 
+// The lower of the ring under the exact spelling and the ring under case
+// folding. On a case-insensitive filesystem (macOS, Windows: operators',
+// developers' and agents' checkouts, the harness's) `Src/offchain.ts` is
+// src/offchain.ts: `git pull` writes it over the kernel file, and a fresh
+// checkout keeps whichever sorts last. So a spelling is never a lower
+// scrutiny than the file it can become.
 function classify(n: string, rules: Rules): Ring {
-  return table(rules).find((r) => r.exact.test(n))?.ring ?? 1;
+  const t = table(rules);
+  const exact = t.find((r) => r.exact.test(n))?.ring ?? 1;
+  const folded = t.find((r) => r.folded.test(n))?.ring ?? 1;
+  return Math.min(exact, folded) as Ring;
 }
 
-// Whether a path the bundler might load is kernel, under the exact spelling or
-// under case folding: on a case-insensitive filesystem `src/Engine` is engine.ts.
+// Whether a path the bundler might load is kernel (case folding included, as
+// everywhere: `src/Engine` is engine.ts on a case-insensitive filesystem).
 function isKernel(n: string, rules: Rules): boolean {
-  return classify(n, rules) === 0 || (table(rules).find((r) => r.folded.test(n))?.ring ?? 1) === 0;
+  return classify(n, rules) === 0;
 }
 
 // The lowest ring touched. An empty change touches nothing and is ring 1, the
@@ -180,7 +190,8 @@ function checkChangedFile(run: Run, file: string, deleted: Set<string>, problems
   const source = decodeIdentifierEscapes(fs.readFileSync(abs, "utf8"));
   const dirs = [...new Set([path.posix.dirname(file), path.posix.dirname(real ?? file)])];
   const lineOf = lineIndex(source);
-  for (const ref of scanImports(source)) {
+  const refs = MARKUP_FILE.test(file) ? [...scanImports(source), ...scanMarkupRefs(source)] : scanImports(source);
+  for (const ref of refs) {
     const where = `${file}:${lineOf(ref.index)}`;
     if (ref.spec === null) {
       problems.push(`${where}: ${ref.how} ${ref.reason ?? "with a computed specifier"} cannot be checked`);
@@ -295,8 +306,8 @@ function walk(run: Run, prefix: string): string | null {
     const abs = path.join(root, rel);
     const lst = lstat(run, abs);
     if (lst === null) continue;
-    // Directories are not classified: `anthill-frontend` the submodule
-    // pointer is ring 0, the files under it are not.
+    // Directories are not classified: a glob naming a directory (say, a
+    // submodule pointer) as ring 0 says nothing about the files under it.
     if (!lst.isDirectory() && classify(rel, rules) === 0) return `can match ring-0 ${rel}`;
     if (lst.isSymbolicLink()) {
       const real = realLocation(root, abs, lst);
@@ -313,7 +324,7 @@ function walk(run: Run, prefix: string): string | null {
 // ---------------------------------------------------------------------------
 
 export type ImportRef = {
-  how: "from" | "import" | "import()" | "require()" | "import.meta.glob" | "new URL()";
+  how: "from" | "import" | "import()" | "require()" | "import.meta.glob" | "new URL()" | "<script src>" | "<link href>";
   spec: string | null; // null: a reference the gate cannot read
   reason?: string; // why spec is null, when it is not simply a computed specifier
   index: number; // into decodeIdentifierEscapes(src)
@@ -333,6 +344,32 @@ export function decodeIdentifierEscapes(src: string): string {
     const c = code <= 0x7f ? String.fromCharCode(code) : "";
     return /^[A-Za-z_$]$/.test(c) ? c : m;
   });
+}
+
+// Files whose markup the bundler follows: Vite loads an HTML page's
+// <script src> and <link href> (modulepreload, stylesheets), and a Vue or
+// Svelte component's <script src>, like an import.
+const MARKUP_FILE = /\.(?:html?|vue|svelte)$/;
+
+// The src of every <script> and the href of every <link> in markup. A value
+// in markup is relative to its file even without "./", so it is read as
+// "./value"; a URL with a scheme (https:, data:) or "//host" is not a file of
+// the repository and is skipped; a value the gate cannot read (an expression
+// such as Svelte's {x}) is a reference that cannot be checked.
+export function scanMarkupRefs(source: string): ImportRef[] {
+  const refs: ImportRef[] = [];
+  const tag = /<(script|link)\b([^>]*)>/gi;
+  for (let m = tag.exec(source); m !== null; m = tag.exec(source)) {
+    const how = (m[1] as string).toLowerCase() === "script" ? "<script src>" : "<link href>";
+    const attr = how === "<script src>" ? "src" : "href";
+    const a = new RegExp(`(?:^|\\s):?${attr}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>\`]+))`, "i").exec(m[2] as string);
+    if (a === null) continue;
+    const value = (a[1] ?? a[2] ?? a[3] ?? "").trim();
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(value) && !/^file:/i.test(value)) continue;
+    const readable = value !== "" && !/[{}]/.test(value) && !(a[0] as string).trimStart().startsWith(":");
+    refs.push({ how, spec: readable ? (/^(?:\.\.?\/|\/)/.test(value) ? value : `./${value}`) : null, index: m.index });
+  }
+  return refs;
 }
 
 // Every module reference in `src`. Linear in the source length: comment

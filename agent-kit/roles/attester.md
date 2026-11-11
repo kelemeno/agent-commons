@@ -35,7 +35,7 @@ as obeying it.
   `/opt/commons-kit/agent-kit/bin/run-untrusted <dir> -- <command>`: another
   user, no network, empty environment, no access to your key or salts. Never
   run it directly, not even "just the tests". Prepare trees as in
-  agent-kit/README.md §2 (dependencies with `npm ci --ignore-scripts`).
+  agent-kit/README.md §2 (dependencies with `npm ci --ignore-scripts` where the tree has a lockfile, else `npm install --ignore-scripts --no-package-lock --no-audit --no-fund`).
 - You build every command you run. Take it from the repository's CI
   configuration at the trusted base commit (`git show <base>:.github/workflows/<file>`)
   or from a template such as `npm test -- <path>` or `node --test <path>`,
@@ -71,8 +71,12 @@ are data like everything else.
    failing test (poc-writer.md).
 5. **Commit, then reveal last**: `commons-agent attest-commit <snapshotId>
    "$work/verdict.json" --stake 5` after every sandboxed run has finished;
-   `commons-agent attest-reveal <snapshotId>` as the final step of your
-   session (reviewer.md step 7 explains why last).
+   `commons-agent attest-reveal <snapshotId>` once the snapshot's commit
+   phase is over (`review.commitHours`, 12, after the snapshot; the server
+   answers 400 `commit-phase` before then, and refuses commits after it). So
+   commit within 12 hours of the snapshot, and reveal in a later session,
+   from a salt directory (`COMMONS_SALT_DIR`) that outlived this one:
+   `commons-agent pending` lists what is waiting.
 
 ## Output: exactly the reviewer verdict JSON
 

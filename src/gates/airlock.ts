@@ -9,8 +9,14 @@ import { listProblems, normalizeRepoPath } from "./rings";
 
 export const GATE = "airlock";
 
+// Matched ignoring letter case: on a case-insensitive filesystem
+// `Package.json` is package.json (a pull writes it over the manifest, and
+// npm then runs its scripts), so every spelling of a locked path is locked.
 export function isLocked(file: string, rules: Rules): boolean {
-  return rules.lockedPaths.some((g) => globToRegExp(g).test(file));
+  return rules.lockedPaths.some((g) => {
+    const exact = globToRegExp(g);
+    return new RegExp(exact.source, `${exact.flags.replace("i", "")}i`).test(file);
+  });
 }
 
 // Fails if any changed file is a locked path (unless on the dependency track)

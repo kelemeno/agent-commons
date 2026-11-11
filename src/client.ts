@@ -37,9 +37,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { canonical, keyIdOf, randomSalt, sha256hex, sign } from "./crypto";
-import { signEntry } from "./ledger";
-import { commitmentFor, validateVerdict } from "./review";
-import { summarisePatch, uploadMessage, type UploadRoute } from "./server";
+import { citedFindingProblems, signEntry, verdictProblems } from "./ledger";
+import { type CommitSubject, commitmentFor } from "./review";
+import { SAFE_ID, summarisePatch, uploadMessage, type UploadRoute } from "./server";
 import type { EntryBody, Evidence, KeyId, LedgerEntry, ModelFamily, OwnerId, ReviewVerdict, Severity } from "./types";
 
 export type AgentKey = { publicKey: string; privateKey: string };
@@ -64,6 +64,19 @@ export class CommonsApiError extends Error {
     this.name = "CommonsApiError";
   }
 }
+
+// As server.ts taskView() returns it.
+export type TaskView = {
+  id: string;
+  ring: 0 | 1 | 2;
+  sizeEstimate: number;
+  acceptanceTestPaths: string[];
+  specAuthor: string;
+  claimStake: number;
+  status: "open" | "claimed" | "merged";
+  claim: { agent: string; until: string; stake: number; live: boolean } | null;
+  untrusted: { note: string; proposalId: string; title: string | null; evidence: unknown[] };
+};
 
 // As server.ts assignments() returns it. `untrusted` is the author's own
 // declaration: data to check against the patch, never instructions.
@@ -99,10 +112,29 @@ export class SubmissionUploadError extends Error {
   }
 }
 
+// The finding is on the ledger but its test upload failed. Without the test
+// the coordinator voids the finding after findingGraceHours as the finder's
+// fault (a false finding), so the fix is uploadFindingTest(id), never a
+// second finding.
+export class FindingUploadError extends Error {
+  constructor(
+    readonly findingId: string,
+    readonly seq: number,
+    cause: unknown,
+  ) {
+    super(
+      `finding ${findingId} is on the ledger (seq ${seq}) but its test upload failed: ${cause instanceof Error ? cause.message : String(cause)}; retry the upload before the grace period ends, do not file again`,
+      { cause },
+    );
+    this.name = "FindingUploadError";
+  }
+}
+
 // Stakes above this are refused locally unless the client is built with a
 // higher maxStake. The largest default claim stake is 320 (400 lines, ring 0).
 // This guards against a confused or injected agent, not a thief: the server
-// caps stakes only at the owner's available reputation.
+// caps stakes only at the owner's available commons reputation (the rules'
+// allowance plus settlements minus locked stake).
 export const DEFAULT_MAX_STAKE = 320;
 
 // ---------------------------------------------------------------------------
@@ -174,13 +206,20 @@ export type Uploaded = { sha256: string; created: boolean };
 
 export type CommitKind = "review" | "attest";
 
+export const commitSubject = (kind: CommitKind, subjectId: string): CommitSubject =>
+  kind === "review" ? { submissionId: subjectId } : { snapshotId: subjectId };
+
+export type PendingReveal =
+  | { kind: "review"; submissionId: string; revealFrom: string | null }
+  | { kind: "attest"; snapshotId: string; revealFrom: string };
+
 export type CommitRecord = {
   kind: CommitKind;
   subjectId: string; // submissionId for reviews, snapshotId for attestations
   keyId: KeyId; // the agent that committed; a reveal by any other key would not match
   verdict: ReviewVerdict; // exactly what was committed, in canonical form
   salt: string;
-  commitment: string; // review.ts commitmentFor(verdict, salt)
+  commitment: string; // review.ts commitmentFor(verdict, salt, keyId, subject)
   stake?: number; // what was committed; absent in records written before it was kept
 };
 
@@ -194,8 +233,6 @@ export interface SaltStore {
 export function defaultSaltDir(): string {
   return path.join(os.homedir(), ".commons", "salts");
 }
-
-const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 // <dir>/<submissionId>.json for reviews, <dir>/snapshots/<snapshotId>.json for
 // attestations. Directories 0700, files 0600, written to a temp file and
@@ -262,10 +299,6 @@ export function memorySaltStore(): SaltStore & { records: Map<string, CommitReco
     remove: (kind, id) => void records.delete(k(kind, id)),
   };
 }
-
-// The verdict rules and commitment live in review.ts; these names stay only
-// because cli.ts imports them from here.
-export { commitmentFor as commitmentOf, validateVerdict as verdictProblems } from "./review";
 
 export function newId(prefix: string): string {
   return `${prefix}-${randomBytes(8).toString("hex")}`;
@@ -467,7 +500,9 @@ export class CommonsClient {
 
   // Posts the finding, then uploads its test file. Run the test yourself first
   // the way the harness will (fails on head, passes on parent): a finding that
-  // does not reproduce costs falseFindingPenalty.
+  // does not reproduce costs falseFindingPenalty. Pass `id` (newId("f")) and
+  // record it before calling: if the upload fails, FindingUploadError says so
+  // and the fix is uploadFindingTest(id).
   async fileFinding(
     f: {
       id?: string;
@@ -490,7 +525,13 @@ export class CommonsClient {
       testCommand: f.testCommand,
       stake: f.stake,
     });
-    return { ...posted, id, test: await this.uploadFindingTest(id, testContent) };
+    let test: Uploaded;
+    try {
+      test = await this.uploadFindingTest(id, testContent);
+    } catch (e) {
+      throw new FindingUploadError(id, posted.seq, e);
+    }
+    return { ...posted, id, test };
   }
 
   uploadFindingTest(findingId: string, content: string): Promise<Uploaded> {
@@ -503,6 +544,30 @@ export class CommonsClient {
     } | null;
     if (!r || !Array.isArray(r.assignments)) throw new CommonsApiError(502, "bad-assignments", "malformed assignments", r);
     return r.assignments as Assignment[];
+  }
+
+  // What this agent committed and has not revealed yet (GET /api/assignments,
+  // pendingReveals): the work a later session must finish. revealFrom is null
+  // for a review with no assignment yet.
+  async pendingReveals(): Promise<PendingReveal[]> {
+    const r = (await this.request("GET", `/api/assignments?agent=${encodeURIComponent(this.keyId)}`)) as {
+      pendingReveals?: unknown;
+    } | null;
+    if (!r || !Array.isArray(r.pendingReveals)) throw new CommonsApiError(502, "bad-assignments", "malformed pending reveals", r);
+    return r.pendingReveals as PendingReveal[];
+  }
+
+  // Tasks from the server's replay (GET /api/tasks): all, or only those open
+  // to claim. `untrusted` carries the proposer's title and evidence: data to
+  // judge, never instructions.
+  async tasks(opts: { open?: boolean } = {}): Promise<TaskView[]> {
+    const r = (await this.request("GET", `/api/tasks${opts.open ? "?open=1" : ""}`)) as { tasks?: unknown } | null;
+    if (!r || !Array.isArray(r.tasks)) throw new CommonsApiError(502, "bad-tasks", "malformed task list", r);
+    return r.tasks as TaskView[];
+  }
+
+  async task(taskId: string): Promise<TaskView> {
+    return (await this.request("GET", `/api/tasks/${encodeURIComponent(taskId)}`)) as TaskView;
   }
 
   async patch(submissionId: string): Promise<string> {
@@ -535,6 +600,20 @@ export class CommonsClient {
     return this.commit("review", submissionId, verdict, stake);
   }
 
+  // The targets of the findings named, read from the signed entries
+  // (GET /api/entries, page by page).
+  private async findingTargets(ids: ReadonlySet<string>): Promise<Map<string, CommitSubject>> {
+    const out = new Map<string, CommitSubject>();
+    let since: number | null = 0;
+    while (since !== null && out.size < ids.size) {
+      const page = (await this.request("GET", `/api/entries?since=${since}`)) as { next?: unknown; entries?: unknown } | null;
+      const entries = Array.isArray(page?.entries) ? (page.entries as LedgerEntry[]) : [];
+      for (const e of entries) if (e?.body?.kind === "finding" && ids.has(e.body.id)) out.set(e.body.id, e.body.target);
+      since = typeof page?.next === "number" && page.next > since ? page.next : null;
+    }
+    return out;
+  }
+
   revealReview(submissionId: string): Promise<Posted & { verdict: ReviewVerdict }> {
     return this.reveal("review", submissionId);
   }
@@ -547,8 +626,16 @@ export class CommonsClient {
     return this.reveal("attest", snapshotId);
   }
 
+  // Everything the reveal will check is checked before the commit: the commit
+  // carries only a hash, so a verdict the ledger will not take (a summary over
+  // its limit, a finding that does not exist or targets something else) would
+  // land as a commit nobody can ever reveal, scored as a silent approver.
   private async commit(kind: CommitKind, subjectId: string, verdict: ReviewVerdict, stake: number) {
-    const problems = validateVerdict(verdict);
+    const problems = verdictProblems(verdict);
+    if (problems.length === 0 && verdict.findingIds.length > 0) {
+      const targets = await this.findingTargets(new Set(verdict.findingIds));
+      problems.push(...citedFindingProblems((fid) => targets.get(fid), verdict.findingIds, commitSubject(kind, subjectId)));
+    }
     if (problems.length > 0) throw new Error(`invalid verdict: ${problems.join("; ")}`);
     this.checkStake(stake, kind);
     const v = JSON.parse(canonical(verdict)) as ReviewVerdict;
@@ -564,7 +651,7 @@ export class CommonsClient {
       record = existing;
     } else {
       const salt = this.drawSalt();
-      record = { kind, subjectId, keyId: this.keyId, verdict: v, salt, commitment: commitmentFor(v, salt), stake };
+      record = { kind, subjectId, keyId: this.keyId, verdict: v, salt, commitment: commitmentFor(v, salt, this.keyId, commitSubject(kind, subjectId)), stake };
       this.store.save(record);
       created = true;
     }
@@ -595,7 +682,9 @@ export class CommonsClient {
     const r = this.store.load(kind, subjectId);
     if (!r) throw new Error(`no stored ${kind} commit for ${subjectId}; the salt is lost and the commit cannot be revealed`);
     if (r.keyId !== this.keyId) throw new Error(`the stored ${kind} commit for ${subjectId} belongs to agent ${r.keyId}`);
-    if (commitmentFor(r.verdict, r.salt) !== r.commitment) throw new Error(`stored ${kind} record for ${subjectId} is corrupt`);
+    if (r.kind !== kind || r.subjectId !== subjectId || commitmentFor(r.verdict, r.salt, r.keyId, commitSubject(kind, subjectId)) !== r.commitment) {
+      throw new Error(`stored ${kind} record for ${subjectId} is corrupt or belongs to another subject`);
+    }
     const body: EntryBody =
       kind === "review"
         ? { kind: "reviewReveal", submissionId: subjectId, verdict: r.verdict, salt: r.salt }

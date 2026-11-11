@@ -24,11 +24,10 @@ import { computeMetrics } from "./metrics";
 import { evaluatePromotion } from "./promotion";
 import { reviewerScores } from "./review";
 import { route, type Site } from "./playground/render";
-import type { LedgerEntry, TreeView } from "./types";
+import type { LedgerEntry } from "./types";
 
 export type PlaygroundOptions = {
   ledgerPath: string;
-  tree: TreeView;
   port: number;
   host?: string;
   // Fixed clock for tests and reproducible renders; otherwise the wall clock,
@@ -143,15 +142,14 @@ export function startPlayground(opts: PlaygroundOptions): http.Server {
     return {
       state,
       entries: f.entries,
-      tree: opts.tree,
       nowIso,
       log,
       memo: cached,
       derive: {
-        metrics: () => cached("derive:metrics", () => computeMetrics(state, opts.tree, nowIso)),
+        metrics: () => cached("derive:metrics", () => computeMetrics(state, nowIso)),
         promotion: (snapshotId) =>
-          cached(`derive:promotion:${snapshotId}`, () => evaluatePromotion(state, opts.tree, snapshotId, nowIso)),
-        reviewerScores: () => cached("derive:scores", () => reviewerScores(state)),
+          cached(`derive:promotion:${snapshotId}`, () => evaluatePromotion(state, snapshotId, nowIso)),
+        reviewerScores: () => cached("derive:scores", () => reviewerScores(state, nowIso)),
       },
     };
   };

@@ -1,6 +1,6 @@
 // The coordinator loop: a pure planner and an effectful executor.
 //
-// planActions(state, tree, nowIso, opts) reads only its arguments and returns
+// planActions(state, nowIso, opts) reads only its arguments and returns
 // what the coordinator should do next. Every rule is decided from the ledger
 // (plus the injected facts in PlanOptions), so planning is idempotent: once a
 // plan's actions are executed (and their entries appended), planning again does
@@ -42,6 +42,9 @@
 
 import { readFileSync } from "node:fs";
 import { canonical } from "./crypto";
+import { blocksTarget, findingStatus, isConfirmedDefect } from "./findingStatus";
+import { LEDGER_LIMITS, taskMerged } from "./ledger";
+import { CATCH_THRESHOLD, reviewWindowCloseSeq } from "./plants";
 import { uploadExists } from "./server";
 import type {
   CommitSha,
@@ -51,9 +54,7 @@ import type {
   KeyId,
   LedgerEntry,
   OwnerId,
-  SnapshotState,
   SubmissionState,
-  TreeView,
 } from "./types";
 
 type Body<K extends EntryBody["kind"]> = Extract<EntryBody, { kind: K }>;
@@ -67,9 +68,10 @@ export type Stage = "dev" | "release" | "main";
 // ---------------------------------------------------------------------------
 
 export type IncentivesApi = {
-  settleFinding(state: CommonsState, tree: TreeView, findingId: string, stage: Stage): SettlementBody[];
-  settleMerge(state: CommonsState, submissionId: string, tranche: 1 | 2 | 3): SettlementBody[];
-  settleCleanReviews(state: CommonsState, snapshotId: string): SettlementBody[];
+  settleFinding(state: CommonsState, findingId: string, stage: Stage, nowIso?: string): SettlementBody[];
+  // nowIso: the evaluation time (tranche 3 and clean reviews vest after the tail).
+  settleMerge(state: CommonsState, submissionId: string, tranche: 1 | 2 | 3, nowIso: string): SettlementBody[];
+  settleCleanReviews(state: CommonsState, snapshotId: string, nowIso: string): SettlementBody[];
   settleMissedPlant(state: CommonsState, submissionId: string): SettlementBody[];
   settleFalseFinding(state: CommonsState, findingId: string): SettlementBody[];
   settleExpiredClaims(state: CommonsState, nowIso: string): SettlementBody[];
@@ -79,20 +81,18 @@ export type IncentivesApi = {
 export type PromotionApi = {
   evaluatePromotion(
     state: CommonsState,
-    tree: TreeView,
     snapshotId: string,
     nowIso: string,
   ): { pass: boolean; checks: { name: string; pass: boolean; detail: string }[] };
 };
 
 export type SelectionApi = {
-  computeBeacon(state: CommonsState, submissionId: string, externalEntropy: string): string;
-  selectReviewers(
+  // The draw over the member tree of `state`, and the entry recording it.
+  drawAssignment(
     state: CommonsState,
-    tree: TreeView,
     submissionId: string,
-    beacon: string,
-  ): { reviewers: KeyId[]; candidates: number; notes: string[] };
+    entropy: string,
+  ): { reviewers: KeyId[]; candidates: number; notes: string[]; body: Body<"reviewAssignment"> };
 };
 
 function load<T>(name: "incentives" | "promotion" | "selection"): T {
@@ -110,6 +110,19 @@ function load<T>(name: "incentives" | "promotion" | "selection"): T {
 
 // Reserved gate name for the binding; a gate runner may not report it.
 export const BINDING_GATE = "patch";
+
+// Reserved gate name for a merge the bridge refused because the bound head
+// conflicts with dev. Without a record the submission could never merge and
+// never die: every pass would retry it, and it would hold its author's PR
+// slot and its reviewers' stakes for good. The failed gate makes it dead
+// (ledger.submissionDead); the author resubmits on the new dev.
+export const MERGE_GATE = "merge";
+
+// What a bridge throws when the head does not merge cleanly onto dev (and
+// only then: any other error is retried on the next pass).
+export class MergeConflictError extends Error {
+  override readonly name = "MergeConflictError";
+}
 
 export type PatchBinding = { head: CommitSha; patchSha256: string };
 
@@ -143,7 +156,10 @@ export function codeHead(s: SubmissionState, opts: Pick<PlanOptions, "headBindin
 // Actions
 // ---------------------------------------------------------------------------
 
-export type VoidReason = "no-test" | "harness-error";
+// no-test: the finder never uploaded its test (the finder's fault: a false
+// finding). harness-error, deadline: the harness could not judge it (nobody's
+// fault: recorded with harnessError, nobody is slashed).
+export type VoidReason = "no-test" | "harness-error" | "deadline";
 
 export type Action =
   | { kind: "task"; body: TaskBody }
@@ -166,10 +182,10 @@ export type Action =
   | { kind: "bindPatch"; submissionId: string }
   | { kind: "runGates"; submissionId: string; headCommit: CommitSha; gates: string[] | null }
   | { kind: "assignReviewers"; submissionId: string }
-  // The review window closed with a quorum of reveals; the reviewers who
-  // never revealed count as missing. Planned only alongside the merge it
-  // unblocks, so it is not repeated while the submission waits for something else.
-  | { kind: "revealPhaseClose"; submissionId: string; missing: KeyId[] }
+  // The review window's time ran out with a quorum of reveals: record it on
+  // the ledger (reviewWindowClosed), which closes the window for plants.ts, so
+  // the merge waits a plant-reveal grace after it. `missing` never revealed.
+  | { kind: "closeReviewWindow"; submissionId: string; missing: KeyId[] }
   | { kind: "merge"; submissionId: string }
   | { kind: "snapshot"; id: string; commit: CommitSha; previousSnapshotId: string | null; submissionIds: string[] }
   | { kind: "promote"; snapshotId: string; commit: CommitSha };
@@ -185,12 +201,12 @@ export type PlanOptions = {
   // "required" (default): judge and merge only the bot commit bound to the
   // stored patch. "declared": trust the author's headCommit (trusted repos only).
   headBinding?: "required" | "declared";
-  phase?: 1 | 2; // default 1: a human must approve every merge and confirm every reproduced finding
-  humanApproval?: (submissionId: string) => boolean; // phase 1; absent = never approved
-  // Phase 1: a reproduced finding pays and slashes (and records an escape) only
-  // once a human confirmed it tests a real defect, not merely the intended
-  // change. Absent = never confirmed. The merge stays blocked either way.
-  findingConfirmed?: (findingId: string) => boolean;
+  // Default 1: every merge needs a mergeApproval entry. Phase 2 merges
+  // mechanically, except a submission its revealed assigned reviewers flagged
+  // (a majority at p >= CATCH_THRESHOLD), which still needs one. In every phase
+  // a reproduced finding pays, slashes and records an escape only once an
+  // operator confirmed it (findingDecision), and blocks until one decided.
+  phase?: 1 | 2;
   snapshotEvery?: number; // merged, unsnapshotted submissions that trigger a snapshot; absent = never
   // Binding and gates need the patch; while this says false they are not planned.
   patchAvailable?: (submissionId: string) => boolean;
@@ -198,12 +214,17 @@ export type PlanOptions = {
   // findingGraceHours such a finding is voided. Absent = unknown, never voided for it.
   findingTestAvailable?: (findingId: string) => boolean;
   findingGraceHours?: number; // default 24
-  harnessErrors?: (findingId: string) => number; // failed harness runs so far
-  maxHarnessErrors?: number; // default 3; then the finding is voided
-  maxReproductionsPerPass?: number; // default 4, oldest findings first
+  maxHarnessErrors?: number; // default 3 findingAttempt entries; then the finding is voided
+  // A finding still without a result this long after filing (no sandbox, the
+  // harness keeps refusing, a test that cannot be fetched) is voided with a
+  // harness error: it stops blocking its target, and nobody is slashed for an
+  // operator's problem. Default 72.
+  findingResultDeadlineHours?: number;
+  maxReproductionsPerPass?: number; // default 4: fewest harness errors first, then oldest
   // While a plant commitment is unrevealed, merges of later submissions wait
-  // until the review window closed plus this grace, so the custodian (who
-  // reveals only after the window) can reveal before a plant merges. Default 1.
+  // this long after the entry that closed the review window on the ledger
+  // (plants.reviewWindowCloseSeq), so the custodian, who may reveal only once
+  // the window is closed there, can always reveal before a plant merges. Default 1.
   plantRevealGraceHours?: number;
   // Ledger entries, to time the review window from the assignment entry.
   // Without them the window never counts as closed (fail closed).
@@ -219,9 +240,14 @@ export type PlanOptions = {
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
-export type MergeReadiness = { ready: boolean; missing: KeyId[]; waiting: string[] };
+// `closeWindow`: the window's time ran out with a quorum but no
+// reviewWindowClosed entry records it yet; the planner appends one first.
+export type MergeReadiness = { ready: boolean; missing: KeyId[]; waiting: string[]; closeWindow?: boolean };
 
 // Why a submission can or cannot merge now. `waiting` lists every unmet rule.
+// Everything it reads is on the ledger (approvals, decisions, the window's
+// close) except the clock and the entries' times, so `commons merge` and the
+// coordinator apply exactly the same rule.
 export function mergeReadiness(
   state: CommonsState,
   submissionId: string,
@@ -235,17 +261,23 @@ export function mergeReadiness(
   let missing: KeyId[] = [];
   if (s.merged) waiting.push("already merged");
   if (s.planted) waiting.push("revealed plant");
+  if (!s.merged && s.taskId !== null && taskMerged(state, s.taskId)) waiting.push(`task ${s.taskId} already merged`);
   if (state.agents.get(s.author)?.active === false) waiting.push("author suspended");
   if (codeHead(s, opts) === null) waiting.push("patch not bound");
   waiting.push(...gateProblems(s, opts));
   const windowEnd = reviewWindowEnd(s, opts);
+  let closeWindow = false;
+  let flagged = false;
   if (!s.assignment) {
     waiting.push("no reviewers assigned");
   } else {
     const assigned = s.assignment.reviewers;
+    const verdicts = assigned.flatMap((r) => s.reviews.find((v) => v.reviewer === r && v.verdict !== undefined)?.verdict ?? []);
     const revealed = assigned.filter((r) => s.reviews.some((v) => v.reviewer === r && v.verdict !== undefined));
     const unrevealed = assigned.filter((r) => !revealed.includes(r));
     const quorum = Math.min(assigned.length, Math.max(1, opts.reviewQuorum ?? assigned.length - 1));
+    // What the reviewers said matters: a majority flag sends the merge to a human.
+    flagged = verdicts.filter((v) => v.defectProbability >= CATCH_THRESHOLD).length * 2 > verdicts.length;
     if (unrevealed.length > 0) {
       const expired = windowEnd !== null && now >= windowEnd;
       if (!expired) waiting.push(`awaiting reveals from ${unrevealed.join(", ")}`);
@@ -253,25 +285,42 @@ export function mergeReadiness(
         // Never "window expired" as "reviewed". A fresh draw needs a second
         // reviewAssignment, which the ledger does not accept yet.
         waiting.push(`review quorum not met: ${revealed.length} of ${quorum} revealed when the window closed`);
-      } else missing = unrevealed;
+      } else {
+        missing = unrevealed;
+        if (!s.windowClosed) {
+          closeWindow = true;
+          waiting.push("the review window's close is not on the ledger yet");
+        }
+      }
     }
   }
   if (plantMayBePending(state, s)) {
+    // Timed from the entry that closed the window on the ledger: the same
+    // close `commons plant reveal` waits for, so the custodian can always
+    // reveal in this grace, before the plant merges.
     const grace = (opts.plantRevealGraceHours ?? 1) * HOUR;
-    if (windowEnd === null || now < windowEnd + grace) waiting.push("plant reveal grace: a plant commitment is unrevealed");
+    const close = reviewWindowCloseSeq(state, s.id);
+    const entry = close === null ? undefined : opts.entries?.[close];
+    const closedAt = entry && entry.seq === close ? Date.parse(entry.at) : null;
+    if (closedAt === null || now < closedAt + grace) waiting.push("plant reveal grace: a plant commitment is unrevealed");
   }
   for (const fid of s.findingIds) {
     const f = state.findings.get(fid);
     if (!f) continue;
-    if (f.result?.reproduced) waiting.push(`reproduced finding ${fid}`);
+    const status = findingStatus(f);
+    if (status === "confirmed") waiting.push(`confirmed defect ${fid}`);
+    else if (status === "undecided") waiting.push(`reproduced finding ${fid} awaits an operator's decision`);
     // Stricter than "no unresolved finding >= high": the ledger refuses a merge
     // while any finding on the submission is undecided (finding-pending). An
     // undecidable finding is voided after a deadline (voidFinding), so this
     // cannot block for ever.
-    else if (!f.result) waiting.push(`unresolved ${f.severity} finding ${fid}`);
+    else if (status === "pending") waiting.push(`unresolved ${f.severity} finding ${fid}`);
   }
-  if ((opts.phase ?? 1) === 1 && opts.humanApproval?.(submissionId) !== true) waiting.push("awaiting human approval");
-  return { ready: waiting.length === 0, missing, waiting };
+  if (!s.approval) {
+    if ((opts.phase ?? 1) === 1) waiting.push("awaiting human approval (mergeApproval)");
+    else if (flagged) waiting.push("the assigned reviewers flagged a defect: awaiting human approval (mergeApproval)");
+  }
+  return { ready: waiting.length === 0, missing, waiting, ...(closeWindow ? { closeWindow } : {}) };
 }
 
 // Problems with the gate record; empty means all required gates passed.
@@ -285,10 +334,26 @@ function gateProblems(s: SubmissionState, opts: PlanOptions): string[] {
 }
 
 // Required gates without a result; null when no gate besides the binding ran
-// and no list is given (all gates are wanted).
+// and no list is given (all gates are wanted). A recorded failure settles it
+// (the submission can never merge), so nothing is missing then. Without a
+// list, one recorded gate stands for all of them, which a crash between the
+// runner's appends can make wrong: the CLI always passes its runner's list.
 function missingGates(s: SubmissionState, opts: PlanOptions): string[] | null {
+  if (s.gates.some((g) => !g.pass && g.gate !== BINDING_GATE)) return [];
   if (opts.requiredGates) return opts.requiredGates.filter((name) => !s.gates.some((g) => g.gate === name));
   return s.gates.some((g) => g.gate !== BINDING_GATE) ? [] : null;
+}
+
+// A gate's details as the ledger takes them: at most LEDGER_LIMITS.text
+// characters. The author controls how long a failure's details are (paths,
+// import specifiers), and a gateResult the ledger refused would never be
+// recorded: the failure would be lost and the planner would move on as if
+// the gates had passed.
+export function gateDetails(details: string): string {
+  const max = LEDGER_LIMITS.text;
+  if (details.length <= max) return details;
+  const marker = ` [... ${details.length} characters, cut]`;
+  return details.slice(0, max - marker.length) + marker;
 }
 
 // When the review window closes; null when the assignment time is unknown,
@@ -332,8 +397,11 @@ function snapshotOf(state: CommonsState, submissionId: string): string | null {
   return null;
 }
 
-// Where a defect was found, judged at the finding's own seq so the answer never
-// changes after the fact. `escapeSnapshot` is set when the defect was on main.
+// Where a defect was found. "dev" if its target was not in a snapshot when
+// the finding was filed; "main" (with the escape's snapshot) if a promotion
+// shipped it before the reproducing result, since main held the defect then
+// whenever the test was filed; else "release". Both seqs are fixed once the
+// result exists, so the answer never changes after the fact.
 function findingStage(state: CommonsState, findingId: string): { stage: Stage; escapeSnapshot: string | null } {
   const f = state.findings.get(findingId);
   if (!f) return { stage: "dev", escapeSnapshot: null };
@@ -341,7 +409,7 @@ function findingStage(state: CommonsState, findingId: string): { stage: Stage; e
   const snap = snapId === null ? undefined : state.snapshots.get(snapId);
   if (!snap || snap.seq > f.seq) return { stage: "dev", escapeSnapshot: null };
   const promo = promotionCovering(state, snap.id);
-  if (promo && promo.seq < f.seq) return { stage: "main", escapeSnapshot: promo.snapshotId };
+  if (promo && promo.seq < (f.result?.seq ?? f.seq)) return { stage: "main", escapeSnapshot: promo.snapshotId };
   return { stage: "release", escapeSnapshot: null };
 }
 
@@ -349,7 +417,7 @@ function findingStage(state: CommonsState, findingId: string): { stage: Stage; e
 // code head (never the declared one unless trusted), or for a snapshot the
 // previous snapshot or, for the first one, the base of its earliest merged
 // submission.
-function findingCommits(state: CommonsState, findingId: string, opts: PlanOptions): { base: CommitSha; head: CommitSha } | null {
+export function findingCommits(state: CommonsState, findingId: string, opts: Pick<PlanOptions, "headBinding">): { base: CommitSha; head: CommitSha } | null {
   const f = state.findings.get(findingId);
   if (!f) return null;
   if ("submissionId" in f.target) {
@@ -369,48 +437,25 @@ function findingCommits(state: CommonsState, findingId: string, opts: PlanOption
 }
 
 // A merged submission's standing for snapshots: "defective" can never be
-// snapshotted (its code needs a revert first), "pending" waits for a result.
+// snapshotted (its code needs a revert first), "pending" waits for a result or
+// an operator's decision. A dismissed reproduction is clean.
 function submissionStanding(state: CommonsState, s: SubmissionState): "clean" | "pending" | "defective" {
   if (s.planted) return "defective";
   let pending = false;
   for (const fid of s.findingIds) {
     const f = state.findings.get(fid);
-    if (f?.result?.reproduced) return "defective";
-    if (f && !f.result) pending = true;
+    if (f && isConfirmedDefect(f)) return "defective";
+    if (f && blocksTarget(f)) pending = true;
   }
   return pending ? "pending" : "clean";
 }
 
-// Why main must not move to this snapshot: any reproduced or undecided
-// finding on it, on an unpromoted ancestor, or on a submission they cover.
-export function ancestryProblems(state: CommonsState, snapshotId: string): string[] {
-  const out: string[] = [];
-  const ids = new Set<string>();
-  const subs = new Set<string>();
-  for (let cur: SnapshotState | undefined = state.snapshots.get(snapshotId); cur; ) {
-    ids.add(cur.id);
-    for (const sid of cur.submissionIds) subs.add(sid);
-    const prev = cur.previousSnapshotId === null ? undefined : state.snapshots.get(cur.previousSnapshotId);
-    if (!prev || prev.promoted) break;
-    cur = prev;
-  }
-  for (const f of state.findings.values()) {
-    const hit = "snapshotId" in f.target ? ids.has(f.target.snapshotId) : subs.has(f.target.submissionId);
-    if (!hit) continue;
-    if (f.result?.reproduced) out.push(`reproduced finding ${f.id}`);
-    else if (!f.result) out.push(`unresolved finding ${f.id}`);
-  }
-  for (const sid of subs) if (state.submissions.get(sid)?.planted) out.push(`revealed plant ${sid}`);
-  return out;
-}
-
 const settlementKey = (b: { owner: OwnerId; reason: string; ref: string }) => `${b.owner}\u0000${b.reason}\u0000${b.ref}`;
 
-export function planActions(state: CommonsState, tree: TreeView, nowIso: string, opts: PlanOptions): Action[] {
+export function planActions(state: CommonsState, nowIso: string, opts: PlanOptions): Action[] {
   const incentives = opts.incentives ?? load<IncentivesApi>("incentives");
   const promotion = opts.promotion ?? load<PromotionApi>("promotion");
   const now = Date.parse(nowIso);
-  const phase1 = (opts.phase ?? 1) === 1;
   const actions: Action[] = [];
 
   // 0. Coordinator entries from outside facts: approved tasks, decoy hits.
@@ -431,18 +476,17 @@ export function planActions(state: CommonsState, tree: TreeView, nowIso: string,
   const bodies: SettlementBody[] = [];
   const escapes = new Set(state.escapes.map((e) => e.findingId));
   for (const f of state.findings.values()) {
-    if (!f.result) continue;
-    if (f.result.reproduced) {
-      // A test can be made to "reproduce" by asserting the old text the change
-      // intentionally removed. In phase 1 a human confirms before anyone is
-      // paid or slashed and before an escape is recorded.
-      if (phase1 && opts.findingConfirmed?.(f.id) !== true) continue;
+    const status = findingStatus(f);
+    // A test can be made to "reproduce" by asserting the old text the change
+    // intentionally removed, so in every phase only a reproduction an operator
+    // confirmed pays, slashes or records an escape; a dismissed one is false.
+    if (status === "confirmed") {
       const { stage, escapeSnapshot } = findingStage(state, f.id);
       if (escapeSnapshot !== null && !escapes.has(f.id)) {
         actions.push({ kind: "escape", findingId: f.id, snapshotId: escapeSnapshot });
       }
-      bodies.push(...incentives.settleFinding(state, tree, f.id, stage));
-    } else {
+      bodies.push(...incentives.settleFinding(state, f.id, stage, nowIso));
+    } else if (status === "notReproduced" || status === "dismissed") {
       bodies.push(...incentives.settleFalseFinding(state, f.id));
     }
   }
@@ -450,17 +494,17 @@ export function planActions(state: CommonsState, tree: TreeView, nowIso: string,
   for (const s of state.submissions.values()) {
     if (s.planted) bodies.push(...incentives.settleMissedPlant(state, s.id));
     if (!s.merged) continue;
-    bodies.push(...incentives.settleMerge(state, s.id, 1));
+    bodies.push(...incentives.settleMerge(state, s.id, 1, nowIso));
     const snap = snapshotOf(state, s.id);
     const promo = snap === null ? null : promotionCovering(state, snap);
     if (promo) {
-      bodies.push(...incentives.settleMerge(state, s.id, 2));
-      if (Date.parse(promo.at) + tail <= now) bodies.push(...incentives.settleMerge(state, s.id, 3));
+      bodies.push(...incentives.settleMerge(state, s.id, 2, nowIso));
+      if (Date.parse(promo.at) + tail <= now) bodies.push(...incentives.settleMerge(state, s.id, 3, nowIso));
     }
   }
   for (const snap of state.snapshots.values()) {
     if (snap.promoted && Date.parse(snap.promoted.at) + tail <= now) {
-      bodies.push(...incentives.settleCleanReviews(state, snap.id));
+      bodies.push(...incentives.settleCleanReviews(state, snap.id, nowIso));
     }
   }
   bodies.push(...incentives.settleExpiredClaims(state, nowIso));
@@ -485,18 +529,26 @@ export function planActions(state: CommonsState, tree: TreeView, nowIso: string,
   }
 
   // 3. Findings without a result: void the undecidable ones, reproduce the
-  // rest (oldest first, a bounded number per pass).
+  // rest, a bounded number per pass: fewest recorded harness errors first,
+  // then oldest, so a test that always times out cannot hold every slot.
   const grace = (opts.findingGraceHours ?? 24) * HOUR;
+  const deadline = (opts.findingResultDeadlineHours ?? 72) * HOUR;
   const maxErrors = opts.maxHarnessErrors ?? 3;
   let budget = opts.maxReproductionsPerPass ?? 4;
-  const open = [...state.findings.values()].filter((f) => !f.result).sort((a, b) => a.seq - b.seq);
+  const open = [...state.findings.values()]
+    .filter((f) => !f.result)
+    .sort((a, b) => (a.harnessErrors ?? 0) - (b.harnessErrors ?? 0) || a.seq - b.seq);
   for (const f of open) {
-    if ((opts.harnessErrors?.(f.id) ?? 0) >= maxErrors) {
+    if ((f.harnessErrors ?? 0) >= maxErrors) {
       actions.push({ kind: "voidFinding", findingId: f.id, reason: "harness-error" });
       continue;
     }
     if (opts.findingTestAvailable?.(f.id) === false) {
       if (now >= Date.parse(f.at) + grace) actions.push({ kind: "voidFinding", findingId: f.id, reason: "no-test" });
+      continue;
+    }
+    if (now >= Date.parse(f.at) + deadline) {
+      actions.push({ kind: "voidFinding", findingId: f.id, reason: "deadline" });
       continue;
     }
     const commits = findingCommits(state, f.id, opts);
@@ -536,8 +588,8 @@ export function planActions(state: CommonsState, tree: TreeView, nowIso: string,
       continue;
     }
     const r = mergeReadiness(state, s.id, nowIso, opts);
+    if (r.closeWindow) actions.push({ kind: "closeReviewWindow", submissionId: s.id, missing: r.missing });
     if (!r.ready) continue;
-    if (r.missing.length > 0) actions.push({ kind: "revealPhaseClose", submissionId: s.id, missing: r.missing });
     actions.push({ kind: "merge", submissionId: s.id });
   }
 
@@ -573,15 +625,14 @@ export function planActions(state: CommonsState, tree: TreeView, nowIso: string,
   }
 
   // 8. Promote the newest unpromoted snapshot after the last promotion that
-  // passes the promotion rule and has no open or reproduced finding in its
-  // ancestry. Older candidates are covered by its ancestry.
+  // passes the promotion rule (promotion.ts, the one rule `commons promote`
+  // also applies). Older candidates are covered by its ancestry.
   const lastPromotedSnapshotSeq = Math.max(-1, ...[...state.snapshots.values()].filter((s) => s.promoted).map((s) => s.seq));
   const candidates = [...state.snapshots.values()]
     .filter((s) => !s.promoted && s.seq > lastPromotedSnapshotSeq)
     .sort((a, b) => b.seq - a.seq);
   for (const snap of candidates) {
-    if (ancestryProblems(state, snap.id).length > 0) continue;
-    if (promotion.evaluatePromotion(state, tree, snap.id, nowIso).pass) {
+    if (promotion.evaluatePromotion(state, snap.id, nowIso).pass) {
       actions.push({ kind: "promote", snapshotId: snap.id, commit: snap.commit });
       break;
     }
@@ -599,6 +650,9 @@ export type ReproductionOutcome = {
   passesOnParent: boolean;
   logDigest: string;
   harnessError?: string | null;
+  // The harness could not remove its temporary directory (findings.ts): the
+  // outcome stands, but the leftover is logged so the operator sees disk leak.
+  cleanupError?: string | null;
 };
 
 export type GithubBridge = {
@@ -609,17 +663,47 @@ export type GithubBridge = {
   merge(submission: SubmissionState, expectedHead: CommitSha): Promise<CommitSha>;
   // Fast-forwards main to the snapshot commit. Idempotent.
   fastForwardMain(commit: CommitSha): Promise<void>;
+  // Optional compensation. The store's lock serialises this process only:
+  // another process (a local `commons finding file`, `plant reveal`) can
+  // append an entry while the bridge acts, and the ledger then refuses the
+  // merge or promotion entry. tip() reads a ref before the effect; restore()
+  // moves it back from `after` to `before` (null: the ref did not exist)
+  // with compare-and-swap, leaving alone a ref someone moved since, and says
+  // whether it did. Without them a refused entry leaves the effect in place.
+  tip?(ref: "dev" | "main"): Promise<CommitSha | null>;
+  restore?(ref: "dev" | "main", before: CommitSha | null, after: CommitSha): Promise<boolean>;
 };
+
+// Runs `effectful` (which appends an entry whose body moved `ref`) and, when
+// the append throws after the ref moved, asks the bridge to move it back: the
+// ledger never claims a merge or promotion that did not happen, and the repo
+// must not keep one the ledger refused.
+async function compensated<T>(
+  bridge: GithubBridge,
+  effectful: (record: (ref: "dev" | "main", before: CommitSha | null | undefined, after: CommitSha) => void) => Promise<T>,
+): Promise<T> {
+  let moved: { ref: "dev" | "main"; before: CommitSha | null; after: CommitSha } | null = null;
+  try {
+    return await effectful((ref, before, after) => {
+      if (before !== undefined && before !== after) moved = { ref, before, after };
+    });
+  } catch (e) {
+    const m = moved as { ref: "dev" | "main"; before: CommitSha | null; after: CommitSha } | null;
+    if (m === null || bridge.restore === undefined) throw e;
+    const back = await bridge.restore(m.ref, m.before, m.after).catch(() => false);
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`${msg}; ${m.ref} ${back ? `restored to ${m.before ?? "(none)"}` : `could NOT be restored from ${m.after} to ${m.before ?? "(none)"}: fix it by hand`}`);
+  }
+}
 
 export type BodyFn = (state: CommonsState) => EntryBody | Promise<EntryBody>;
 
 // What the executor re-checks under the ledger lock right before an effect:
-// the merge rule (including a fresh human approval) and the promotion rule.
+// the merge rule (approvals and decisions are ledger entries, so the live
+// state carries them) and the promotion rule.
 export type Recheck = {
   clock: () => string;
   opts: PlanOptions;
-  // Re-asked under the lock; absent = opts.humanApproval.
-  humanApproval?: (submissionId: string) => boolean | Promise<boolean>;
 };
 
 export type ExecuteDeps = {
@@ -628,7 +712,6 @@ export type ExecuteDeps = {
   // the entry is appended to, under the store's lock, so nothing lands between
   // what it read and what it appends (LedgerStore.appendAsCoordinator).
   append(body: EntryBody | BodyFn): Promise<LedgerEntry> | LedgerEntry;
-  tree: TreeView;
   recheck: Recheck;
   // External entropy for the reviewer beacon (e.g. a public randomness round).
   // Recorded in the log line, so the beacon can be recomputed.
@@ -643,15 +726,13 @@ export type ExecuteDeps = {
   // in a sandbox outside the coordinator's uid (see the header).
   runGates(submission: SubmissionState, gates: string[] | null): Promise<GateReport[]>;
   // null = cannot run yet (the test file was not uploaded); retried next pass.
-  // A returned harnessError counts toward maxHarnessErrors; a thrown error
-  // (an operator problem, e.g. no sandbox) does not.
+  // A returned harnessError is recorded as a findingAttempt entry and counts
+  // toward maxHarnessErrors; a thrown error (an operator problem, e.g. no
+  // sandbox) does not, and findingResultDeadlineHours bounds what it blocks.
   reproduce(action: Extract<Action, { kind: "reproduceFinding" }>): Promise<ReproductionOutcome | null>;
-  // Harness errors per finding, kept by the caller across passes.
-  harnessErrors?: Map<string, number>;
   reproduceConcurrency?: number; // default 2
   bridge: GithubBridge;
   selection?: SelectionApi;
-  onRevealPhaseClose?: (submissionId: string, missing: KeyId[]) => void;
 };
 
 export type LogLine = { action: Action; ok: boolean; detail: string; seqs: number[] };
@@ -719,11 +800,17 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
     case "reproduceFinding": {
       const r = await deps.reproduce(action);
       if (r === null) return "skipped: not ready";
-      // A harness error proves nothing either way; it is not recorded, but it
-      // is counted, and after maxHarnessErrors the planner voids the finding.
+      const cleanup = r.cleanupError ? ` (cleanup failed: ${r.cleanupError})` : "";
+      // A harness error proves nothing either way. It is counted on the
+      // ledger (findingAttempt), so the count survives restarts and run-once
+      // processes, and after maxHarnessErrors the planner voids the finding.
       if (r.harnessError) {
-        deps.harnessErrors?.set(action.findingId, (deps.harnessErrors.get(action.findingId) ?? 0) + 1);
-        throw new Error(`harness error: ${r.harnessError}`);
+        const error = r.harnessError.slice(0, 4000);
+        await append((state) => {
+          if (state.findings.get(action.findingId)?.result) fail("finding already has a result");
+          return { kind: "findingAttempt", findingId: action.findingId, harnessError: error };
+        });
+        throw new Error(`harness error (recorded): ${r.harnessError}${cleanup}`);
       }
       await append((state) => {
         if (state.findings.get(action.findingId)?.result) fail("finding already has a result");
@@ -736,9 +823,11 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
           logDigest: r.logDigest,
         };
       });
-      return r.failsOnHead && r.passesOnParent ? "reproduced" : "not reproduced";
+      return `${r.failsOnHead && r.passesOnParent ? "reproduced" : "not reproduced"}${cleanup}`;
     }
     case "voidFinding": {
+      // A harness that keeps failing is not the finder's fault: that void
+      // carries harnessError, so nobody is slashed. A test never uploaded is.
       await append((state) => {
         if (state.findings.get(action.findingId)?.result) fail("finding already has a result");
         return {
@@ -748,6 +837,11 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
           failsOnHead: false,
           passesOnParent: false,
           logDigest: `void:${action.reason}`,
+          ...(action.reason === "harness-error"
+            ? { harnessError: `voided after ${state.findings.get(action.findingId)?.harnessErrors ?? 0} harness errors` }
+            : action.reason === "deadline"
+              ? { harnessError: "voided: no result before the finding's result deadline" }
+              : {}),
         };
       });
       return `voided (${action.reason})`;
@@ -760,7 +854,7 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
       await append((state) => {
         if (state.submissions.get(s.id)?.gates.some((g) => g.gate === BINDING_GATE)) fail("already bound");
         return "error" in b
-          ? { kind: "gateResult", submissionId: s.id, gate: BINDING_GATE, pass: false, details: b.error }
+          ? { kind: "gateResult", submissionId: s.id, gate: BINDING_GATE, pass: false, details: gateDetails(b.error) }
           : { kind: "gateResult", submissionId: s.id, gate: BINDING_GATE, pass: true, details: bindingDetails(b) };
       });
       return "error" in b ? `patch does not bind: ${b.error}` : `bound to ${b.head} (patch ${b.patchSha256})`;
@@ -776,7 +870,7 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
       for (const r of reports) {
         if (r.gate === BINDING_GATE || recorded.has(r.gate) || (wanted && !wanted.has(r.gate))) continue;
         recorded.add(r.gate);
-        await append({ kind: "gateResult", submissionId: s.id, gate: r.gate, pass: r.pass, details: r.details });
+        await append({ kind: "gateResult", submissionId: s.id, gate: r.gate, pass: r.pass, details: gateDetails(r.details) });
         n++;
       }
       if (n === 0) fail("gate runner returned no new results");
@@ -784,41 +878,54 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
     }
     case "assignReviewers": {
       const selection = deps.selection ?? load<SelectionApi>("selection");
+      // The entropy must be the randomness round the rule names (see
+      // selection.ts); the entry records it and the member tree's digest, and
+      // the ledger checks both.
       const entropy = await deps.entropy(action.submissionId);
-      // The beacon covers the ledger head at assignment time, so it is computed
-      // inside the append, against the state the entry is appended to: no other
-      // entry can land in between and make verifyAssignment disagree. The
-      // reviewAssignment entry has no field for the entropy, so it is in the log.
+      // The draw reads the agent pool and the member tree, so it runs inside
+      // the append, against the state the entry is appended to: no other
+      // entry can land in between.
       let note = "";
       await append((state) => {
-        const beacon = selection.computeBeacon(state, action.submissionId, entropy);
-        const picked = selection.selectReviewers(state, deps.tree, action.submissionId, beacon);
+        const picked = selection.drawAssignment(state, action.submissionId, entropy);
         if (picked.reviewers.length === 0) fail(`no eligible reviewers (${picked.notes.join("; ")})`);
-        note = `entropy ${JSON.stringify(entropy)}; beacon ${beacon}; ${picked.reviewers.length} of ${picked.candidates} candidates${picked.notes.length ? `; ${picked.notes.join("; ")}` : ""}`;
-        return { kind: "reviewAssignment", submissionId: action.submissionId, beacon, reviewers: picked.reviewers };
+        note = `entropy ${JSON.stringify(entropy)}; beacon ${picked.body.beacon}; ${picked.reviewers.length} of ${picked.candidates} candidates${picked.notes.length ? `; ${picked.notes.join("; ")}` : ""}`;
+        return picked.body;
       });
       return note;
     }
-    case "revealPhaseClose": {
-      deps.onRevealPhaseClose?.(action.submissionId, action.missing);
-      return `missing reviewers: ${action.missing.join(", ")}`;
+    case "closeReviewWindow": {
+      await append((state) => {
+        if (state.submissions.get(action.submissionId)?.windowClosed) fail("review window already closed");
+        return { kind: "reviewWindowClosed", submissionId: action.submissionId, missing: action.missing };
+      });
+      return `review window closed; missing reviewers: ${action.missing.join(", ")}`;
     }
     case "merge": {
-      // The whole merge rule, re-checked under the store lock with a fresh
-      // human approval: a finding posted, or an approval withdrawn, while this
-      // pass ran must stop the merge. The bridge merges the bound head only.
+      // The whole merge rule, re-checked under the store lock against live
+      // state: a finding posted while this pass ran must stop the merge. The
+      // bridge merges the bound head only.
       let detail = "";
-      await append(async (state) => {
-        const s = state.submissions.get(action.submissionId) ?? fail(`no submission ${action.submissionId}`);
-        const ask = deps.recheck.humanApproval ?? deps.recheck.opts.humanApproval;
-        const approved = ask === undefined ? false : await ask(s.id);
-        const r = mergeReadiness(state, s.id, deps.recheck.clock(), { ...deps.recheck.opts, humanApproval: () => approved });
-        if (!r.ready) fail(`not mergeable: ${r.waiting.join("; ")}`);
-        const head = codeHead(s, deps.recheck.opts) ?? fail("patch not bound");
-        const commit = await deps.bridge.merge({ ...s, headCommit: head }, head);
-        detail = `merged ${head} at ${commit}`;
-        return { kind: "merge", submissionId: s.id, commit };
-      });
+      await compensated(deps.bridge, (record) =>
+        append(async (state) => {
+          const s = state.submissions.get(action.submissionId) ?? fail(`no submission ${action.submissionId}`);
+          const r = mergeReadiness(state, s.id, deps.recheck.clock(), deps.recheck.opts);
+          if (!r.ready) fail(`not mergeable: ${r.waiting.join("; ")}`);
+          const head = codeHead(s, deps.recheck.opts) ?? fail("patch not bound");
+          const before = await deps.bridge.tip?.("dev");
+          let commit: string;
+          try {
+            commit = await deps.bridge.merge({ ...s, headCommit: head }, head);
+          } catch (e) {
+            if (!(e instanceof MergeConflictError)) throw e;
+            detail = `does not merge: ${e.message} (recorded; the author resubmits on the new dev)`;
+            return { kind: "gateResult", submissionId: s.id, gate: MERGE_GATE, pass: false, details: gateDetails(e.message) };
+          }
+          record("dev", before, commit);
+          detail = `merged ${head} at ${commit}`;
+          return { kind: "merge", submissionId: s.id, commit };
+        }),
+      );
       return detail;
     }
     case "snapshot": {
@@ -837,21 +944,24 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
       if (deps.state().snapshots.get(action.snapshotId)?.promoted) return "already promoted";
       const promotion = deps.recheck.opts.promotion ?? load<PromotionApi>("promotion");
       // Re-checked against live state under the lock, then main moves, then
-      // the entry: nothing can land between the check and the fast-forward.
-      await append(async (state) => {
-        const snap = state.snapshots.get(action.snapshotId) ?? fail(`no snapshot ${action.snapshotId}`);
-        if (snap.promoted) fail("already promoted");
-        if (snap.commit !== action.commit) fail("snapshot commit differs from the planned one");
-        const problems = ancestryProblems(state, snap.id);
-        if (problems.length > 0) fail(`not promotable: ${problems.join("; ")}`);
-        const verdict = promotion.evaluatePromotion(state, deps.tree, snap.id, deps.recheck.clock());
-        if (!verdict.pass) {
-          const failed = verdict.checks.filter((c) => !c.pass).map((c) => c.name);
-          fail(`promotion rule fails: ${failed.join(", ")}`);
-        }
-        await deps.bridge.fastForwardMain(action.commit);
-        return { kind: "promotion", snapshotId: snap.id, commit: action.commit };
-      });
+      // the entry. Nothing from this process lands in between; an entry from
+      // another process can, and then main is moved back (compensated).
+      await compensated(deps.bridge, (record) =>
+        append(async (state) => {
+          const snap = state.snapshots.get(action.snapshotId) ?? fail(`no snapshot ${action.snapshotId}`);
+          if (snap.promoted) fail("already promoted");
+          if (snap.commit !== action.commit) fail("snapshot commit differs from the planned one");
+          const verdict = promotion.evaluatePromotion(state, snap.id, deps.recheck.clock());
+          if (!verdict.pass) {
+            const failed = verdict.checks.filter((c) => !c.pass).map((c) => c.name);
+            fail(`promotion rule fails: ${failed.join(", ")}`);
+          }
+          const before = await deps.bridge.tip?.("main");
+          await deps.bridge.fastForwardMain(action.commit);
+          record("main", before, (await deps.bridge.tip?.("main")) ?? action.commit);
+          return { kind: "promotion", snapshotId: snap.id, commit: action.commit };
+        }),
+      );
       return `main at ${action.commit}`;
     }
   }
@@ -868,13 +978,7 @@ function fail(message: string): never {
 export type RunDeps = Omit<ExecuteDeps, "recheck"> & {
   clock: () => string;
   entries?: () => readonly LedgerEntry[];
-  plan: Omit<PlanOptions, "humanApproval" | "entries" | "findingConfirmed" | "harnessErrors" | "approvedTasks" | "honeytokenHits">;
-  // May be async (e.g. a GitHub review lookup); resolved before planning for
-  // every unmerged submission that has reviewers, so the planner stays pure,
-  // and asked again under the lock right before each merge.
-  humanApproval?: (submissionId: string) => boolean | Promise<boolean>;
-  // Phase 1: a human confirmed this reproduced finding (see PlanOptions).
-  findingConfirmed?: (findingId: string) => boolean | Promise<boolean>;
+  plan: Omit<PlanOptions, "entries" | "approvedTasks" | "honeytokenHits">;
   // The server's patchesDir: defaults patchAvailable and findingTestAvailable
   // from the uploads on disk unless plan sets them.
   patchesDir?: string;
@@ -884,20 +988,7 @@ export type RunDeps = Omit<ExecuteDeps, "recheck"> & {
 
 export async function runOnce(deps: RunDeps): Promise<{ actions: Action[]; log: LogLine[] }> {
   const state = deps.state();
-  const approved = new Set<string>();
-  if (deps.humanApproval) {
-    for (const s of state.submissions.values()) {
-      if (!s.merged && s.assignment && (await deps.humanApproval(s.id))) approved.add(s.id);
-    }
-  }
-  const confirmed = new Set<string>();
-  if (deps.findingConfirmed) {
-    for (const f of state.findings.values()) {
-      if (f.result?.reproduced && (await deps.findingConfirmed(f.id))) confirmed.add(f.id);
-    }
-  }
   const dir = deps.patchesDir;
-  const harness = deps.harnessErrors;
   const opts: PlanOptions = {
     ...(dir === undefined
       ? {}
@@ -907,14 +998,11 @@ export async function runOnce(deps: RunDeps): Promise<{ actions: Action[]; log: 
         }),
     ...deps.plan,
     entries: deps.entries?.(),
-    humanApproval: (sid) => approved.has(sid),
-    findingConfirmed: (fid) => confirmed.has(fid),
-    ...(harness === undefined ? {} : { harnessErrors: (fid: string) => harness.get(fid) ?? 0 }),
     approvedTasks: deps.approvedTasks ? await deps.approvedTasks() : undefined,
     honeytokenHits: deps.honeytokenHits ? await deps.honeytokenHits() : undefined,
   };
-  const actions = planActions(state, deps.tree, deps.clock(), opts);
-  const recheck: Recheck = { clock: deps.clock, opts, ...(deps.humanApproval ? { humanApproval: deps.humanApproval } : {}) };
+  const actions = planActions(state, deps.clock(), opts);
+  const recheck: Recheck = { clock: deps.clock, opts };
   return { actions, log: await executeActions(actions, { ...deps, recheck }) };
 }
 
@@ -925,8 +1013,9 @@ export async function runOnce(deps: RunDeps): Promise<{ actions: Action[]; log: 
 //
 // It refuses to run without `sandbox`: the command, the test and the head's
 // code are chosen by strangers. The sandbox argv must put them outside the
-// coordinator's uid (a container or a dedicated user, no network, a copy of
-// the repository); findings.ts's PID_NAMESPACE_SANDBOX alone still runs as the
+// coordinator's uid and outside each other's runs (a fresh container per run,
+// no network, a copy of the repository: a dedicated user shared by every run
+// lets one test tamper with another's checkout); findings.ts's PID_NAMESPACE_SANDBOX alone still runs as the
 // coordinator's uid and can read its files. The refusal is thrown, not
 // returned as a harness error, so a misconfigured coordinator never voids
 // findings.

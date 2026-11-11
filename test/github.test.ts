@@ -407,7 +407,7 @@ test("applyUnifiedDiff rejects unsafe paths and binary diffs", () => {
 });
 
 test("checkRepoPath accepts ordinary paths and refuses traversal", () => {
-  checkRepoPath("anthill-backend/src/engine.ts");
+  checkRepoPath("server/src/engine.ts");
   checkRepoPath("docs/my file.md");
   checkRepoPath(".github/workflows/ci.yml");
   for (const bad of ["", "/abs", "a/../b", "..", "./a", "a//b", "a/", ".git/config", "x/.GIT/hooks", "a\\b", "a\u0000b"]) {

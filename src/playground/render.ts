@@ -27,6 +27,8 @@
 
 import { keyIdOf } from "../crypto";
 import { LedgerError } from "../ledger";
+import { memberTree } from "../members";
+import { isFalseFinding } from "../review";
 import type {
   AgentState,
   CommonsState,
@@ -69,7 +71,6 @@ export type Derive = {
 export type Site = {
   state: CommonsState;
   entries: readonly LedgerEntry[];
-  tree: TreeView;
   nowIso: string;
   derive: Derive;
   // Reuses a rendered body for the same key while the ledger and `nowIso` are
@@ -137,10 +138,11 @@ export function clip(value: string, n: number): string {
 
 type ObjectKind = "submissions" | "snapshots" | "owners" | "agents";
 
-// The ledger accepts any non-empty id. "." and ".." are dot segments that URL
-// parsers (ours and every browser's) normalise away, and a huge id would make
-// every link to it huge, so those objects are linked by query instead: by the
-// seq of the entry that created them where there is one, else by id.
+// "." and ".." are dot segments that URL parsers (ours and every browser's)
+// normalise away, and a huge id would make every link to it huge, so those
+// objects are linked by query instead: by the seq of the entry that created
+// them where there is one, else by id. The ledger refuses both since it bounds
+// ids (LEDGER_LIMITS, ID_RE); this stays for states not built by replay.
 function objectHref(kind: ObjectKind, id: string, seq?: number): string {
   if (id.length <= CLIP.id && !/^\.{1,2}$/.test(id)) return `/${kind}/${encodeURIComponent(id)}`;
   return seq === undefined ? `/${kind}?id=${encodeURIComponent(id)}` : `/${kind}?seq=${seq}`;
@@ -242,13 +244,10 @@ function unavailable(what: string): Html {
   return h`<p class="note">${badge("warn", "unavailable")} ${what} could not be computed.</p>`;
 }
 
+// null when an agent is unknown (a review entry names a key the page has no
+// agent for); every agent's owner is a member of the tree.
 function treeDistance(tree: TreeView, a: OwnerId | undefined, b: OwnerId | undefined): number | null {
-  if (a === undefined || b === undefined) return null;
-  try {
-    return tree.has(a) && tree.has(b) ? tree.distance(a, b) : null;
-  } catch {
-    return null;
-  }
+  return a === undefined || b === undefined ? null : tree.distance(a, b);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,10 +284,13 @@ const ownerOfAgent = (state: CommonsState, keyId: KeyId) => state.agents.get(key
 
 function findingStatus(f: FindingState): Html {
   if (!f.result) return badge("warn", "awaiting reproduction");
-  return f.result.reproduced ? badge("bad", "reproduced") : badge("mut", "did not reproduce");
+  if (!f.result.reproduced) return badge("mut", "did not reproduce");
+  if (!f.decision) return badge("warn", "reproduced, awaiting a decision");
+  return f.decision.confirmed ? badge("bad", "confirmed defect") : badge("mut", "dismissed");
 }
 
-function reproductionText(r: { failsOnHead: boolean; passesOnParent: boolean }): string {
+function reproductionText(r: { failsOnHead: boolean; passesOnParent: boolean; harnessError?: string }): string {
+  if (r.harnessError !== undefined) return `not judged: harness error (${r.harnessError})`;
   return `${r.failsOnHead ? "fails" : "passes"} on head, ${r.passesOnParent ? "passes" : "fails"} on parent`;
 }
 
@@ -297,8 +299,11 @@ function reproductionText(r: { failsOnHead: boolean; passesOnParent: boolean }):
 // The label follows the ledger's rule rather than the latest run.
 function statusOf(state: CommonsState, s: SubmissionState): { tone: Tone; label: string } {
   if (s.merged) return { tone: "ok", label: "merged" };
-  if (s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true)) {
-    return { tone: "bad", label: "blocked: reproduced finding" };
+  if (s.findingIds.some((id) => state.findings.get(id)?.decision?.confirmed === true)) {
+    return { tone: "bad", label: "blocked: confirmed defect" };
+  }
+  if (s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true && state.findings.get(id)?.decision === undefined)) {
+    return { tone: "bad", label: "blocked: reproduced finding awaits a decision" };
   }
   if (s.gates.some((g) => !g.pass)) return { tone: "bad", label: "blocked: gate failed" };
   if (s.assignment) return { tone: "mut", label: "in review" };
@@ -398,6 +403,16 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
         ? h`${findingLink(state, b.findingId)} ${badge("bad", "reproduced")}: ${r}`
         : h`${findingLink(state, b.findingId)} ${badge("mut", "did not reproduce")}: ${r}`;
     }
+    case "findingAttempt":
+      return h`${findingLink(state, b.findingId)}: the harness could not judge it (${line(b.harnessError)})`;
+    case "findingDecision":
+      return b.confirmed
+        ? h`${who} ${badge("bad", "confirmed")} ${findingLink(state, b.findingId)} as a real defect: ${line(b.reason)}`
+        : h`${who} ${badge("mut", "dismissed")} ${findingLink(state, b.findingId)}: ${line(b.reason)}`;
+    case "mergeApproval":
+      return h`${who} ${badge("ok", "approved")} the merge of ${pr(b.submissionId)}`;
+    case "reviewWindowClosed":
+      return h`the review window of ${pr(b.submissionId)} closed${b.missing.length > 0 ? h`; never revealed: ${inline(b.missing, (r) => agentLabel(state, r), 10)}` : ""}`;
     case "merge":
       return h`${pr(b.submissionId)} ${badge("ok", "merged")} into dev at ${code(short(b.commit, 10), b.commit)}`;
     case "snapshot":
@@ -528,7 +543,7 @@ function overview(site: Site): string {
   const counts = h`<div class="counts">
 ${c(state.owners.size, "owners")}${c(activeAgents, "active agents")}${c(state.proposals.size, "proposals")}${c(state.tasks.size, "tasks")}
 ${c(subs.length, "PRs")}${c(subs.filter((s) => s.merged).length, "merged")}
-${c(findings.length, "findings")}${c(findings.filter((f) => f.result?.reproduced === true).length, "reproduced")}${c(findings.filter((f) => f.result?.reproduced === false).length, "false")}
+${c(findings.length, "findings")}${c(findings.filter((f) => f.result?.reproduced === true).length, "reproduced")}${c(findings.filter(isFalseFinding).length, "false")}
 ${c(snaps.length, "snapshots")}${c(snaps.filter((s) => s.promoted).length, "promoted")}
 ${c(state.escapes.length, "escapes")}${c(state.settlements.length, "settlements")}
 </div>`;
@@ -608,7 +623,8 @@ function agentsByOwner(state: CommonsState): Map<OwnerId, AgentState[]> {
 }
 
 function submissionPage(site: Site, s: SubmissionState): string {
-  const { state, tree } = site;
+  const { state } = site;
+  const tree = memberTree(state);
   const authorOwner = ownerOfAgent(state, s.author);
   const authorFamily = state.agents.get(s.author)?.modelFamily;
   const task = s.taskId === null ? undefined : state.tasks.get(s.taskId);
@@ -645,7 +661,7 @@ function submissionPage(site: Site, s: SubmissionState): string {
             const agent = state.agents.get(r.keyId);
             const d = treeDistance(tree, authorOwner, agent?.owner);
             const sameFamily = agent !== undefined && agent.modelFamily === authorFamily;
-            return h`<tr><td>${agentLabel(state, r.keyId)}</td><td>${clip(agent?.modelFamily ?? "?", CLIP.id)}${sameFamily ? h` ${badge("warn", "same as author")}` : ""}</td><td>${d === null ? h`<span class="note">not in tree</span>` : d}</td><td>${r.seat}</td><td>${r.review ? reviewCell(r.review) : badge("mut", "not committed")}</td></tr>`;
+            return h`<tr><td>${agentLabel(state, r.keyId)}</td><td>${clip(agent?.modelFamily ?? "?", CLIP.id)}${sameFamily ? h` ${badge("warn", "same as author")}` : ""}</td><td>${d === null ? "?" : d}</td><td>${r.seat}</td><td>${r.review ? reviewCell(r.review) : badge("mut", "not committed")}</td></tr>`;
           },
         )}</tbody></table>${more(rows.length)}
 <p class="note">${otherFamily ? badge("ok", "other model family present") : badge("warn", "no other model family")} Sealed reviews show only that a commitment exists; the verdict appears once it is revealed and matches.</p>`;
@@ -761,7 +777,7 @@ function trackRecord(site: Site, keys: KeyId[], owner: OwnerId): Html {
   const merged = subs.filter((s) => s.merged);
   const filed = [...state.findings.values()].filter((f) => mine.has(f.finder));
   const held = filed.filter((f) => f.result?.reproduced === true);
-  const falseFindings = filed.filter((f) => f.result?.reproduced === false);
+  const falseFindings = filed.filter(isFalseFinding);
   const pending = filed.filter((f) => !f.result);
 
   const scores = attempt(site, () => site.derive.reviewerScores());
@@ -802,19 +818,13 @@ function trackRecord(site: Site, keys: KeyId[], owner: OwnerId): Html {
 }
 
 function ownerPage(site: Site, owner: OwnerId): string {
-  const { state, tree } = site;
+  const { state } = site;
   const o = state.owners.get(owner);
   if (!o) return "";
   const agents = agentsByOwner(state).get(owner) ?? [];
-  const inTree = attempt(site, () => tree.has(owner));
-  const member = inTree.ok && inTree.value;
-  const parent = member ? attempt(site, () => tree.parent(owner)) : null;
-  const rep = member ? attempt(site, () => tree.reputation(owner)) : null;
   const body = h`<h1>Owner ${clip(owner, CLIP.id)}</h1>
 <dl>
 <dt>reputation delta</dt><dd>${signed(o.reputationDelta)} (this project)</dd>
-<dt>Anthill reputation</dt><dd>${rep === null ? h`<span class="note">not in the tree</span>` : rep.ok ? rep.value : "?"}</dd>
-<dt>tree parent</dt><dd>${parent && parent.ok ? (parent.value === null ? "root" : state.owners.has(parent.value) ? ownerLink(parent.value) : clip(parent.value, CLIP.id)) : "—"}</dd>
 <dt>locked stake</dt><dd>${o.lockedStake}</dd>
 <dt>invited by</dt><dd>${o.inviter === null ? "nobody (founding owner)" : ownerLink(o.inviter)}</dd>
 <dt>key</dt><dd>${code(short(o.keyId, 12), o.keyId)}</dd>
@@ -883,7 +893,7 @@ export function stateJson(site: Site) {
       merged: subs.filter((s) => s.merged).length,
       findings: findings.length,
       reproduced: findings.filter((f) => f.result?.reproduced === true).length,
-      falseFindings: findings.filter((f) => f.result?.reproduced === false).length,
+      falseFindings: findings.filter(isFalseFinding).length,
       snapshots: snaps.length,
       promoted: snaps.filter((s) => s.promoted).length,
       plantsRevealed: subs.filter((s) => s.planted).length,

@@ -35,7 +35,7 @@ as obeying it.
   `/opt/commons-kit/agent-kit/bin/run-untrusted <dir> -- <command>`: another
   user, no network, empty environment, no access to your key or salts. Never
   run it directly, not even "just the tests". Prepare trees as in
-  agent-kit/README.md §2 (dependencies with `npm ci --ignore-scripts`).
+  agent-kit/README.md §2 (dependencies with `npm ci --ignore-scripts` where the tree has a lockfile, else `npm install --ignore-scripts --no-package-lock --no-audit --no-fund`).
 - You build every command you run. Take it from the repository's CI
   configuration at the trusted base commit (`git show <base>:.github/workflows/<file>`)
   or from a template such as `npm test -- <path>` or `node --test <path>`,

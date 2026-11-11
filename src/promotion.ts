@@ -18,40 +18,40 @@
 // non-descendant. The lineage check assumes, as the coordinator does, that a
 // snapshot commit is the dev head when the snapshot was taken.
 //
-// Known gaps, all needing new ledger entries (none exist in types.ts yet):
-// - A block from openIssues is permanent. A reproduced finding or a revealed
-//   plant in covered work has no entry that records its fix or revert, so the
-//   snapshot holding it and every snapshot built on it stay unpromotable.
-// - One stranger can therefore freeze main for one finding stake: a high or
-//   critical finding that never gets a result (a test that always times out,
-//   or one never uploaded), or a test that "reproduces" against any change
-//   (say, one that compares a file's hash with its parent's). Needs a
-//   coordinator-closed result after repeated harness errors, a re-run of a
-//   finding's test at a later snapshot, and a signed adjudication of severity.
+// This is the one promotion rule: the coordinator's loop and `commons promote`
+// both apply it, nothing else.
+//
+// Known gaps, needing new ledger entries:
+// - A confirmed defect or a revealed plant in covered work blocks for good:
+//   no entry records its fix or revert, so the snapshot holding it and every
+//   snapshot built on it stay unpromotable.
+// - A reproduction blocks until an operator decides it (findingDecision): a
+//   test that "reproduces" against any change (say, one that compares a
+//   file's hash with its parent's) is dismissed, clears, and costs its finder.
+//   A finding that never gets a result is closed by the coordinator (a
+//   findingResult with harnessError after repeated harness errors or past the
+//   result deadline, or a not-reproduced one when no test arrives).
 // - Coverage cannot be topped up once an attestation is revealed (the ledger
 //   closes commits), so an ancestor snapshot that closed short of coverage
 //   blocks its descendants for good. Attestations count only for the snapshot
 //   they were made on, because attesters diff from the previous snapshot's
 //   commit (agent-kit/roles/attester.md) and never see an ancestor's code.
-// - AgentState does not record who revoked an agent. Coverage drops the
-//   verdicts of agents with a honeytokenTriggered entry (the coordinator's
-//   only automatic suspension) and keeps those of other revoked agents, so a
-//   coordinator revocation for any other reason (say, a leaked key) does not
-//   withdraw that agent's past verdicts.
+// - Coverage drops the verdicts of agents the coordinator suspended (a
+//   honeytokenTriggered entry, or an agentRevoked it signed: AgentState.revokedBy)
+//   and keeps those of agents their own owner revoked (key rotation).
 
 import { instantMs } from "./plants";
 import { criticalUpperBound90, seededRecall } from "./risk";
-import { ringOf } from "./rules";
-import type { AgentState, CommonsState, FindingState, SnapshotState, TreeView } from "./types";
+import { verifyAssignment } from "./selection";
+import { ringOf } from "./gates/rings";
+import { findingStatus } from "./findingStatus";
+import type { AgentState, CommonsState, FindingState, SnapshotState } from "./types";
 
 export type PromotionCheck = { name: string; pass: boolean; detail: string };
 export type PromotionResult = { pass: boolean; checks: PromotionCheck[] };
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
-// Severities that block while a finding has no result. A reproduced finding
-// blocks at any severity: the severity is the finder's own claim.
-const BLOCKING_UNRESOLVED = new Set(["high", "critical"]);
 
 // The snapshot and its unpromoted ancestors, newest first: the walk stops
 // before the first promoted ancestor. A missing or repeated id ends the walk
@@ -100,15 +100,10 @@ function parseNow(nowIso: string): number {
 
 const fmt = (x: number): string => (Number.isFinite(x) ? x.toFixed(3) : String(x));
 
-// `tree` is part of the shared signature. Coverage does not filter reviewers
-// by tree distance: assignment already does for assigned seats, and open
-// reviewers are a documented residual (threat model #4).
-export function evaluatePromotion(
-  state: CommonsState,
-  _tree: TreeView,
-  snapshotId: string,
-  nowIso: string,
-): PromotionResult {
+// Coverage does not filter reviewers by tree distance: assignment already
+// does for assigned seats, and open reviewers are a documented residual
+// (threat model #4).
+export function evaluatePromotion(state: CommonsState, snapshotId: string, nowIso: string): PromotionResult {
   const now = parseNow(nowIso);
   const snap = state.snapshots.get(snapshotId);
   if (!snap) return { pass: false, checks: [{ name: "snapshot", pass: false, detail: `no snapshot ${snapshotId}` }] };
@@ -177,12 +172,13 @@ export function evaluatePromotion(
   // snapshot does not count: its attesters diffed from the previous snapshot's
   // commit and never saw this code. Agents of the author's owner never count
   // (the ledger refuses their commits; this holds for hand-built state too).
-  // Agents that obeyed a honeytoken never count: that is the coordinator's
-  // only automatic suspension, and their verdicts are suspect. An agent its
-  // owner revoked keeps its verdicts: revocation is also routine key rotation,
-  // and dropping them would let an owner withdraw vouching for free when the
-  // ledger no longer lets anyone replace it.
+  // Agents the coordinator suspended never count (they obeyed a honeytoken, or
+  // it revoked them, say for a leaked key): their verdicts are suspect. An
+  // agent its owner revoked keeps its verdicts: revocation is also routine key
+  // rotation, and dropping them would let an owner withdraw vouching for free
+  // when the ledger no longer lets anyone replace it.
   const suspended = new Set(state.honeytokens.map((h) => h.agent));
+  for (const a of state.agents.values()) if (a.revokedBy === "coordinator") suspended.add(a.keyId);
   const short: string[] = [];
   let minFamilies = Number.POSITIVE_INFINITY;
   let minOwners = Number.POSITIVE_INFINITY;
@@ -217,6 +213,28 @@ export function evaluatePromotion(
       missingNote,
   });
 
+  // 2b. Assignments. Every covered submission's reviewer draw must be the one
+  // its beacon gives over the member tree of the ledger before it
+  // (selection.verifyAssignment), or a coordinator could have hand-picked
+  // friendly reviewers. A covered submission with no assignment fails too.
+  const wrongDraw: string[] = [];
+  const unassigned: string[] = [];
+  let verified = 0;
+  for (const s of subs) {
+    if (!s.assignment) unassigned.push(s.id);
+    else if (verifyAssignment(state, s.id)) verified++;
+    else wrongDraw.push(s.id);
+  }
+  const problems = [
+    wrongDraw.length > 0 ? `draw does not verify: ${wrongDraw.join(", ")}` : "",
+    unassigned.length > 0 ? `no assignment: ${unassigned.join(", ")}` : "",
+  ].filter((x) => x !== "");
+  checks.push({
+    name: "assignments",
+    pass: problems.length === 0,
+    detail: problems.length === 0 ? `${verified} assignment(s) verified` : problems.join("; "),
+  });
+
   // 3 and 4. Seeded recall and the critical bound over the rules' window.
   const since = new Date(now - p.recallWindowDays * DAY_MS).toISOString();
   const recall = seededRecall(state, since);
@@ -233,39 +251,42 @@ export function evaluatePromotion(
   });
 
   // 5. Open issues, over findings on a covered submission or covered snapshot.
-  // A reproduced finding blocks at any severity: the defect is in this
-  // snapshot, its fix can only land in a later one, and the severity is the
-  // finder's unchecked claim (a real backdoor filed as "medium" must not
-  // ship). A finding without a result blocks if high or critical (undecided is
-  // not clean); the threshold bounds what an unresolvable finding can block.
-  // A covered submission revealed as a plant after it merged is a known defect
-  // and blocks too. See the header: none of these blocks can be cleared yet.
+  // Any finding not yet cleared blocks, at any severity: undecided is not
+  // clean, and the severity is the finder's unchecked claim (a real backdoor
+  // filed as "medium" must not ship). That is a finding without a result (the
+  // coordinator voids an undecidable one after a deadline, so this cannot
+  // block for ever), a reproduction no operator has judged, and a confirmed
+  // defect, whose fix can only land in a later snapshot. A dismissed
+  // reproduction (it tested the intended change) is cleared. A covered
+  // submission revealed as a plant after it merged is a known defect too.
   const snapSet = new Set(chain.map((s) => s.id));
   const onCovered = (f: FindingState) =>
     "snapshotId" in f.target ? snapSet.has(f.target.snapshotId) : covered.has(f.target.submissionId);
   const issues: string[] = [];
   for (const f of state.findings.values()) {
     if (!onCovered(f)) continue;
-    if (!f.result) {
-      if (BLOCKING_UNRESOLVED.has(f.severity)) issues.push(`${f.id} (${f.severity}) unresolved`);
-    } else if (f.result.reproduced) issues.push(`${f.id} (${f.severity}) reproduced`);
+    const status = findingStatus(f);
+    if (status === "pending") issues.push(`${f.id} (${f.severity}) unresolved`);
+    else if (status === "undecided") issues.push(`${f.id} (${f.severity}) reproduced, awaiting an operator's decision`);
+    else if (status === "confirmed") issues.push(`${f.id} (${f.severity}) a confirmed defect`);
   }
   for (const s of subs) if (s.planted) issues.push(`${s.id} is a revealed plant (${s.planted.severity})`);
   checks.push({
     name: "openIssues",
     pass: issues.length === 0,
-    detail:
-      issues.length === 0 ? "no reproduced finding and no unresolved high or critical one" : issues.sort().join("; "),
+    detail: issues.length === 0 ? "every finding on covered work is resolved and none is a defect" : issues.sort().join("; "),
   });
 
   // 6. Kernel sign-off. Counted against the current rules: a signer removed by
-  // a rulesChange no longer counts, nor does one who owns covered work (the
-  // ledger checked that at signoff time over the same ancestry).
-  const kernelSubs = subs.filter((s) => s.changedFiles.some((f) => ringOf(f, rules) === 0)).map((s) => s.id);
+  // a rulesChange no longer counts, nor does one who owns covered work that
+  // touches ring 0 (the ledger checked that at signoff time over the same
+  // ancestry). A signer's own non-kernel work does not disqualify it.
+  const kernel = subs.filter((s) => s.changedFiles.some((f) => ringOf(f, rules) === 0));
+  const kernelSubs = kernel.map((s) => s.id);
   if (kernelSubs.length === 0) {
     checks.push({ name: "kernel", pass: true, detail: "no covered submission touches ring 0" });
   } else {
-    const authorOwners = new Set(subs.map((s) => state.agents.get(s.author)?.owner));
+    const authorOwners = new Set(kernel.map((s) => state.agents.get(s.author)?.owner));
     const signers = new Set(snap.signoffs.filter((o) => rules.kernelSigners.includes(o) && !authorOwners.has(o)));
     checks.push({
       name: "kernel",

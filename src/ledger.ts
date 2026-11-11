@@ -21,7 +21,12 @@
 
 import * as fs from "node:fs";
 import { canonical, isValidPublicKey, keyIdOf, sha256hex, sign, verify } from "./crypto";
-import { claimStake, ringOf, validateRules } from "./rules";
+import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
+import { ringOf } from "./gates/rings";
+import { MEMBER_ROOT, memberDigest } from "./members";
+import { commitDeadlineMs, plantCommitment } from "./plants";
+import { assignmentBeacon, type CommitSubject, commitmentFor, validateVerdict } from "./review";
+import { claimStake, validateRules } from "./rules";
 import type {
   CommonsState,
   EntryBody,
@@ -98,10 +103,18 @@ export type LedgerErrorCode =
   | "not-reproduced"
   | "not-promoted"
   | "duplicate-escape"
+  | "duplicate-settlement"
+  | "commit-phase"
+  | "not-assigned"
+  | "decided"
+  | "not-decidable"
+  | "approved"
+  | "window-closed"
   // file
   | "exists"
   | "torn"
-  | "stale";
+  | "stale"
+  | "locked";
 
 export class LedgerError extends Error {
   readonly code: LedgerErrorCode;
@@ -125,13 +138,60 @@ export type LedgerState = CommonsState & { headAt: string };
 
 const EPOCH = "1970-01-01T00:00:00.000Z";
 
-// Longest a single claim entry may run. A cap is what stops one agent from
-// locking a task forever for a token stake. It belongs in Rules (claim.maxHours);
-// until types.ts has that field it is fixed here.
+// Longest a claim may run: one entry, and also one holder's unbroken run of
+// extensions unless the holder delivered a submission for the task during the
+// run. A cap is what stops one agent from locking a task forever for a token
+// stake. It belongs in Rules (claim.maxHours); until then it is fixed here.
 export const MAX_CLAIM_MS = 7 * 24 * 3_600_000;
 
 // Default tolerance between an entry's `at` and the writer's clock.
 export const DEFAULT_MAX_SKEW_MS = 5 * 60_000;
+
+// Input limits. The ledger is permanent and every node replays all of it, so
+// every free-text field, id and list is bounded here, at the one place every
+// entry passes; the server's caps (server.ts FIELD_CAPS) are a stricter edge
+// policy on top. Lengths are in UTF-16 code units (String.length).
+export const LEDGER_LIMITS = {
+  id: 128, // ids, refs to ids, owner ids, commit shas, salts, gate names: also ID_RE
+  title: 300, // proposal titles
+  text: 4000, // summaries, details, descriptions, notes, reasons, messages, harness errors
+  path: 512, // repo paths: also canonical POSIX (isCanonicalPath)
+  command: 2000, // test commands
+  name: 64, // harness and modelFamily
+  ref: 256, // settlement refs, evidence test ids and tools, entropy, log digests
+  evidence: 20, // items per proposal
+  changedFiles: 2000, // per submission
+  acceptanceTestPaths: 100, // per task
+  reviewers: 10, // per assignment
+  findingIds: 50, // per verdict
+  snapshotSubmissions: 500, // submissionIds per snapshot
+} as const;
+
+// An id starts with a letter or digit, so "", "." and ".." (and any id made
+// only of dots) are impossible, and has no '/', space or control character:
+// ids name files (patches, salts) and appear in refs and URLs.
+export const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+// The trust tree's virtual root must never be an owner id (members.ts).
+if (ID_RE.test(MEMBER_ROOT)) throw new Error(`ledger: ID_RE accepts the reserved tree root ${MEMBER_ROOT}`);
+
+// Whether a submission for the task has merged: the task is done.
+export function taskMerged(state: CommonsState, taskId: string): boolean {
+  for (const s of state.submissions.values()) if (s.taskId === taskId && s.merged) return true;
+  return false;
+}
+
+// An existing id equal to `id` ignoring letter case, if any.
+function caseTwin(ids: Iterable<string>, id: string): string | undefined {
+  const lower = id.toLowerCase();
+  for (const other of ids) if (other.toLowerCase() === lower) return other;
+  return undefined;
+}
+
+// An id git accepts as one ref name component (git check-ref-format), on top
+// of ID_RE: no ':' and no "..", and no '.' or ".lock" at the end.
+export function isRefSafeId(id: string): boolean {
+  return !id.includes(":") && !id.includes("..") && !id.endsWith(".") && !id.endsWith(".lock");
+}
 
 // ---------------------------------------------------------------------------
 // Envelope: what is signed and what is hashed.
@@ -205,15 +265,60 @@ const REASONS: readonly SettlementReason[] = [
   "honeytoken",
 ];
 
+const L = LEDGER_LIMITS;
 const any: Check = () => true;
 const str: Check = (v) => typeof v === "string";
-const id: Check = (v) => typeof v === "string" && v.length > 0;
+// A string of at most `max` characters; non-empty unless `empty`.
+const text =
+  (max: number, empty = false): Check =>
+  (v) =>
+    typeof v === "string" && v.length <= max && (empty || v.length > 0);
+const id: Check = (v) => typeof v === "string" && v.length <= L.id && ID_RE.test(v);
 const idOrNull: Check = (v) => v === null || id(v);
+
+// Everything about a verdict the ledger checks at reveal without state: the
+// shape (review.validateVerdict) and the ledger's limits. A commit carries only
+// a hash, so a verdict that fails here would land as a commit no reveal could
+// ever open (a silent approver, slashed as p = 0): clients call this before
+// committing (client.ts, cli.ts).
+export function verdictProblems(verdict: unknown): string[] {
+  const problems = validateVerdict(verdict);
+  if (problems.length > 0) return problems;
+  const v = verdict as { summary: string; findingIds: unknown[] };
+  if (v.summary.length > L.text) problems.push(`summary longer than ${L.text} characters`);
+  if (v.findingIds.length > L.findingIds) problems.push(`more than ${L.findingIds} findingIds`);
+  if (!v.findingIds.every(id)) problems.push("findingIds must be ids");
+  return problems;
+}
+
+// The findings a verdict cites must exist and target its subject: a review's
+// its submission, an attestation's its snapshot. `targetOf` gives a finding's
+// target, or undefined for no such finding. The ledger applies this at reveal;
+// clients apply it before committing, for the reason verdictProblems gives.
+export function citedFindingProblems(
+  targetOf: (findingId: string) => CommitSubject | undefined,
+  findingIds: readonly string[],
+  subject: CommitSubject,
+): string[] {
+  const out: string[] = [];
+  for (const fid of findingIds) {
+    const t = targetOf(fid);
+    const here =
+      t !== undefined &&
+      ("submissionId" in subject ? "submissionId" in t && t.submissionId === subject.submissionId : "snapshotId" in t && t.snapshotId === subject.snapshotId);
+    if (t === undefined) out.push(`no finding ${fid}`);
+    else if (!here) out.push(`finding ${fid} does not target this review's subject`);
+  }
+  return out;
+}
+const path: Check = (v) => isCanonicalPath(v);
 const int: Check = (v) => Number.isSafeInteger(v);
 const nat: Check = (v) => Number.isSafeInteger(v) && (v as number) >= 0;
 const bool: Check = (v) => typeof v === "boolean";
-const array: Check = (v) => Array.isArray(v);
-const strings: Check = (v) => Array.isArray(v) && v.every(str);
+const listOf =
+  (max: number, item: Check): Check =>
+  (v) =>
+    Array.isArray(v) && v.length <= max && v.every(item);
 const hex64: Check = (v) => typeof v === "string" && HEX64_RE.test(v);
 // One spelling per instant: the UTC form toISOString() produces. Date.parse
 // alone would accept 2026-02-30 (rolled to March 2) and many spellings of one
@@ -228,38 +333,69 @@ const reason: Check = (v) => REASONS.includes(v as SettlementReason);
 
 // Field checks per kind (besides `kind`). Arrays of ids, evidence, verdicts,
 // targets and rules are type-checked here and validated in depth by the rules.
+// Every limit in LEDGER_LIMITS is applied here, so an over-long field or list
+// is a "malformed" entry before any rule reads it. Paths are only typed here:
+// the per-kind rules check isCanonicalPath (which includes the length limit)
+// and refuse with "invalid-value".
 const SHAPES: { [K in EntryKind]: Record<string, Check> } = {
-  genesis: { project: id, admins: strings, coordinator: str, rules: any },
+  genesis: { project: id, admins: listOf(Number.MAX_SAFE_INTEGER, str), coordinator: str, rules: any },
   ownerKey: { owner: id, publicKey: str, inviter: idOrNull },
-  agentRegistered: { owner: id, publicKey: str, modelFamily: id, harness: str },
-  agentRevoked: { agent: id, reason: str },
-  proposal: { id, title: id, evidence: array },
-  task: { id, proposalId: id, ring, acceptanceTestPaths: strings, sizeEstimate: nat, specAuthor: id },
+  agentRegistered: { owner: id, publicKey: str, modelFamily: text(L.name), harness: text(L.name) },
+  agentRevoked: { agent: id, reason: text(L.text, true) },
+  proposal: { id, title: text(L.title), evidence: listOf(L.evidence, any) },
+  task: { id, proposalId: id, ring, acceptanceTestPaths: listOf(L.acceptanceTestPaths, str), sizeEstimate: nat, specAuthor: id },
   claim: { taskId: id, until: iso, stake: int },
-  submission: { id, taskId: idOrNull, baseCommit: id, headCommit: id, changedFiles: strings, linesChanged: int },
-  gateResult: { submissionId: id, gate: id, pass: bool, details: str },
-  reviewAssignment: { submissionId: id, beacon: id, reviewers: strings },
+  submission: {
+    id,
+    taskId: idOrNull,
+    baseCommit: id,
+    headCommit: id,
+    changedFiles: listOf(L.changedFiles, str),
+    linesChanged: int,
+  },
+  gateResult: { submissionId: id, gate: id, pass: bool, details: text(L.text, true) },
+  reviewAssignment: {
+    submissionId: id,
+    beacon: hex64,
+    entropy: text(L.ref),
+    treeDigest: hex64,
+    reviewers: listOf(L.reviewers, id),
+  },
   reviewCommit: { submissionId: id, commitment: hex64, stake: int },
   reviewReveal: { submissionId: id, verdict: any, salt: id },
-  finding: { id, target, severity, testPath: id, testCommand: id, stake: int },
-  findingResult: { findingId: id, reproduced: bool, failsOnHead: bool, passesOnParent: bool, logDigest: str },
+  finding: { id, target, severity, testPath: str, testCommand: text(L.command), stake: int },
+  findingResult: {
+    findingId: id,
+    reproduced: bool,
+    failsOnHead: bool,
+    passesOnParent: bool,
+    logDigest: text(L.ref, true),
+  },
+  findingAttempt: { findingId: id, harnessError: text(L.text) },
+  findingDecision: { findingId: id, confirmed: bool, reason: text(L.text, true) },
+  mergeApproval: { submissionId: id },
+  reviewWindowClosed: { submissionId: id, missing: listOf(L.reviewers, id) },
   merge: { submissionId: id, commit: id },
-  snapshot: { id, commit: id, previousSnapshotId: idOrNull, submissionIds: strings },
+  snapshot: { id, commit: id, previousSnapshotId: idOrNull, submissionIds: listOf(L.snapshotSubmissions, id) },
   attestCommit: { snapshotId: id, commitment: hex64, stake: int },
   attestReveal: { snapshotId: id, verdict: any, salt: id },
   signoff: { snapshotId: id },
   promotion: { snapshotId: id, commit: id },
   plantCommit: { commitment: hex64 },
-  plantReveal: { submissionId: id, salt: id, description: str, severity },
+  plantReveal: { submissionId: id, salt: id, description: text(L.text, true), severity },
   honeytokenTriggered: { agent: id, tokenId: id },
   escape: { findingId: id, snapshotId: id },
-  settlement: { owner: id, delta: int, reason, ref: str },
+  settlement: { owner: id, delta: int, reason, ref: text(L.ref, true) },
   rulesChange: { rules: any, pollId: id },
 };
 
-// `planted` may appear on a submission only so that the "authors may not set
-// planted" rule can reject it with its own code instead of a shape error.
-const OPTIONAL: Partial<Record<EntryKind, readonly string[]>> = { submission: ["planted"] };
+// Optional fields, checked when present. `planted` may appear on a submission
+// only so that the "authors may not set planted" rule can reject it with its
+// own code instead of a shape error.
+const OPTIONAL: Partial<Record<EntryKind, Record<string, Check>>> = {
+  submission: { planted: any },
+  findingResult: { harnessError: text(L.text) },
+};
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
@@ -275,21 +411,26 @@ function definedKeys(o: Record<string, unknown>): string[] {
 // Own properties only, on both sides: `in` would also find Object.prototype
 // names (constructor, valueOf, ...), and JSON.parse makes "__proto__" an own
 // key, so either way extra data could ride along unhashed in the envelope.
-function fieldProblem(o: Record<string, unknown>, fields: Record<string, Check>, optional: readonly string[] = []) {
+function fieldProblem(o: Record<string, unknown>, fields: Record<string, Check>, optional: Record<string, Check> = {}) {
   for (const [name, check] of Object.entries(fields)) {
     if (!Object.hasOwn(o, name) || o[name] === undefined) return `missing field ${name}`;
     if (!check(o[name])) return `bad field ${name}`;
   }
   for (const key of definedKeys(o)) {
-    if (!Object.hasOwn(fields, key) && !optional.includes(key)) return `unknown field ${key}`;
+    if (Object.hasOwn(fields, key)) continue;
+    if (!Object.hasOwn(optional, key)) return `unknown field ${key}`;
+    if (!(optional[key] as Check)(o[key])) return `bad field ${key}`;
   }
   return null;
 }
 
-// A repo-relative POSIX path in its one spelling. Ring and airlock globs are
-// anchored, so `./a`, `a//b` or `a/../b` would dodge them while naming the same file.
+// A repo-relative POSIX path in its one spelling, at most LEDGER_LIMITS.path
+// long: no leading '/', no empty, '.' or '..' segment, no backslash or NUL.
+// Ring and airlock globs are anchored, so `./a`, `a//b` or `a/../b` would
+// dodge them while naming the same file.
 export function isCanonicalPath(p: unknown): p is string {
-  if (typeof p !== "string" || p === "" || p.includes("\\") || p.includes("\0")) return false;
+  if (typeof p !== "string" || p === "" || p.length > LEDGER_LIMITS.path) return false;
+  if (p.includes("\\") || p.includes("\0")) return false;
   return p.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 }
 
@@ -318,26 +459,14 @@ function evidenceProblem(e: unknown): string | null {
   const line: Check = (v) => Number.isSafeInteger(v) && (v as number) >= 1;
   switch (e.kind) {
     case "failingTest":
-      return fieldProblem(e, { kind: str, testId: id, command: id });
+      return fieldProblem(e, { kind: str, testId: text(L.ref), command: text(L.command) });
     case "diagnostic":
-      return fieldProblem(e, { kind: str, tool: id, message: id, file: id, line });
+      return fieldProblem(e, { kind: str, tool: text(L.ref), message: text(L.text), file: path, line });
     case "location":
-      return fieldProblem(e, { kind: str, file: id, line, note: str });
+      return fieldProblem(e, { kind: str, file: path, line, note: text(L.text, true) });
     default:
       return `unknown evidence kind ${String(e.kind)}`;
   }
-}
-
-function verdictProblem(v: unknown): string | null {
-  if (!isPlainObject(v)) return "verdict is not an object";
-  const problem = fieldProblem(v, { defectProbability: any, summary: str, findingIds: strings });
-  if (problem) return problem;
-  const p = v.defectProbability;
-  if (typeof p !== "number" || !Number.isFinite(p) || p < 0 || p > 1) return "defectProbability must be in [0, 1]";
-  const ids = v.findingIds as string[];
-  if (ids.some((x) => x === "")) return "empty finding id";
-  if (new Set(ids).size !== ids.length) return "duplicate finding id";
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +503,7 @@ export function emptyState(genesis: LedgerEntry | GenesisBody, at: string = EPOC
   return {
     project: body.project,
     rules: cloneJson(body.rules),
+    rulesHistory: [{ seq: 0, rules: cloneJson(body.rules) }],
     adminKeys,
     coordinatorKey: keyIdOf(body.coordinator),
     publicKeys,
@@ -383,6 +513,7 @@ export function emptyState(genesis: LedgerEntry | GenesisBody, at: string = EPOC
     proposals: new Map(),
     tasks: new Map(),
     claims: new Map(),
+    claimHistory: [],
     submissions: new Map(),
     findings: new Map(),
     snapshots: new Map(),
@@ -412,8 +543,11 @@ export function applyEntry(state: CommonsState, entry: LedgerEntry): void {
 
 // lockedStake per owner, from scratch. Stake is locked while its outcome is
 // open: a claim until it expires (judged at the latest entry time) or its task
-// merges, a review commit until its submission merges, an attestation until
-// its snapshot is promoted, a finding until its result is recorded.
+// merges, a review commit until its submission merges or can never merge, an
+// attestation until its snapshot ships or can never ship, a finding until its
+// result is recorded. Without the "can never" release, every dead submission
+// (a failed gate, a confirmed defect, a revealed plant) would lock its
+// reviewers' stakes for good and drain the allowance of a small group.
 export function recomputeLockedStake(state: CommonsState): void {
   for (const owner of state.owners.values()) owner.lockedStake = 0;
   const now = Date.parse(headAtOf(state));
@@ -426,9 +560,59 @@ export function recomputeLockedStake(state: CommonsState): void {
   for (const c of state.claims.values()) {
     if (!doneTasks.has(c.taskId) && Date.parse(c.until) >= now) add(c.agent, c.stake);
   }
-  for (const s of state.submissions.values()) if (!s.merged) for (const r of s.reviews) add(r.reviewer, r.stake);
-  for (const s of state.snapshots.values()) if (!s.promoted) for (const a of s.attestations) add(a.reviewer, a.stake);
+  const dead = new Set<string>();
+  for (const s of state.submissions.values()) {
+    if (!s.merged && submissionDead(state, s.id)) dead.add(s.id);
+    if (!s.merged && !dead.has(s.id)) for (const r of s.reviews) add(r.reviewer, r.stake);
+  }
+  const shipped = shippedSnapshotIds(state);
+  for (const snap of state.snapshots.values()) {
+    if (shipped.has(snap.id) || snapshotDead(state, snap)) continue;
+    for (const a of snap.attestations) add(a.reviewer, a.stake);
+  }
   for (const f of state.findings.values()) if (!f.result) add(f.finder, f.stake);
+}
+
+// An unmerged submission that can never merge: a failed gate (the merge rule
+// refuses any), a revealed plant, a confirmed defect, a task another
+// submission already merged, or a revoked author.
+export function submissionDead(state: CommonsState, submissionId: string): boolean {
+  const s = state.submissions.get(submissionId);
+  if (!s || s.merged) return false;
+  if (s.planted || s.gates.some((g) => !g.pass)) return true;
+  // The coordinator never progresses a revoked author's work (coordinator
+  // planActions): key rotation or suspension ends it, so its PR slot and its
+  // reviewers' stakes are released; the owner resubmits with a new agent.
+  if (state.agents.get(s.author)?.active === false) return true;
+  if (s.taskId !== null && taskMerged(state, s.taskId)) return true;
+  return s.findingIds.some((fid) => {
+    const f = state.findings.get(fid);
+    return f !== undefined && isConfirmedDefect(f);
+  });
+}
+
+// A snapshot that can never be promoted: a confirmed defect on it or on a
+// submission it lists, or a revealed plant among them.
+function snapshotDead(state: CommonsState, snap: SnapshotState): boolean {
+  if (snap.submissionIds.some((sid) => state.submissions.get(sid)?.planted)) return true;
+  for (const f of state.findings.values()) {
+    if (!isConfirmedDefect(f)) continue;
+    if ("snapshotId" in f.target ? f.target.snapshotId === snap.id : snap.submissionIds.includes(f.target.submissionId)) return true;
+  }
+  return false;
+}
+
+// Snapshots on main: promoted ones and every ancestor of one.
+export function shippedSnapshotIds(state: CommonsState): Set<string> {
+  const out = new Set<string>();
+  for (const snap of state.snapshots.values()) {
+    if (!snap.promoted) continue;
+    for (let cur: string | null = snap.id; cur !== null && !out.has(cur); ) {
+      out.add(cur);
+      cur = state.snapshots.get(cur)?.previousSnapshotId ?? null;
+    }
+  }
+  return out;
 }
 
 function headAtOf(state: CommonsState): string {
@@ -439,7 +623,10 @@ function headAtOf(state: CommonsState): string {
 // Applying one entry.
 // ---------------------------------------------------------------------------
 
-type Role = "admin" | "coordinator" | "owner" | "agent" | "agentOrOwner" | "ownerOrCoordinator";
+// operator = a genesis admin key, or the key of an owner named in
+// rules.kernelSigners: the humans who decide what a machine cannot (whether a
+// reproduction is a real defect, whether a merge may go ahead).
+type Role = "admin" | "coordinator" | "owner" | "agent" | "agentOrOwner" | "ownerOrCoordinator" | "operator";
 
 const SIGNERS: { [K in Exclude<EntryKind, "genesis">]: Role } = {
   ownerKey: "admin",
@@ -455,6 +642,10 @@ const SIGNERS: { [K in Exclude<EntryKind, "genesis">]: Role } = {
   reviewReveal: "agent",
   finding: "agent",
   findingResult: "coordinator",
+  findingAttempt: "coordinator",
+  findingDecision: "operator",
+  mergeApproval: "operator",
+  reviewWindowClosed: "coordinator",
   merge: "coordinator",
   snapshot: "coordinator",
   attestCommit: "agent",
@@ -486,6 +677,8 @@ function hasRole(state: CommonsState, signer: KeyId, role: Role): boolean {
       return isAgent || isOwner;
     case "ownerOrCoordinator":
       return isOwner || isCoordinator;
+    case "operator":
+      return state.adminKeys.includes(signer) || state.rules.kernelSigners.includes(state.ownerByKey.get(signer) ?? "");
   }
 }
 
@@ -539,10 +732,19 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
 
     case "ownerKey": {
       if (state.owners.has(body.owner)) reject("duplicate-id", `owner ${body.owner} already has a key`);
+      // Ids are chosen by people, who type them in any case. Two
+      // spellings of one member would be two owners here (two tickets, two
+      // review seats, a way round "not the author's owner"), so ids that
+      // differ only in case are one id. Every other owner check can then
+      // compare exact strings, as the member tree does.
+      const lower = body.owner.toLowerCase();
+      for (const o of state.owners.keys()) {
+        if (o.toLowerCase() === lower) reject("duplicate-id", `owner ${body.owner} is already registered as ${o} (owner ids ignore case)`);
+      }
       const keyId = newKey(body.publicKey);
       if (body.inviter !== null && !state.owners.has(body.inviter)) reject("unknown-ref", `no inviter ${body.inviter}`);
       state.publicKeys.set(keyId, body.publicKey);
-      state.owners.set(body.owner, { id: body.owner, keyId, inviter: body.inviter, reputationDelta: 0, lockedStake: 0 });
+      state.owners.set(body.owner, { id: body.owner, keyId, inviter: body.inviter, reputationDelta: 0, lockedStake: 0, registeredSeq: seq });
       state.ownerByKey.set(keyId, body.owner);
       return;
     }
@@ -550,6 +752,11 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "agentRegistered": {
       const owner = state.owners.get(body.owner) ?? reject("unknown-ref", `no owner ${body.owner}`);
       if (owner.keyId !== signer) reject("unauthorised", "only the named owner may register its agents");
+      // A closed list: free spellings ("Claude ", "anthropic") would let one
+      // family pass as two for requireOtherModelFamily and promotion coverage.
+      if (!state.rules.modelFamilies.includes(body.modelFamily)) {
+        reject("invalid-value", `model family ${JSON.stringify(body.modelFamily)} is not one of rules.modelFamilies`);
+      }
       const keyId = newKey(body.publicKey);
       state.publicKeys.set(keyId, body.publicKey);
       state.agents.set(keyId, {
@@ -558,6 +765,7 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
         modelFamily: body.modelFamily,
         harness: body.harness,
         active: true,
+        registeredSeq: seq,
       });
       return;
     }
@@ -570,6 +778,8 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       if (!agent.active) reject("inactive-agent", "agent already revoked");
       agent.active = false;
       agent.revokedReason = body.reason;
+      agent.revokedBy = signer === state.coordinatorKey ? "coordinator" : "owner";
+      agent.revokedSeq = seq;
       return;
     }
 
@@ -609,30 +819,52 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       const until = Date.parse(body.until);
       if (until <= ms) reject("invalid-value", "claim must expire after it is made");
       if (until - ms > MAX_CLAIM_MS) reject("claim-too-long", `a claim may run at most ${MAX_CLAIM_MS / 3_600_000} hours`);
-      for (const s of state.submissions.values()) {
-        if (s.taskId === body.taskId && s.merged) reject("task-done", `task ${body.taskId} already merged`);
-      }
+      if (taskMerged(state, body.taskId)) reject("task-done", `task ${body.taskId} already merged`);
       const current = state.claims.get(body.taskId);
-      // The holder may extend its own claim (each extension capped like a new
-      // claim); anyone else waits for expiry. A revoked holder's claim is dead:
-      // revocation must not leave the task locked.
-      if (
-        current &&
-        current.agent !== signer &&
-        Date.parse(current.until) > ms &&
-        state.agents.get(current.agent)?.active === true
-      ) {
+      // Live through its `until` instant, as everywhere else (the submission
+      // rule, recomputeLockedStake, settleExpiredClaims): a re-claim stamped
+      // exactly at `until` is an extension, capped like one, not a fresh run.
+      const live = current !== undefined && Date.parse(current.until) >= ms;
+      // The holder may extend its own live claim; anyone else waits for
+      // expiry. A revoked holder's claim is dead: revocation must not leave the
+      // task locked.
+      if (current && live && current.agent !== signer && state.agents.get(current.agent)?.active === true) {
         reject("claim-live", `task ${body.taskId} is claimed until ${current.until}`);
       }
-      state.claims.set(body.taskId, { taskId: body.taskId, agent: signer, until: body.until, stake: body.stake, seq });
+      // An unbroken run of extensions is capped like one claim, unless the
+      // holder delivered a submission for the task since its previous claim
+      // entry (it is working, not squatting). Re-claiming after expiry starts
+      // a new run; the lapsed claim stays in claimHistory and is still settled.
+      const extending = current !== undefined && live && current.agent === signer;
+      const since = extending ? (current.since ?? at) : at;
+      if (extending && until - Date.parse(since) > MAX_CLAIM_MS) {
+        const delivered = [...state.submissions.values()].some(
+          (x) => x.taskId === body.taskId && x.author === signer && x.submittedSeq > current.seq,
+        );
+        if (!delivered) {
+          reject("claim-too-long", `claims on ${body.taskId} since ${since} would run past ${MAX_CLAIM_MS / 3_600_000} hours without a submission`);
+        }
+      }
+      state.claims.set(body.taskId, { taskId: body.taskId, agent: signer, until: body.until, stake: body.stake, seq, since });
+      state.claimHistory?.push({ taskId: body.taskId, agent: signer, until: body.until, stake: body.stake, seq, at });
       return;
     }
 
     case "submission": {
       if (body.planted !== undefined) reject("planted-by-author", "authors may not set planted");
       if (state.submissions.has(body.id)) reject("duplicate-id", `submission ${body.id} exists`);
+      // A submission id names its patch file and its ref refs/commons/<id>:
+      // one that differs from another only in case is the same file on a
+      // case-insensitive filesystem (the default on macOS), and git refuses
+      // some names outright.
+      const twin = caseTwin(state.submissions.keys(), body.id);
+      if (twin !== undefined) reject("duplicate-id", `submission ${body.id} differs from ${twin} only in case`);
+      if (!isRefSafeId(body.id)) reject("invalid-value", `submission id ${body.id} cannot name a git ref (no ':', '..', or a '.' or '.lock' ending)`);
       if (body.taskId !== null) {
         if (!state.tasks.has(body.taskId)) reject("unknown-ref", `no task ${body.taskId}`);
+        // A task is done once one submission for it merged; a claim still live
+        // must not let its holder submit (and be paid) again for it.
+        if (taskMerged(state, body.taskId)) reject("task-done", `task ${body.taskId} already merged`);
         const claim = state.claims.get(body.taskId);
         if (!claim || claim.agent !== signer || Date.parse(claim.until) < ms) {
           reject("claim-missing", `submitter holds no live claim on task ${body.taskId}`);
@@ -675,6 +907,17 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       if (s.merged) reject("merged", "submission already merged");
       if (s.assignment) reject("assigned", "submission already has an assignment");
       if (body.reviewers.length === 0) reject("invalid-reviewers", "no reviewers");
+      // The tree is the member tree of the ledger so far, so the coordinator
+      // cannot draw over another one; the beacon is a function of the
+      // submission and the entropy, never the coordinator's choice (it leaves
+      // the digest out: see review.assignmentBeacon). Replay does not redo the
+      // draw itself (selection.verifyAssignment does).
+      if (body.treeDigest !== memberDigest(state)) {
+        reject("invalid-value", "treeDigest is not the digest of the member tree before this entry");
+      }
+      if (body.beacon !== assignmentBeacon(s.id, s.headCommit, body.entropy)) {
+        reject("invalid-value", "beacon is not assignmentBeacon(submissionId, headCommit, entropy)");
+      }
       const authorOwner = ownerOf(s.author);
       const owners = new Set<OwnerId>();
       for (const r of body.reviewers) {
@@ -685,32 +928,47 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
         // agents must not fill several review seats.
         if (owners.has(agent.owner)) reject("invalid-reviewers", `owner ${agent.owner} holds two seats`);
         owners.add(agent.owner);
+        // One review commit per owner (checkCommit): a seat given to another
+        // agent of an owner that already committed could never be filled.
+        const other = s.reviews.find((c) => c.reviewer !== r && ownerOf(c.reviewer) === agent.owner);
+        if (other) reject("invalid-reviewers", `owner ${agent.owner} already committed through ${other.reviewer}; that agent holds its seat`);
       }
-      s.assignment = { beacon: body.beacon, reviewers: [...body.reviewers], seq };
+      s.assignment = {
+        beacon: body.beacon,
+        entropy: body.entropy,
+        treeDigest: body.treeDigest,
+        reviewers: [...body.reviewers],
+        seq,
+        at,
+      };
       return;
     }
 
     case "reviewCommit": {
       const s = submission(body.submissionId);
       if (s.merged) reject("merged", "submission already merged");
-      const closedBy = s.reviews.some((r) => r.verdict)
-        ? "a review was revealed"
-        : s.planted
-          ? "the plant was revealed"
-          : s.findingIds.some((fid) => state.findings.get(fid)?.result?.reproduced === true)
-            ? "a finding on it reproduced"
-            : null;
-      checkCommit(s.reviews, ownerSet([s.id]), body.stake, closedBy);
+      checkCommit(s.reviews, ownerSet([s.id]), body.commitment, body.stake, reviewCommitsClosedBy(state, s.id, ms));
+      // The owner's seat is its assigned agent's: a commit by another of its
+      // agents would leave that seat unfillable (one commit per owner). A
+      // seated agent since revoked can fill nothing, so it holds nothing.
+      const seat = s.assignment?.reviewers.find((k) => k !== signer && ownerOf(k) === ownerOf(signer) && state.agents.get(k)?.active === true);
+      if (seat !== undefined) reject("duplicate-commit", `this owner's seat on ${s.id} is ${seat}'s; commit with that agent`);
       s.reviews.push({ reviewer: signer, commitment: body.commitment, stake: body.stake, committedSeq: seq });
       return;
     }
 
     case "reviewReveal": {
       const s = submission(body.submissionId);
-      const review = checkReveal(s.reviews, body.verdict, body.salt, (fid) => {
-        const f = finding(fid);
-        return "submissionId" in f.target && f.target.submissionId === s.id;
-      });
+      // The commit phase: no verdict is public until every assigned reviewer
+      // committed or the phase ended. Otherwise one reveal, by anyone, seconds
+      // after a submission would shut the assigned reviewers out for good.
+      if (!s.assignment) reject("commit-phase", "reveals wait for the reviewer assignment");
+      const deadline = commitDeadlineMs(state.rules, s.assignment?.at);
+      const allCommitted = (s.assignment?.reviewers ?? []).every((k) => s.reviews.some((r) => r.reviewer === k));
+      if (!allCommitted && ms < deadline) {
+        reject("commit-phase", `reveals wait until every assigned reviewer committed or ${new Date(deadline).toISOString()}`);
+      }
+      const review = checkReveal(s.reviews, body.verdict, body.salt, { submissionId: s.id });
       review.verdict = cloneJson(body.verdict);
       review.revealedSeq = seq;
       return;
@@ -718,6 +976,9 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
 
     case "finding": {
       if (state.findings.has(body.id)) reject("duplicate-id", `finding ${body.id} exists`);
+      // Finding ids name the uploaded test file: unique ignoring case, as above.
+      const twin = caseTwin(state.findings.keys(), body.id);
+      if (twin !== undefined) reject("duplicate-id", `finding ${body.id} differs from ${twin} only in case`);
       const target = body.target as unknown;
       if (!isPlainObject(target) || definedKeys(target).length !== 1) {
         return reject("invalid-target", "target must name exactly one submission or snapshot");
@@ -758,23 +1019,83 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       if (body.reproduced !== (body.failsOnHead && body.passesOnParent)) {
         reject("result-inconsistent", "reproduced must equal failsOnHead && passesOnParent");
       }
+      // "Could not run" is not "did not reproduce", and never a reproduction.
+      if (body.harnessError !== undefined && body.reproduced) {
+        reject("result-inconsistent", "a result with a harness error cannot be a reproduction");
+      }
       f.result = {
         reproduced: body.reproduced,
         failsOnHead: body.failsOnHead,
         passesOnParent: body.passesOnParent,
         logDigest: body.logDigest,
+        ...(body.harnessError === undefined ? {} : { harnessError: body.harnessError }),
         seq,
+        at,
       };
+      return;
+    }
+
+    case "findingAttempt": {
+      const f = finding(body.findingId);
+      if (f.result) reject("result-exists", "finding already has a result");
+      f.harnessErrors = (f.harnessErrors ?? 0) + 1;
+      return;
+    }
+
+    case "findingDecision": {
+      const f = finding(body.findingId);
+      if (f.result?.reproduced !== true) reject("not-decidable", "only a reproduced finding is confirmed or dismissed");
+      if (f.decision) reject("decided", "finding already decided");
+      // An owner judges neither its own finding nor a finding on its own work.
+      const mine = state.ownerByKey.get(signer);
+      if (mine !== undefined && !state.adminKeys.includes(signer)) {
+        if (ownerOf(f.finder) === mine) reject("same-owner", "cannot decide your own owner's finding");
+        const targetOwners =
+          "submissionId" in f.target ? ownerSet([f.target.submissionId]) : ownerSet(covered(snapshot(f.target.snapshotId)));
+        if (targetOwners.has(mine)) reject("same-owner", "cannot decide a finding on your owner's work");
+      }
+      f.decision = { confirmed: body.confirmed, reason: body.reason, by: signer, seq, at };
+      return;
+    }
+
+    case "mergeApproval": {
+      const s = submission(body.submissionId);
+      if (s.merged) reject("merged", "submission already merged");
+      if (s.approval) reject("approved", "submission already approved");
+      const mine = state.ownerByKey.get(signer);
+      if (mine !== undefined && !state.adminKeys.includes(signer) && ownerOf(s.author) === mine) {
+        reject("same-owner", "cannot approve your owner's work");
+      }
+      s.approval = { by: signer, seq, at };
+      return;
+    }
+
+    case "reviewWindowClosed": {
+      const s = submission(body.submissionId);
+      if (s.merged) reject("merged", "submission already merged");
+      if (!s.assignment) reject("not-assigned", "no reviewer assignment");
+      if (s.windowClosed) reject("window-closed", "review window already closed");
+      const unrevealed = (s.assignment?.reviewers ?? []).filter((k) => !s.reviews.some((r) => r.reviewer === k && r.verdict));
+      if (canon([...body.missing].sort()) !== canon([...unrevealed].sort())) {
+        reject("invalid-reviewers", "missing must be exactly the assigned reviewers who have not revealed");
+      }
+      s.windowClosed = { missing: [...body.missing], seq, at };
       return;
     }
 
     case "merge": {
       const s = submission(body.submissionId);
       if (s.merged) reject("merged", "submission already merged");
+      if (s.taskId !== null && taskMerged(state, s.taskId)) reject("task-done", `task ${s.taskId} already merged`);
       if (s.gates.length === 0) reject("gates-missing", "no gate results recorded");
       const failed = s.gates.find((g) => !g.pass);
       if (failed) reject("gate-failed", `gate ${failed.gate} failed`);
-      if (s.findingIds.some((fid) => state.findings.get(fid)?.result?.reproduced === true)) {
+      // Mechanical and cheap: nothing merges unreviewed. The quorum and the
+      // human approval are the coordinator's rule (mergeReadiness), which
+      // needs the clock; `commons merge` checks it before appending.
+      if (!s.assignment) reject("not-assigned", "no reviewers were assigned");
+      // A reproduction blocks until an operator dismisses it.
+      if (s.findingIds.some((fid) => isReproducedOpen(finding(fid)))) {
         reject("reproduced-finding", "a reproduced finding targets this submission");
       }
       // Undecided is not clean: merging before the harness answers would get
@@ -818,24 +1139,29 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       if (snap.promoted) reject("promoted", "snapshot already promoted");
       const chain = ancestry(snap, true);
       const subs = chain.flatMap((x) => x.submissionIds);
-      const closedBy = snap.attestations.some((a) => a.verdict)
-        ? "an attestation was revealed"
-        : subs.some((sid) => state.submissions.get(sid)?.planted)
-          ? "a plant it covers was revealed"
-          : [...state.findings.values()].some((f) => f.result?.reproduced === true && chain.some((x) => targets(f, x, subs)))
-            ? "a finding on it reproduced"
-            : null;
-      checkCommit(snap.attestations, ownerSet(subs), body.stake, closedBy);
+      // Commits close at the end of the commit phase, never at the first
+      // reveal (reveals wait for that end): one early reveal must not shut
+      // every other attester out.
+      const closedBy =
+        ms >= commitDeadlineMs(state.rules, snap.at)
+          ? "the commit phase ended"
+          : snap.attestations.some((a) => a.verdict)
+            ? "an attestation was revealed"
+            : subs.some((sid) => state.submissions.get(sid)?.planted)
+              ? "a plant it covers was revealed"
+              : [...state.findings.values()].some((f) => isReproducedOpen(f) && chain.some((x) => targets(f, x, subs)))
+                ? "a finding on it reproduced"
+                : null;
+      checkCommit(snap.attestations, ownerSet(subs), body.commitment, body.stake, closedBy);
       snap.attestations.push({ reviewer: signer, commitment: body.commitment, stake: body.stake, committedSeq: seq });
       return;
     }
 
     case "attestReveal": {
       const snap = snapshot(body.snapshotId);
-      const attestation = checkReveal(snap.attestations, body.verdict, body.salt, (fid) => {
-        const f = finding(fid);
-        return "snapshotId" in f.target && f.target.snapshotId === snap.id;
-      });
+      const deadline = commitDeadlineMs(state.rules, snap.at);
+      if (ms < deadline) reject("commit-phase", `attestation reveals wait until ${new Date(deadline).toISOString()}`);
+      const attestation = checkReveal(snap.attestations, body.verdict, body.salt, { snapshotId: snap.id });
       attestation.verdict = cloneJson(body.verdict);
       attestation.revealedSeq = seq;
       return;
@@ -846,7 +1172,12 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       const owner = state.ownerByKey.get(signer) ?? reject("unauthorised", "signer is not an owner");
       if (!state.rules.kernelSigners.includes(owner)) reject("unauthorised", `${owner} is not a kernel signer`);
       if (snap.promoted) reject("promoted", "snapshot already promoted");
-      if (ownerSet(covered(snap)).has(owner)) reject("same-owner", "cannot sign off a snapshot of your own agents' work");
+      // Independence is about the kernel diff being signed: a signer's own
+      // ring-1 or ring-2 work in the same snapshot does not stop it reading
+      // someone else's kernel change. In a small group every snapshot soon
+      // covers everyone's work, so excluding all authors would leave nobody.
+      const kernelWork = covered(snap).filter((sid) => state.submissions.get(sid)?.changedFiles.some((f) => ringOf(f, state.rules) === 0));
+      if (ownerSet(kernelWork).has(owner)) reject("same-owner", "cannot sign off a snapshot whose kernel changes include your own agents' work");
       if (snap.signoffs.includes(owner)) reject("duplicate-signoff", `${owner} already signed off`);
       snap.signoffs.push(owner);
       return;
@@ -855,6 +1186,13 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "promotion": {
       const snap = snapshot(body.snapshotId);
       if (snap.promoted) reject("promoted", "snapshot already promoted");
+      // Main never moves backwards: not onto what a promoted descendant
+      // already shipped, nor behind a later promoted snapshot. Every derived
+      // notion of "covered" and "shipped" relies on this.
+      if (shippedSnapshotIds(state).has(snap.id)) reject("promoted", "a promoted descendant already shipped this snapshot");
+      for (const other of state.snapshots.values()) {
+        if (other.promoted && other.seq > snap.seq) reject("promoted", `main has moved past it: ${other.id} is promoted`);
+      }
       snap.promoted = { seq, at };
       return;
     }
@@ -875,13 +1213,13 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       // already-planted is what makes each commitment usable once. Without this
       // one commitment to "a:b:c" could later label "a" or "a:b", at choice.
       if (body.salt.includes(":")) reject("invalid-value", "plant salt may not contain ':'");
-      const commitment = sha256hex(`${body.submissionId}:${body.salt}`);
+      const commitment = plantCommitment(body.submissionId, body.salt);
       const commit = state.plantCommitments.find((c) => c.commitment === commitment);
       if (!commit) return reject("plant-mismatch", "no plant commitment matches");
       // The commitment must predate the submission; otherwise the custodian
       // could label any submission a plant after seeing who caught it.
       if (commit.seq > s.submittedSeq) reject("plant-late", "plant committed after the submission");
-      s.planted = { severity: body.severity, description: body.description };
+      s.planted = { severity: body.severity, description: body.description, seq };
       return;
     }
 
@@ -894,6 +1232,7 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "escape": {
       const f = finding(body.findingId);
       if (f.result?.reproduced !== true) reject("not-reproduced", "escape needs a reproduced finding");
+      if (!isConfirmedDefect(f)) reject("not-decidable", "escape needs a finding an operator confirmed");
       const snap = snapshot(body.snapshotId);
       if (!snap.promoted) reject("not-promoted", "escape needs a promoted snapshot");
       // What main holds at a snapshot is the snapshot and all its ancestors.
@@ -909,8 +1248,15 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
 
     case "settlement": {
       const owner = state.owners.get(body.owner) ?? reject("unknown-ref", `no owner ${body.owner}`);
+      // (owner, reason, ref) names one event's movement: settled once, whoever
+      // appends it (protocol §6). incentives.ts and the coordinator filter on
+      // the same key; this makes a duplicate invalid on replay too.
+      const keys = settledKeys(state);
+      const key = settlementKey(body);
+      if (keys.has(key)) reject("duplicate-settlement", `${body.owner} ${body.reason} ${body.ref} is already settled`);
       owner.reputationDelta += body.delta;
       state.settlements.push({ owner: body.owner, delta: body.delta, reason: body.reason, ref: body.ref, seq, at });
+      keys.add(key);
       return;
     }
 
@@ -921,6 +1267,7 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
         reject("rules-version", `version must exceed ${state.rules.version}`);
       }
       state.rules = cloneJson<Rules>(body.rules);
+      state.rulesHistory?.push({ seq, rules: cloneJson<Rules>(body.rules) });
       return;
     }
 
@@ -935,10 +1282,13 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
   // seats), at least the rules' review stake, and only while the outcome is
   // still hidden. Once a verdict is revealed, a plant is revealed or a finding
   // reproduces, a late commit could copy the answer.
-  function checkCommit(existing: ReviewState[], authors: Set<OwnerId>, stake: number, closedBy: string | null): void {
+  function checkCommit(existing: ReviewState[], authors: Set<OwnerId>, commitment: string, stake: number, closedBy: string | null): void {
     const mine = ownerOf(signer);
     if (mine !== undefined && authors.has(mine)) reject("same-owner", "cannot review your owner's work");
     if (existing.some((r) => r.reviewer === signer)) reject("duplicate-commit", "already committed");
+    // Commitments bind the reviewer (review.commitmentFor), so a copy could
+    // never be revealed; refusing it also keeps a copier from holding a seat.
+    if (existing.some((r) => r.commitment === commitment)) reject("duplicate-commit", "that commitment is already posted");
     if (existing.some((r) => ownerOf(r.reviewer) === mine)) {
       reject("duplicate-commit", "another agent of this owner already committed");
     }
@@ -983,20 +1333,57 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     existing: ReviewState[],
     verdict: ReviewVerdict,
     salt: string,
-    targetsHere: (findingId: string) => boolean,
+    subject: CommitSubject,
   ): ReviewState {
     const review = existing.find((r) => r.reviewer === signer) ?? reject("no-commit", "no earlier commit by signer");
     if (review.verdict) reject("already-revealed", "already revealed");
-    const problem = verdictProblem(verdict);
-    if (problem) reject("invalid-verdict", problem);
-    if (sha256hex(canonical(verdict) + salt) !== review.commitment) {
+    const problems = verdictProblems(verdict);
+    if (problems.length > 0) reject("invalid-verdict", problems.join("; "));
+    if (commitmentFor(verdict, salt, signer, subject) !== review.commitment) {
       reject("commitment-mismatch", "verdict and salt do not match the commitment");
     }
+    // finding() refuses an unknown id (unknown-ref) before the target rule.
     for (const fid of verdict.findingIds) {
-      if (!targetsHere(fid)) reject("invalid-target", `finding ${fid} does not target this review's subject`);
+      const problem = citedFindingProblems((f) => finding(f).target, [fid], subject)[0];
+      if (problem !== undefined) reject("invalid-target", problem);
     }
     return review;
   }
+}
+
+const settlementKey = (b: { owner: OwnerId; reason: string; ref: string }) => `${b.owner}\u0000${b.reason}\u0000${b.ref}`;
+const settledKeyCache = new WeakMap<CommonsState, Set<string>>();
+
+// The settled (owner, reason, ref) keys, cached per state object and rebuilt
+// whenever it no longer matches state.settlements (a clone, a hand-built state).
+function settledKeys(state: CommonsState): Set<string> {
+  let keys = settledKeyCache.get(state);
+  if (!keys || keys.size !== state.settlements.length) {
+    keys = new Set(state.settlements.map(settlementKey));
+    settledKeyCache.set(state, keys);
+  }
+  return keys;
+}
+
+// Why review commits on the submission are closed at `atMs`, or null while
+// they are open. The ledger's reviewCommit rule; the server's assignment list
+// asks the same. Commits close at the end of the commit phase (commitHours
+// after the assignment), at the first reveal (which the commit phase holds
+// back until every assigned reviewer committed or the phase ended), at a plant
+// reveal, or while a reproduction nobody dismissed stands: a later commit
+// could copy the answer.
+export function reviewCommitsClosedBy(state: CommonsState, submissionId: string, atMs: number): string | null {
+  const s = state.submissions.get(submissionId);
+  if (!s) return "no such submission";
+  if (s.merged) return "the submission merged";
+  if (s.assignment && atMs >= commitDeadlineMs(state.rules, s.assignment.at)) return "the commit phase ended";
+  if (s.reviews.some((r) => r.verdict)) return "a review was revealed";
+  if (s.planted) return "the plant was revealed";
+  const open = s.findingIds.some((fid) => {
+    const f = state.findings.get(fid);
+    return f !== undefined && isReproducedOpen(f);
+  });
+  return open ? "a finding on it reproduced" : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,14 +1413,66 @@ export class Ledger {
   }
 
   // Replays and validates every line; a corrupt, truncated or tampered file throws.
+  // Drops an unterminated last line (a write interrupted by a crash or a full
+  // disk), under the lock, and only when everything before it replays: a
+  // complete entry is never dropped, and a file damaged anywhere else is left
+  // alone (it throws). Returns the number of bytes dropped (0: nothing torn).
+  static repair(path: string): number {
+    return withFileLock(path, () => {
+      const text = fs.readFileSync(path, "utf8");
+      if (text.endsWith("\n")) return 0;
+      const keep = text.lastIndexOf("\n") + 1;
+      if (keep === 0) throw new LedgerError("torn", "no complete entry before the torn line; not a ledger to repair");
+      replay(parseLines(text.slice(0, keep)));
+      const bytes = Buffer.byteLength(text.slice(0, keep));
+      fs.truncateSync(path, bytes);
+      return Buffer.byteLength(text) - bytes;
+    });
+  }
+
   static open(path: string): Ledger {
-    const text = fs.readFileSync(path, "utf8");
+    const text = withFileLock(path, () => fs.readFileSync(path, "utf8"), LOCK_WAIT_STEPS, true);
     const entries = parseLines(text);
     return new Ledger(path, entries, replay(entries), Buffer.byteLength(text));
   }
 
   entries(): readonly LedgerEntry[] {
     return this.list;
+  }
+
+  // Catches up with entries another writer appended to the file since this
+  // instance read it (an operator's local `commons task`, say, while `serve`
+  // holds the ledger). The file must extend what this instance holds; a
+  // rewritten, truncated or torn file throws and leaves this instance as it
+  // was. Returns whether anything was read. Writers in other processes are
+  // serialised by the file lock (withFileLock): a write signed against an old
+  // head fails as stale and is re-signed against the new one, and two writers
+  // never both append the same seq.
+  refresh(): boolean {
+    const text = withFileLock(this.path, () => {
+      let size: number;
+      try {
+        size = fs.statSync(this.path).size;
+      } catch {
+        throw new LedgerError("stale", `${this.path} is gone`);
+      }
+      return size === this.bytes ? null : fs.readFileSync(this.path, "utf8");
+    }, LOCK_WAIT_STEPS, true);
+    if (text === null) return false;
+    const entries = parseLines(text);
+    const known = this.list.length;
+    if (entries.length < known || entries[known - 1]?.hash !== this.list[known - 1]?.hash) {
+      throw new LedgerError("stale", `${this.path} no longer extends the ledger this process read`);
+    }
+    try {
+      for (let i = known; i < entries.length; i++) applyEntry(this.current, entries[i] as LedgerEntry);
+    } catch (e) {
+      this.current = replay(this.list);
+      throw e;
+    }
+    this.list = entries;
+    this.bytes = Buffer.byteLength(text);
+    return true;
   }
 
   state(): CommonsState {
@@ -1065,7 +1504,13 @@ export class Ledger {
     return this.write(entry);
   }
 
+  // The size check, the validation and the append happen under the file
+  // lock, so no other process can append between them.
   private write(entry: LedgerEntry): LedgerEntry {
+    return withFileLock(this.path, () => this.writeLocked(entry));
+  }
+
+  private writeLocked(entry: LedgerEntry): LedgerEntry {
     if (!fs.existsSync(this.path) || fs.statSync(this.path).size !== this.bytes) {
       throw new LedgerError("stale", `${this.path} changed on disk since it was opened`);
     }
@@ -1082,6 +1527,15 @@ export class Ledger {
       fs.appendFileSync(this.path, line);
     } catch (e) {
       this.current = replay(this.list); // the write failed: undo the in-memory apply
+      // A write that failed part way (ENOSPC) left an unterminated fragment,
+      // and every later read would refuse the file as torn. Still holding the
+      // lock, cut the file back to what was read. If even that fails, the
+      // fragment stays: see `Ledger.repair`.
+      try {
+        fs.truncateSync(this.path, this.bytes);
+      } catch {
+        // reported by the next read as "torn"
+      }
       throw e;
     }
     this.list.push(stored);
@@ -1090,9 +1544,97 @@ export class Ledger {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process lock. Every process that touches the ledger file (serve, the
+// coordinator loop, a local `commons approve` or `task`) goes through a Ledger
+// instance, and every Ledger reads and appends only while it holds
+// `<ledger>.lock`. Without it two processes can both see the file unchanged
+// and both append, leaving two entries with one seq: a ledger no replay
+// accepts. The lock is taken atomically (a hard link to a file that already
+// holds our pid), held for one synchronous read or write, then removed. A lock
+// whose pid no longer runs was left by a crash and is broken. Same host only
+// (pids, not hosts), which is how the coordinator runs; a ledger shared over a
+// network filesystem by several hosts is not supported.
+// ---------------------------------------------------------------------------
+
+export const LOCK_WAIT_STEPS = 2000; // x LOCK_STEP_MS: about 10 s, then "locked"
+const LOCK_STEP_MS = 5;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+
+export const lockPathOf = (ledgerPath: string): string => `${ledgerPath}.lock`;
+
+// `forRead`: a reader that cannot create files next to the ledger (a
+// read-only mount, another user's directory) reads without the lock; it can
+// corrupt nothing, and at worst meets a half-written last line ("torn").
+export function withFileLock<T>(ledgerPath: string, fn: () => T, waitSteps = LOCK_WAIT_STEPS, forRead = false): T {
+  const lock = lockPathOf(ledgerPath);
+  const mine = `${lock}.${process.pid}`;
+  try {
+    fs.writeFileSync(mine, String(process.pid));
+  } catch (e) {
+    if (forRead && ["EACCES", "EPERM", "EROFS"].includes((e as NodeJS.ErrnoException).code ?? "")) return fn();
+    throw e;
+  }
+  try {
+    for (let step = 0; ; step++) {
+      try {
+        fs.linkSync(mine, lock); // atomic: fails while anyone holds the lock
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      }
+      breakIfStale(lock);
+      if (step >= waitSteps) {
+        throw new LedgerError("locked", `${lock} is held by another process; if none is running, remove it`);
+      }
+      Atomics.wait(sleeper, 0, 0, LOCK_STEP_MS); // a synchronous sleep, no clock read
+    }
+  } finally {
+    fs.rmSync(mine, { force: true });
+  }
+  try {
+    return fn();
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+}
+
+// Removes the lock if the pid in it no longer runs. It re-reads the file just
+// before removing it, so a lock a live writer took meanwhile is left alone
+// (two processes breaking one crashed writer's lock in the same microsecond
+// remain a theoretical race).
+function breakIfStale(lock: string): void {
+  const holder = readLockPid(lock);
+  if (holder === null || pidRuns(holder)) return;
+  if (readLockPid(lock) === holder) fs.rmSync(lock, { force: true });
+}
+
+function readLockPid(lock: string): number | null {
+  try {
+    const pid = Number(fs.readFileSync(lock, "utf8"));
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function pidRuns(pid: number): boolean {
+  // Ledger calls are synchronous, so this thread never meets a lock it holds:
+  // one with our own pid is a leftover.
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM"; // it runs, as another user
+  }
+}
+
 export function parseLines(text: string): LedgerEntry[] {
   if (text === "") throw new LedgerError("genesis", "empty ledger file");
-  if (!text.endsWith("\n")) throw new LedgerError("torn", "last line is not terminated (interrupted write?)");
+  if (!text.endsWith("\n")) {
+    throw new LedgerError("torn", "last line is not terminated (interrupted write?); `commons ledger repair` drops it once the rest replays");
+  }
   return text
     .slice(0, -1)
     .split("\n")

@@ -3,17 +3,50 @@
 // A review is a probability that the change holds a defect of severity >=
 // medium, committed blind (commitmentFor) and revealed later. Reviewers are
 // scored with the Brier score against what later became known about the
-// change: a reproduced finding or a revealed plant of severity >= medium says
+// change: a confirmed finding (findingStatus.ts) or a revealed plant of severity >= medium says
 // it was defective; shipping to main and surviving the vesting tail without
 // such a defect says it was clean. Anything else is unknown and scores nothing.
 
 import { canonical, sha256hex } from "./crypto";
+import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
 import { instantMs, plantStats, reviewWindowCloseSeq } from "./plants";
-import type { CommonsState, KeyId, ReviewVerdict, Severity, SnapshotState, SubmissionState } from "./types";
+import type { CommonsState, FindingState, KeyId, ReviewVerdict, Severity, SnapshotState, SubmissionState } from "./types";
 
-// The ledger checks reveals against exactly this.
-export function commitmentFor(verdict: ReviewVerdict, salt: string): string {
-  return sha256hex(canonical(verdict) + salt);
+// What a review or attestation commits to: a submission or a snapshot.
+export type CommitSubject = { submissionId: string } | { snapshotId: string };
+
+// The ledger checks reveals against exactly this. It binds the reviewer and the
+// subject as well as the verdict: commitments are public, so one that bound
+// only the verdict could be posted again by another agent and, once the
+// original was revealed, revealed as that agent's own review (a seat filled,
+// a clean-review reward and a Brier score earned, with no review done).
+export function commitmentFor(verdict: ReviewVerdict, salt: string, reviewer: KeyId, subject: CommitSubject): string {
+  return sha256hex(canonical({ verdict, salt, reviewer, subject }));
+}
+
+// What falseFindingPenalty charges and the false-finding rate counts; defined
+// with the other finding standings in findingStatus.ts.
+export { isFalseFinding } from "./findingStatus";
+
+// The reviewer-draw beacon of a reviewAssignment; the ledger recomputes it from
+// the entry and refuses a mismatch, and selection.ts draws from it. It binds
+// the draw to this exact change (submission id and declared head commit) and
+// to entropy the coordinator does not choose: the public randomness round
+// fixed by rule (docs/protocol.md §5.6). It deliberately leaves out anything
+// the coordinator or admin can still change between the submission and the
+// draw, since each such input is a choice of beacon:
+// - the ledger head: the coordinator decides what it is, so a head-bound
+//   beacon could be ground by reordering or padding its own entries;
+// - the member tree's digest: an owner admitted after the submission changes
+//   it, while it cannot change the draw (it has no agent in the pool, which
+//   is fixed at the submission, and a new leaf moves no existing distance).
+//   With the digest in the beacon, the admin could try owner ids offline
+//   against a public round and admit the one that seats friendly reviewers,
+//   and the coordinator could pick a beacon by drawing before or after a
+//   pending admission. The entry still records the digest, and the ledger
+//   checks it against the member tree before the entry.
+export function assignmentBeacon(submissionId: string, headCommit: string, entropy: string): string {
+  return sha256hex(canonical({ submission: submissionId, head: headCommit, entropy }));
 }
 
 const VERDICT_FIELDS = ["defectProbability", "summary", "findingIds"];
@@ -106,7 +139,8 @@ function outcomeIndex(state: CommonsState): OutcomeIndex {
   const unpinned = new Set<string>();
   const walked = new Set<string>();
   for (const f of state.findings.values()) {
-    if (!("snapshotId" in f.target) || f.result?.reproduced !== true || !COUNTS[f.severity]) continue;
+    // Undecided counts here too: until an operator dismisses it, it may be a defect.
+    if (!("snapshotId" in f.target) || !isReproducedOpen(f) || !COUNTS[f.severity]) continue;
     for (let cur = state.snapshots.get(f.target.snapshotId); cur && !walked.has(cur.id); ) {
       walked.add(cur.id);
       for (const sid of cur.submissionIds) unpinned.add(sid);
@@ -121,7 +155,7 @@ function outcomeWith(state: CommonsState, index: OutcomeIndex, s: SubmissionStat
   if (s.planted && COUNTS[s.planted.severity]) return 1;
   for (const fid of s.findingIds) {
     const f = state.findings.get(fid);
-    if (f?.result?.reproduced === true && COUNTS[f.severity]) return 1;
+    if (f !== undefined && isConfirmedDefect(f) && COUNTS[f.severity]) return 1;
   }
   const shipped = index.shippedAt.get(s.id);
   if (shipped === undefined || shipped + state.rules.vesting.tailDays * DAY_MS > now) return null;
@@ -134,7 +168,7 @@ function parseNow(nowIso: string): number {
   return now;
 }
 
-// 1: a reproduced finding of severity >= medium targets the submission, or it
+// 1: a confirmed finding of severity >= medium targets the submission, or it
 // is a revealed plant of severity >= medium.
 // 0: it shipped (its snapshot, or a later one, was promoted) at least
 // rules.vesting.tailDays before nowIso, and no reproduced snapshot-level

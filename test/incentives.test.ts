@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { canonical, generateKeyPair, keyIdOf, sha256hex } from "../src/crypto";
-import { applyEntry, emptyState, genesisEntry, signEntry, type LedgerState, type Signer } from "../src/ledger";
-import { claimStake as rulesClaimStake, defaultRules } from "../src/rules";
-import { treeFromParents } from "../src/tree";
+import { applyEntry, emptyState, genesisEntry, signEntry, submissionDead, type LedgerState, type Signer } from "../src/ledger";
+import { claimStake as rulesClaimStake, defaultRules, phase1Rules } from "../src/rules";
+import { memberTree } from "../src/members";
 import {
   apportion,
   claimStake,
@@ -20,38 +20,34 @@ import {
   type SettlementBody,
 } from "../src/incentives";
 import type { EntryBody, OwnerId, ReviewVerdict, Rules, Severity } from "../src/types";
+import { assignmentBody } from "../src/selection";
+import { commitmentFor } from "../src/review";
+import { plantCaught, plantCaughtBy, reviewWindowCloseSeq } from "../src/plants";
 
 // ---------------------------------------------------------------------------
 // Fixture: a real, signed, in-memory ledger. Settlements are applied through
 // the ledger too, so every body incentives returns must be one it accepts.
 //
-// Tree (distances from alice): amy 2 (her friend, within minTreeDistance 2),
-// bob, dave 4 and carol, eve 4. ivy invited alice and carol.
+// The member tree comes from the ownerKey entries: ivy invited alice and
+// carol, alice invited amy, everyone else came in with no inviter. The
+// fixture's rules set minTreeDistance 1, so only an inviter and its invitee
+// are too close: from alice, amy and ivy are at distance 1 (her friends),
+// carol 2, and bob, dave, eve and ghost 3.
 // ---------------------------------------------------------------------------
 
 const T0 = Date.UTC(2026, 0, 1);
 const DAY_MIN = 24 * 60;
 const iso = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString();
 
-const tree = treeFromParents({
-  root: null,
-  x: "root",
-  y: "root",
-  z: "root",
-  alice: "x",
-  amy: "x",
-  bob: "y",
-  dave: "y",
-  carol: "z",
-  eve: "z",
-  ivy: "root",
-  // ghost is a ledger owner who is not in the tree.
-});
+// defaultRules() but for minTreeDistance (see above).
+function fixtureRules(): Rules {
+  return { ...defaultRules(), minTreeDistance: 1 };
+}
 
 const OWNERS: [OwnerId, OwnerId | null][] = [
   ["ivy", null],
   ["alice", "ivy"],
-  ["amy", null],
+  ["amy", "alice"],
   ["bob", null],
   ["carol", "ivy"],
   ["dave", null],
@@ -78,10 +74,10 @@ class World {
   minute = 0;
   state: LedgerState;
 
-  constructor(rules: Rules = defaultRules()) {
+  constructor(rules: Rules = fixtureRules()) {
     this.state = emptyState(
       genesisEntry(
-        { kind: "genesis", project: "anthill", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules },
+        { kind: "genesis", project: "demo", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules },
         iso(0),
       ),
     );
@@ -119,6 +115,16 @@ class World {
     this.minute += days * DAY_MIN;
   }
 
+  // A submission for its own task (proposal, task and claim made here): the
+  // kind of merge that earns tranches. The author proposed it, so no cut.
+  submitTask(id: string, agent = "a1"): void {
+    const task = `t-${id}`;
+    this.apply({ kind: "proposal", id: `p-${id}`, title: "t", evidence: [{ kind: "location", file: "src/x.ts", line: 1, note: "n" }] }, this.key(agent));
+    this.apply({ kind: "task", id: task, proposalId: `p-${id}`, ring: 1, acceptanceTestPaths: ["test/t.test.ts"], sizeEstimate: 10, specAuthor: "bob" }, this.coord);
+    this.apply({ kind: "claim", taskId: task, until: iso(this.minute + 600), stake: 5 }, this.key(agent));
+    this.submit(id, agent, task);
+  }
+
   submit(id: string, agent = "a1", taskId: string | null = null): void {
     this.apply(
       { kind: "submission", id, taskId, baseCommit: `base-${id}`, headCommit: `head-${id}`, changedFiles: ["src/x.ts"], linesChanged: 10 },
@@ -127,17 +133,30 @@ class World {
   }
 
   assign(sid: string, agents: string[]): void {
-    this.apply({ kind: "reviewAssignment", submissionId: sid, beacon: "b", reviewers: agents.map((a) => this.id(a)) }, this.coord);
+    this.apply(assignmentBody(this.state, sid, agents.map((a) => this.id(a)), "e"), this.coord);
   }
 
   // Commits close once any verdict is revealed, so commit everyone first.
+  // Reveals wait for the commit phase: every assigned reviewer committed, or
+  // the phase's deadline passed (then time moves past it). Without an
+  // assignment the reviewers given are the assigned ones.
   reviews(sid: string, ps: Record<string, number>): void {
+    if (!this.state.submissions.get(sid)?.assignment) this.assign(sid, Object.keys(ps));
     for (const [agent, p] of Object.entries(ps)) this.commit(sid, agent, p);
+    this.endCommitPhase(sid);
     for (const [agent, p] of Object.entries(ps)) this.reveal(sid, agent, p);
   }
 
+  // Moves time past the commit deadline unless every assigned reviewer committed.
+  endCommitPhase(sid: string): void {
+    const s = this.state.submissions.get(sid);
+    if (!s?.assignment) return;
+    const all = s.assignment.reviewers.every((k) => s.reviews.some((r) => r.reviewer === k));
+    if (!all) this.minute = Math.max(this.minute, (Date.parse(s.assignment.at ?? "") - T0) / 60_000 + this.state.rules.review.commitHours * 60);
+  }
+
   commit(sid: string, agent: string, p: number): void {
-    this.apply({ kind: "reviewCommit", submissionId: sid, commitment: sha256hex(canonical(verdictOf(p)) + `salt-${agent}`), stake: 5 }, this.key(agent));
+    this.apply({ kind: "reviewCommit", submissionId: sid, commitment: commitmentFor(verdictOf(p), `salt-${agent}`, this.id(agent), { submissionId: sid }), stake: 5 }, this.key(agent));
   }
 
   reveal(sid: string, agent: string, p: number): void {
@@ -146,8 +165,11 @@ class World {
 
   attest(snapshotId: string, ps: Record<string, number>): void {
     for (const [agent, p] of Object.entries(ps)) {
-      this.apply({ kind: "attestCommit", snapshotId, commitment: sha256hex(canonical(verdictOf(p)) + `asalt-${agent}`), stake: 5 }, this.key(agent));
+      this.apply({ kind: "attestCommit", snapshotId, commitment: commitmentFor(verdictOf(p), `asalt-${agent}`, this.id(agent), { snapshotId }), stake: 5 }, this.key(agent));
     }
+    // Attestation reveals wait for the end of the snapshot's commit phase.
+    const at = this.state.snapshots.get(snapshotId)?.at ?? "";
+    this.minute = Math.max(this.minute, (Date.parse(at) - T0) / 60_000 + this.state.rules.review.commitHours * 60);
     for (const [agent, p] of Object.entries(ps)) {
       this.apply({ kind: "attestReveal", snapshotId, verdict: verdictOf(p), salt: `asalt-${agent}` }, this.key(agent));
     }
@@ -157,15 +179,26 @@ class World {
     this.apply({ kind: "finding", id, target, severity, testPath: `test/${id}.test.ts`, testCommand: "npm test", stake: 5 }, this.key(agent));
   }
 
-  result(findingId: string, reproduced: boolean): void {
+  // A reproduced result is confirmed by the admin (a real defect) unless
+  // `decide` says otherwise: "dismiss", or "none" to leave it undecided.
+  result(findingId: string, reproduced: boolean, decide: "confirm" | "dismiss" | "none" = "confirm"): void {
     this.apply(
       { kind: "findingResult", findingId, reproduced, failsOnHead: reproduced, passesOnParent: true, logDigest: "d" },
       this.coord,
     );
+    if (reproduced && decide !== "none") this.decide(findingId, decide === "confirm");
   }
 
+  decide(findingId: string, confirmed: boolean): void {
+    this.apply({ kind: "findingDecision", findingId, confirmed, reason: confirmed ? "a real defect" : "tests the intended change" }, this.admin);
+  }
+
+  // The ledger merges nothing unassigned: without an assignment, eve's agent
+  // (or bob's, for eve's own work) is drawn.
   merge(sid: string): void {
     this.apply({ kind: "gateResult", submissionId: sid, gate: "test", pass: true, details: "" }, this.coord);
+    const s = this.state.submissions.get(sid);
+    if (s && !s.assignment) this.assign(sid, [this.state.agents.get(s.author)?.owner === "eve" ? "b1" : "e1"]);
     this.apply({ kind: "merge", submissionId: sid, commit: `m-${sid}` }, this.coord);
   }
 
@@ -295,6 +328,7 @@ test("submitCredits: one starter credit, one per two revealed reviews, minus sub
   w.reviews("s1", { b1: 0.1 });
   assert.equal(submitCredits(w.state, "bob"), 1); // one review is half a credit
   // An unrevealed commit earns nothing.
+  w.assign("s2", ["b1"]);
   w.commit("s2", "b1", 0.3);
   assert.equal(submitCredits(w.state, "bob"), 1);
   w.reveal("s2", "b1", 0.3);
@@ -302,11 +336,33 @@ test("submitCredits: one starter credit, one per two revealed reviews, minus sub
   assert.equal(submitCredits(w.state, "nobody"), 1);
 });
 
+test("submitCredits: under phase1Rules, gate failures do not freeze a three-owner group", () => {
+  // Only alice, bob and carol take part; each starts with one credit.
+  const w = new World(phase1Rules());
+  const owners = ["alice", "bob", "carol"];
+  const fail = (sid: string, agent: string) => {
+    w.submit(sid, agent);
+    w.apply({ kind: "gateResult", submissionId: sid, gate: "size", pass: false, details: "too big" }, w.coord);
+  };
+  fail("s1", "a1"); // no assignment follows a failed gate, so nobody earns
+  fail("s2", "c1");
+  w.submit("s3", "b1");
+  w.reviews("s3", { a1: 0.1, c1: 0.1 }); // the two assigned seats
+  assert.ok(owners.some((o) => submitCredits(w.state, o) >= 1), "someone can still submit");
+  // The supply grows with every reviewed submission instead of only shrinking.
+  const total = () => owners.reduce((n, o) => n + submitCredits(w.state, o), 0);
+  const before = total();
+  w.submit("s4", "a1");
+  w.reviews("s4", { b1: 0.1, c1: 0.1 });
+  assert.equal(total(), before + 1);
+});
+
 test("submitCredits: a reveal held back until after the merge earns no credit", () => {
   const w = new World();
   w.submit("s1");
   w.submit("s2");
   w.reviews("s1", { b1: 0.1 });
+  w.assign("s2", ["b1"]);
   w.commit("s2", "b1", 0.1);
   w.merge("s2");
   w.reveal("s2", "b1", 0.1);
@@ -323,9 +379,9 @@ test("submitCredits: a reveal held back until after the merge earns no credit", 
 test("reproduced finding: stranger paid, author and approvers slashed by confidence, inviter charged per invitee", () => {
   const w = reviewedSubmission({ b1: 0.1, c1: 0.2, d1: 1 });
   w.file("f1", { submissionId: "s1" }, "critical", "e1");
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), [], "no result yet");
+  assert.deepEqual(settleFinding(w.state, "f1", "main"), [], "no result yet");
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "main");
+  const bodies = settleFinding(w.state, "f1", "main");
   assertWellFormed(bodies);
   // Settled at bounty.low (5) whatever severity was declared; main stage: 5 x 4 = 20.
   assert.deepEqual(
@@ -346,7 +402,7 @@ test("reproduced finding: stranger paid, author and approvers slashed by confide
   );
   assert.ok(bodies.filter((b) => b.owner !== "ivy").every((b) => b.ref === "finding:f1"));
   w.settle(bodies);
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), []);
+  assert.deepEqual(settleFinding(w.state, "f1", "main"), []);
 });
 
 test("severity is the finder's claim: one bug filed at four severities pays one low bounty and slashes once", () => {
@@ -354,7 +410,7 @@ test("severity is the finder's claim: one bug filed at four severities pays one 
   const sev: Severity[] = ["low", "medium", "high", "critical"];
   sev.forEach((s, i) => w.file(`f${i}`, { submissionId: "s1" }, s, "e1"));
   sev.forEach((_, i) => w.result(`f${i}`, true));
-  const all = sev.flatMap((_, i) => settleFinding(w.state, tree, `f${i}`, "dev"));
+  const all = sev.flatMap((_, i) => settleFinding(w.state, `f${i}`, "dev"));
   assertWellFormed(all);
   assert.equal(total(all, "bounty"), 5, "one bounty.low, split by rank");
   assert.deepEqual(
@@ -371,21 +427,25 @@ test("farming: the author's friend within minTreeDistance earns 0, the author st
   const w = reviewedSubmission({ b1: 0.1 });
   w.file("f1", { submissionId: "s1" }, "high", "m1");
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "dev");
-  assert.equal(tree.distance("amy", "alice"), 2);
+  const bodies = settleFinding(w.state, "f1", "dev");
+  assert.equal(memberTree(w.state).distance("amy", "alice"), 1);
   assert.ok(!bodies.some((b) => b.owner === "amy"), "no bounty body for amy");
   assert.deepEqual(summary(bodies).filter((s) => s.startsWith("alice")), ["alice authorSlash -5"]);
   w.settle(bodies);
   assert.equal(w.rep("alice") + w.rep("amy"), -5);
 });
 
-test("a finder who is not in the tree earns nothing: unknown distance is not distance", () => {
+test("a finder outside the tree (only a corrupt, hand-built state) stops the settlement: no distance is guessed", () => {
   const w = reviewedSubmission({ b1: 0.5 });
   w.file("f1", { submissionId: "s1" }, "low", "g1");
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "dev");
-  assert.ok(!bodies.some((b) => b.owner === "ghost"));
-  assert.equal(get(bodies, "alice", "authorSlash"), -5);
+  // Every ledger owner is in the member tree; only a hand-built state can
+  // hold an agent whose owner is not.
+  const st = structuredClone(w.state);
+  st.owners.delete("ghost");
+  assert.throws(() => settleFinding(st, "f1", "dev"), /unknown member ghost/);
+  // The replayed state settles normally.
+  assert.equal(get(settleFinding(w.state, "f1", "dev"), "alice", "authorSlash"), -5);
 });
 
 test("stage multipliers raise the author and approver slash, never the bounty", () => {
@@ -398,7 +458,7 @@ test("stage multipliers raise the author and approver slash, never the bounty", 
     const w = reviewedSubmission({ c1: 0.2 });
     w.file("f1", { submissionId: "s1" }, "medium", "b1");
     w.result("f1", true);
-    const bodies = settleFinding(w.state, tree, "f1", stage);
+    const bodies = settleFinding(w.state, "f1", stage);
     assert.equal(get(bodies, "bob", "bounty"), 5, stage);
     assert.equal(get(bodies, "alice", "authorSlash"), author, stage);
     assert.equal(get(bodies, "carol", "approverSlash"), approver, stage);
@@ -411,7 +471,7 @@ test("author slash floor: with a multiplier that rounds below the bounty, the au
   w.state.rules.rewards.stageMultiplier.dev = 0.5; // round(5 * .5) = 3 < 5
   w.file("f1", { submissionId: "s1" }, "low", "e1");
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "dev");
+  const bodies = settleFinding(w.state, "f1", "dev");
   const slash = -(get(bodies, "alice", "authorSlash") ?? 0);
   assert.equal(total(bodies, "bounty"), 5);
   assert.equal(slash, 5, "max(round(bounty x stage), bounty)");
@@ -425,28 +485,28 @@ test("duplicates filed before the first result share one bounty by rank; slashes
   w.file("f2", { submissionId: "s1" }, "high", "e1"); // a different declared severity is still the same class
   w.result("f1", true);
   // f2 has no result yet. f1's share and the slashes do not wait for it.
-  const b1 = settleFinding(w.state, tree, "f1", "dev");
+  const b1 = settleFinding(w.state, "f1", "dev");
   assertWellFormed(b1);
   // shares of 5 by apportion([1, .9] / 1.9): 3 and 2.
   assert.deepEqual(
     summary(b1),
     ["alice authorSlash -5", "bob bounty 3", "carol approverSlash -3", "ivy inviterSlash -1", "ivy inviterSlash -1"].sort(),
   );
-  assert.deepEqual(settleFinding(w.state, tree, "f2", "dev"), [], "no result yet");
+  assert.deepEqual(settleFinding(w.state, "f2", "dev"), [], "no result yet");
   w.settle(b1);
   w.result("f2", true);
-  const b2 = settleFinding(w.state, tree, "f2", "dev");
+  const b2 = settleFinding(w.state, "f2", "dev");
   assert.deepEqual(summary(b2), ["eve bounty 2"], "only the leader carries the slashes");
   assert.ok(b2.every((b) => b.ref === "finding:f2"));
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), [], "the leader's bodies are final");
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), [], "the leader's bodies are final");
 
   // Filed after the first result: the reproduction was public. Not paid, slashes nobody.
   w.file("f3", { submissionId: "s1" }, "low", "d1");
   w.result("f3", true);
-  assert.deepEqual(settleFinding(w.state, tree, "f3", "dev"), []);
+  assert.deepEqual(settleFinding(w.state, "f3", "dev"), []);
 
   w.settle(b2);
-  for (const f of ["f1", "f2", "f3"]) assert.deepEqual(settleFinding(w.state, tree, f, "dev"), [], f);
+  for (const f of ["f1", "f2", "f3"]) assert.deepEqual(settleFinding(w.state, f, "dev"), [], f);
   assert.equal(w.rep("bob") + w.rep("eve"), 5);
 });
 
@@ -457,7 +517,7 @@ test("a duplicate that never gets a result does not freeze the settlement; the a
   w.file("f1", { submissionId: "s1" }, "critical", "m1");
   w.file("f2", { submissionId: "s1" }, "critical", "e1");
   w.result("f2", true);
-  const bodies = settleFinding(w.state, tree, "f2", "dev");
+  const bodies = settleFinding(w.state, "f2", "dev");
   assertWellFormed(bodies);
   assert.equal(get(bodies, "alice", "authorSlash"), -5);
   assert.equal(get(bodies, "bob", "approverSlash"), -5); // round(4.5)
@@ -472,7 +532,7 @@ test("an earlier finding already resolved false is not a duplicate; one resolved
   w.file("f1", { submissionId: "s1" }, "medium", "b1");
   w.result("f0", false);
   w.result("f1", true);
-  assert.equal(get(settleFinding(w.state, tree, "f1", "dev"), "bob", "bounty"), 5);
+  assert.equal(get(settleFinding(w.state, "f1", "dev"), "bob", "bounty"), 5);
   assert.deepEqual(summary(settleFalseFinding(w.state, "f0")), ["dave falseFinding -5"]);
 
   const v = reviewedSubmission({ c1: 0.4 });
@@ -480,14 +540,14 @@ test("an earlier finding already resolved false is not a duplicate; one resolved
   v.file("f1", { submissionId: "s1" }, "medium", "b1");
   v.result("f1", true);
   v.result("f0", false); // known only after the class formed: its share stays unpaid
-  assert.equal(get(settleFinding(v.state, tree, "f1", "dev"), "bob", "bounty"), 2);
+  assert.equal(get(settleFinding(v.state, "f1", "dev"), "bob", "bounty"), 2);
 });
 
 test("duplicate shares never sum past the bounty, at decay 1 and 0.9, for 2 to 5 finders", () => {
   const finders = ["b1", "c1", "d1", "e1", "e2"];
   for (const decay of [1, 0.9]) {
     for (let n = 2; n <= 5; n++) {
-      const rules = defaultRules();
+      const rules = fixtureRules();
       rules.rewards.duplicateDecay = decay;
       rules.rewards.bounty.low = 15; // odd, so equal halves would round up
       const w = new World(rules);
@@ -495,7 +555,7 @@ test("duplicate shares never sum past the bounty, at decay 1 and 0.9, for 2 to 5
       w.submit("s1");
       for (let i = 0; i < n; i++) w.file(`f${i}`, { submissionId: "s1" }, "low", finders[i] as string);
       for (let i = 0; i < n; i++) w.result(`f${i}`, true);
-      const all = Array.from({ length: n }, (_, i) => settleFinding(w.state, tree, `f${i}`, "dev")).flat();
+      const all = Array.from({ length: n }, (_, i) => settleFinding(w.state, `f${i}`, "dev")).flat();
       assertWellFormed(all);
       assert.equal(total(all, "bounty"), 15, `decay ${decay} n ${n}`);
       assert.equal(get(all, "alice", "authorSlash"), -15);
@@ -512,7 +572,7 @@ test("same-owner duplicates cannot farm: two agents' shares sum to one bounty", 
   w.file("f2", { submissionId: "s1" }, "medium", "e2");
   w.result("f1", true);
   w.result("f2", true);
-  const all = [...settleFinding(w.state, tree, "f1", "dev"), ...settleFinding(w.state, tree, "f2", "dev")];
+  const all = [...settleFinding(w.state, "f1", "dev"), ...settleFinding(w.state, "f2", "dev")];
   w.settle(all);
   assert.equal(w.rep("eve"), 5);
 });
@@ -529,7 +589,7 @@ test("unrevealed or late reviews count as p = 0 once the submission merged", () 
   w.reveal("s1", "d1", 0.9);
   w.file("f1", { submissionId: "s1" }, "low", "e1");
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "dev");
+  const bodies = settleFinding(w.state, "f1", "dev");
   assertWellFormed(bodies);
   assert.equal(get(bodies, "bob", "approverSlash"), -3); // round(5 - 2.5)
   assert.equal(get(bodies, "carol", "approverSlash"), -5, "withheld reveal");
@@ -545,12 +605,48 @@ test("before merge, an unrevealed approver is settled when it reveals", () => {
   w.reveal("s1", "b1", 0.2);
   w.file("f1", { submissionId: "s1" }, "low", "e1");
   w.result("f1", true);
-  const first = settleFinding(w.state, tree, "f1", "dev");
+  const first = settleFinding(w.state, "f1", "dev");
   assert.equal(get(first, "bob", "approverSlash"), -4);
   assert.equal(get(first, "carol", "approverSlash"), undefined);
   w.settle(first);
   w.reveal("s1", "c1", 0.6);
-  assert.deepEqual(summary(settleFinding(w.state, tree, "f1", "dev")), ["carol approverSlash -2", "ivy inviterSlash -1"].sort());
+  assert.deepEqual(summary(settleFinding(w.state, "f1", "dev")), ["carol approverSlash -2", "ivy inviterSlash -1"].sort());
+});
+
+test("regression: tranche 3 and clean-review rewards wait while a finding has no result", () => {
+  const w = new World();
+  w.submitTask("s1");
+  w.reviews("s1", { b1: 0.1, c1: 0.1 });
+  w.merge("s1");
+  w.snapshot("S1", ["s1"]);
+  w.promote("S1");
+  w.advanceDays(w.state.rules.vesting.tailDays - 0.1);
+  w.file("f1", { submissionId: "s1" }, "low", "e1"); // filed just before the tail ends
+  w.advanceDays(0.2);
+  assert.deepEqual(settleMerge(w.state, "s1", 3, w.now()), [], "undecided is not clean");
+  assert.deepEqual(settleCleanReviews(w.state, "S1", w.now()), []);
+  w.result("f1", false); // judged: not reproduced
+  assert.equal(get(settleMerge(w.state, "s1", 3, w.now()), "alice", "mergeVest"), 10);
+  assert.equal(get(settleCleanReviews(w.state, "S1", w.now()), "bob", "cleanReview"), 2);
+});
+
+test("a review withheld on a submission with a confirmed defect counts as p = 0 after the reveal deadline", () => {
+  const w = new World();
+  w.submit("s1");
+  w.assign("s1", ["b1", "c1"]);
+  w.commit("s1", "b1", 0);
+  w.commit("s1", "c1", 0);
+  w.reveal("s1", "c1", 0);
+  w.file("f1", { submissionId: "s1" }, "low", "e1");
+  w.result("f1", true); // confirmed: s1 can never merge, its review stakes are released
+  assert.equal(w.state.owners.get("bob")?.lockedStake, 0);
+  // Before the deadline bob may still reveal and be judged on its own p.
+  assert.equal(get(settleFinding(w.state, "f1", "dev"), "bob", "approverSlash"), undefined);
+  w.settle(settleFinding(w.state, "f1", "dev"));
+  const assignedAt = Date.parse(w.state.submissions.get("s1")?.assignment?.at ?? "");
+  const late = new Date(assignedAt + 2 * w.state.rules.review.commitHours * 3_600_000).toISOString();
+  const bodies = settleFinding(w.state, "f1", "dev", late);
+  assert.deepEqual(summary(bodies), ["bob approverSlash -5"], "withholding costs what a confident clean reveal costs");
 });
 
 test("snapshot finding: author slash split across covered submissions, bounty capped at the smallest part; attesters are approvers", () => {
@@ -564,7 +660,7 @@ test("snapshot finding: author slash split across covered submissions, bounty ca
   w.attest("snapB", { d1: 0.5, e1: 0 });
   w.file("f1", { snapshotId: "snapB" }, "low", "c1");
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "release");
+  const bodies = settleFinding(w.state, "f1", "release");
   assertWellFormed(bodies);
   // slash = 5 * 2 = 10 over [s2, s3, s1] -> 4, 3, 3: alice (s2, s1) 7, bob (s3) 3.
   // pool = min(5, 3) = 3. dave attested p = .5: 10 - 5; eve p = 0: 10.
@@ -597,7 +693,7 @@ test("snapshot finding: a buggy author and a distant friend cannot net positive,
     const sev: Severity[] = ["low", "medium", "high", "critical"];
     sev.forEach((s, i) => w.file(`f${i}`, { snapshotId: "x1" }, s, "e1"));
     sev.forEach((_, i) => w.result(`f${i}`, true));
-    const all = sev.flatMap((_, i) => settleFinding(w.state, tree, `f${i}`, "release"));
+    const all = sev.flatMap((_, i) => settleFinding(w.state, `f${i}`, "release"));
     assertWellFormed(all);
     w.settle(all);
     assert.ok(w.rep("alice") + w.rep("eve") <= 0, `pair ${w.rep("alice") + w.rep("eve")} (${order.join(",")})`);
@@ -615,7 +711,7 @@ test("a snapshot finder within distance of any covered author earns nothing", ()
   w.snapshot("snap", ["s1", "s2"]);
   w.file("f1", { snapshotId: "snap" }, "medium", "m1"); // amy: far from bob, close to alice
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "release");
+  const bodies = settleFinding(w.state, "f1", "release");
   assert.ok(!bodies.some((b) => b.reason === "bounty"));
   assert.equal(total(bodies, "authorSlash"), -10);
 });
@@ -629,9 +725,9 @@ test("one bug filed against a submission and the snapshot that ships it is paid 
   w.file("f2", { snapshotId: "x1" }, "high", "e1");
   w.result("f2", true);
   w.result("f1", true);
-  const all = [...settleFinding(w.state, tree, "f1", "release"), ...settleFinding(w.state, tree, "f2", "release")];
+  const all = [...settleFinding(w.state, "f1", "release"), ...settleFinding(w.state, "f2", "release")];
   assertWellFormed(all);
-  assert.deepEqual(settleFinding(w.state, tree, "f2", "release"), [], "the submission finding names the culprit and wins");
+  assert.deepEqual(settleFinding(w.state, "f2", "release"), [], "the submission finding names the culprit and wins");
   w.settle(all);
   assert.equal(w.rep("eve"), 5);
   assert.equal(w.rep("alice"), -10);
@@ -648,8 +744,8 @@ test("one bug filed against a submission and the snapshot that ships it is paid 
   v.file("g2", { snapshotId: "x2" }, "low", "c1");
   v.result("g1", true);
   v.result("g2", true);
-  assert.ok(settleFinding(v.state, tree, "g1", "release").length > 0);
-  assert.deepEqual(settleFinding(v.state, tree, "g2", "release"), []);
+  assert.ok(settleFinding(v.state, "g1", "release").length > 0);
+  assert.deepEqual(settleFinding(v.state, "g2", "release"), []);
 });
 
 test("plant: a finding filed after the review window closed settles nothing", () => {
@@ -661,7 +757,7 @@ test("plant: a finding filed after the review window closed settles nothing", ()
   w.plantReveal("p1");
   w.file("f1", { submissionId: "p1" }, "medium", "e1"); // written from the published description
   w.result("f1", true);
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), []);
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), []);
 });
 
 test("plant: a blind finding settles as real work, custodian included, the same before and after the reveal", () => {
@@ -675,12 +771,12 @@ test("plant: a blind finding settles as real work, custodian included, the same 
   w.reveal("p1", "b1", 0.1);
   w.reveal("p1", "c1", 0.2);
   w.result("f1", true);
-  const before = settleFinding(w.state, tree, "f1", "dev");
+  const before = settleFinding(w.state, "f1", "dev");
   assertWellFormed(before);
   assert.equal(get(before, "eve", "bounty"), 5);
   assert.equal(get(before, "alice", "authorSlash"), -5, "the custodian pays, or it could feed its plants to a friend");
   w.plantReveal("p1");
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), before);
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), before);
 });
 
 test("false finding: finder pays the penalty, inviter pays a share; reproduced findings are not false", () => {
@@ -691,7 +787,7 @@ test("false finding: finder pays the penalty, inviter pays a share; reproduced f
   const bodies = settleFalseFinding(w.state, "f1");
   assert.deepEqual(summary(bodies), ["carol falseFinding -5", "ivy inviterSlash -1"].sort());
   assert.equal(bodies.find((b) => b.owner === "ivy")?.ref, "finding:f1:falseFinding:carol");
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), []);
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), []);
   w.settle(bodies);
   assert.deepEqual(settleFalseFinding(w.state, "f1"), []);
   assert.deepEqual(settleFalseFinding(w.state, "missing"), []);
@@ -705,16 +801,16 @@ test("idempotency: once applied to the ledger, every settlement returns []", () 
   const w = reviewedSubmission({ b1: 0.1, c1: 0.3 });
   w.file("f1", { submissionId: "s1" }, "critical", "e1");
   w.result("f1", true);
-  const first = settleFinding(w.state, tree, "f1", "main");
+  const first = settleFinding(w.state, "f1", "main");
   assert.ok(first.length > 2);
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), first, "pure: same answer before applying");
+  assert.deepEqual(settleFinding(w.state, "f1", "main"), first, "pure: same answer before applying");
   // Partial application (a crash mid-batch) leaves only the rest outstanding.
   w.settle(first.slice(0, 2));
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), first.slice(2));
+  assert.deepEqual(settleFinding(w.state, "f1", "main"), first.slice(2));
   w.settle(first.slice(2));
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), []);
+  assert.deepEqual(settleFinding(w.state, "f1", "main"), []);
   // A different stage asked later does not re-slash: the key is owner + reason + ref.
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), []);
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), []);
   assert.equal(w.rep("eve"), 5);
   assert.equal(w.rep("alice"), -20);
 });
@@ -756,10 +852,12 @@ test("proposer cut goes to an owner who signed the proposal with the owner key; 
   self.merge("s1");
   assert.deepEqual(summary(settleMerge(self.state, "s1", 1, self.now())), ["alice mergeVest 10"]);
 
+  // A taskless merge earns nothing at all: merge rewards come only from work
+  // someone asked for (a task), or whitespace edits would mint reputation.
   const none = new World();
   none.submit("s1");
   none.merge("s1");
-  assert.deepEqual(summary(settleMerge(none.state, "s1", 1, none.now())), ["alice mergeVest 10"]);
+  assert.deepEqual(settleMerge(none.state, "s1", 1, none.now()), []);
 });
 
 test("merge tranches 2 and 3 wait for promotion and the tail; tranche 3 needs a valid nowIso", () => {
@@ -786,7 +884,7 @@ test("merge tranches 2 and 3 wait for promotion and the tail; tranche 3 needs a 
 
 test("a snapshot shipped by a later promotion vests tranche 2", () => {
   const w = new World();
-  w.submit("s1");
+  w.submitTask("s1");
   w.submit("s2", "b1");
   w.merge("s1");
   w.merge("s2");
@@ -798,7 +896,7 @@ test("a snapshot shipped by a later promotion vests tranche 2", () => {
 
 test("a reproduced finding on a merged submission forfeits its unpaid tranches 2 and 3", () => {
   const w = new World();
-  w.submit("s1");
+  w.submitTask("s1");
   w.merge("s1");
   w.settle(settleMerge(w.state, "s1", 1, w.now()));
   w.snapshot("snap", ["s1"]);
@@ -812,7 +910,7 @@ test("a reproduced finding on a merged submission forfeits its unpaid tranches 2
 
 test("a snapshot finding names no culprit and voids no tranche (documented choice)", () => {
   const w = new World();
-  w.submit("s1");
+  w.submitTask("s1");
   w.merge("s1");
   w.snapshot("snap", ["s1"]);
   w.promote("snap");
@@ -825,7 +923,7 @@ test("a snapshot finding names no culprit and voids no tranche (documented choic
 test("a plant vests nothing, even one merged before its reveal", () => {
   const w = new World();
   w.plantCommit("p1");
-  w.submit("p1");
+  w.submitTask("p1");
   w.merge("p1");
   assert.equal(settleMerge(w.state, "p1", 1, w.now()).length, 1, "before the reveal it looks like real work");
   w.plantReveal("p1");
@@ -836,8 +934,8 @@ test("a plant vests nothing, even one merged before its reveal", () => {
 
 test("clean reviews: after the tail, reviewers of a clean shipped submission earn cleanReview x (1 - p^2)", () => {
   const w = new World();
-  w.submit("s1");
-  w.submit("s2");
+  w.submitTask("s1");
+  w.submitTask("s2");
   w.reviews("s1", { b1: 0.1, c1: 0.6, d1: 0.9, e1: 1 });
   // s2: bob reveals, dave commits and never reveals, a finding reproduces after merge.
   w.commit("s2", "d1", 0.2);
@@ -863,7 +961,8 @@ test("clean reviews: after the tail, reviewers of a clean shipped submission ear
 
 test("clean reviews: a reveal held back until after the merge earns nothing", () => {
   const w = new World();
-  w.submit("s1");
+  w.submitTask("s1");
+  w.assign("s1", ["b1", "c1"]);
   w.commit("s1", "b1", 0);
   w.commit("s1", "c1", 0);
   w.reveal("s1", "b1", 0);
@@ -876,10 +975,10 @@ test("clean reviews: a reveal held back until after the merge earns nothing", ()
 
 test("clean reviews: a reproduced finding on the shipping snapshot during the tail blocks them", () => {
   const w = new World();
-  w.submit("s1");
-  w.submit("s2", "d1");
+  w.submitTask("s1");
+  w.submitTask("s2", "d1");
   w.reviews("s1", { b1: 0.1 });
-  w.reviews("s2", { b1: 0.1 });
+  w.reviews("s2", { c1: 0.1 }); // carol: bob is within distance of dave
   w.merge("s1");
   w.merge("s2");
   w.snapshot("A", ["s1"]);
@@ -894,8 +993,8 @@ test("clean reviews: a reproduced finding on the shipping snapshot during the ta
 
 test("clean reviews of a promoted snapshot cover its unpromoted ancestors once", () => {
   const w = new World();
-  w.submit("s1");
-  w.submit("s2");
+  w.submitTask("s1");
+  w.submitTask("s2");
   w.reviews("s1", { b1: 0.1 });
   w.reviews("s2", { b1: 0.1 });
   w.merge("s1");
@@ -926,6 +1025,7 @@ test("missed plant: who pays, who waits, and each invitee's inviter charge has i
   w.commit("p1", "c1", 0.1);
   w.commit("p1", "a1", 0.3); // alice reviews openly
   w.commit("p1", "m1", 0.2); // amy reviews openly
+  w.endCommitPhase("p1"); // eve's seat stays empty; reveals wait for the deadline
   for (const [a, p] of [["b1", 0.9], ["c1", 0.1], ["a1", 0.3], ["m1", 0.2]] as const) w.reveal("p1", a, p);
   w.file("fA", { submissionId: "p1" }, "medium", "a1"); // blind, no result yet: alice waits
   w.file("fB", { submissionId: "p1" }, "medium", "b1");
@@ -938,7 +1038,8 @@ test("missed plant: who pays, who waits, and each invitee's inviter charge has i
   assertWellFormed(first);
   assert.deepEqual(
     summary(first),
-    ["amy missedPlant -6", "carol missedPlant -6", "eve missedPlant -6", "ivy inviterSlash -2"].sort(),
+    // alice is charged as amy's inviter, ivy as carol's.
+    ["alice inviterSlash -2", "amy missedPlant -6", "carol missedPlant -6", "eve missedPlant -6", "ivy inviterSlash -2"].sort(),
   );
   w.settle(first);
   assert.deepEqual(settleMissedPlant(w.state, "p1"), []);
@@ -965,7 +1066,7 @@ test("missed plant: a finding filed after the reveal is no catch, even once it r
   assert.deepEqual(summary(settleMissedPlant(w.state, "p1")), ["bob missedPlant -6"]);
   w.result("f1", true);
   assert.deepEqual(summary(settleMissedPlant(w.state, "p1")), ["bob missedPlant -6"]);
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), [], "and it earns nothing");
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), [], "and it earns nothing");
 });
 
 test("missed plant: a reviewer whose blind finding reproduced caught it; a late reveal does not", () => {
@@ -993,6 +1094,27 @@ test("missed plant: a plant revealed while its window is open charges nobody", (
   w.reveal("p1", "b1", 0); // c1 never reveals, so the window stays open
   w.plantReveal("p1");
   assert.deepEqual(settleMissedPlant(w.state, "p1"), []);
+});
+
+test("regression: dismissing the reproduction that closed a plant's window, after the reveal, does not reopen it", () => {
+  const w = new World();
+  w.plantCommit("p1");
+  w.submit("p1");
+  w.assign("p1", ["b1", "c1"]);
+  w.commit("p1", "b1", 0.9);
+  w.commit("p1", "c1", 0.1);
+  w.file("f1", { submissionId: "p1" }, "low", "d1");
+  w.result("f1", true, "none"); // reproduced: the window closes, so the custodian may reveal
+  const closed = reviewWindowCloseSeq(w.state, "p1");
+  assert.notEqual(closed, null);
+  w.plantReveal("p1");
+  w.decide("f1", false); // the test only pinned the old text
+  w.endCommitPhase("p1");
+  w.reveal("p1", "b1", 0.9); // b1's flag is public only after the plant was announced
+  w.reveal("p1", "c1", 0.1);
+  assert.equal(reviewWindowCloseSeq(w.state, "p1"), w.state.submissions.get("p1")?.planted?.seq, "the reveal caps the window");
+  assert.equal(plantCaught(w.state, "p1"), false, "a flag revealed after the plant reveal is no catch");
+  assert.equal(plantCaughtBy(w.state, "p1", w.id("b1")), false);
 });
 
 function claimWorld(): World {
@@ -1025,13 +1147,21 @@ test("expired claims forfeit their stake when the claimer never submitted", () =
   assert.throws(() => settleExpiredClaims(w.state, "not a date"), RangeError);
 });
 
-test("expired claims: a submission under an earlier claim does not cover an extension", () => {
+test("expired claims: a submission in the holder's unbroken run covers its extensions; one from a lapsed run does not", () => {
+  // Submitting and then extending (to hold the task through review) costs
+  // nothing more than not extending (regression: it used to forfeit the stake).
   const w = claimWorld();
   w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 60), stake: 15 }, w.key("a1"));
-  w.submit("junk", "a1", "t1");
-  const until = iso(w.minute + 600);
-  w.apply({ kind: "claim", taskId: "t1", until, stake: 15 }, w.key("a1")); // the holder extends
-  assert.deepEqual(summary(settleExpiredClaims(w.state, iso(w.minute + 700))), ["alice claimExpired -15", "ivy inviterSlash -4"].sort());
+  w.submit("s1", "a1", "t1");
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 600), stake: 15 }, w.key("a1")); // extended while live
+  assert.deepEqual(settleExpiredClaims(w.state, iso(w.minute + 700)), []);
+  // A new run after the claim lapsed must deliver again.
+  const v = claimWorld();
+  v.apply({ kind: "claim", taskId: "t1", until: iso(v.minute + 60), stake: 15 }, v.key("a1"));
+  v.submit("junk", "a1", "t1");
+  v.minute += 61;
+  v.apply({ kind: "claim", taskId: "t1", until: iso(v.minute + 600), stake: 15 }, v.key("a1")); // re-claimed after it lapsed
+  assert.deepEqual(summary(settleExpiredClaims(v.state, iso(v.minute + 700))), ["alice claimExpired -15", "ivy inviterSlash -4"].sort());
 });
 
 test("expired claims: a task that merged before until releases the claim", () => {
@@ -1063,7 +1193,7 @@ test("honeytoken: owner pays per distinct token, inviter pays a share, repeats a
 });
 
 test("inviter share rounds per slash and never produces a -0 or zero body", () => {
-  const rules = defaultRules();
+  const rules = fixtureRules();
   rules.rewards.inviterShare = 0.01; // round(5 * .01) = 0: no inviter body at all
   const w = new World(rules);
   w.submit("s1", "b1");
@@ -1089,7 +1219,7 @@ test("EV on a real ledger: 20 submissions, 3 plants (15%), 4 organic bugs; hones
   const all: SettlementBody[] = [];
   for (const sid of ids) {
     if (plants.has(sid)) w.plantCommit(sid);
-    w.submit(sid, "a1");
+    w.submitTask(sid, "a1");
     w.assign(sid, ["b1", "c1", "e1"]);
     const defective = plants.has(sid) || bugs.has(sid);
     // bob always says clean; carol is honest and accurate; eve flags everything.
@@ -1100,7 +1230,7 @@ test("EV on a real ledger: 20 submissions, 3 plants (15%), 4 organic bugs; hones
     } else if (bugs.has(sid)) {
       w.file(`f-${sid}`, { submissionId: sid }, "medium", "d1");
       w.result(`f-${sid}`, true);
-      all.push(...settleFinding(w.state, tree, `f-${sid}`, "dev"));
+      all.push(...settleFinding(w.state, `f-${sid}`, "dev"));
     } else {
       w.merge(sid);
     }
@@ -1122,4 +1252,149 @@ test("EV on a real ledger: 20 submissions, 3 plants (15%), 4 organic bugs; hones
   // The stranger who found the organic bugs was paid; the author paid every slash.
   assert.equal(w.rep("dave"), 20);
   assert.equal(w.rep("alice"), -20);
+});
+
+test("false finding: a result with a harness error is neither slashed nor paid", () => {
+  const w = reviewedSubmission({ b1: 0.1 });
+  w.file("f1", { submissionId: "s1" }, "high", "c1");
+  w.apply(
+    {
+      kind: "findingResult",
+      findingId: "f1",
+      reproduced: false,
+      failsOnHead: false,
+      passesOnParent: false,
+      logDigest: "void:harness-error",
+      harnessError: "voided after 3 harness errors",
+    },
+    w.coord,
+  );
+  assert.deepEqual(settleFalseFinding(w.state, "f1"), [], "could not run is not did not reproduce");
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), [], "nor a reproduction");
+});
+
+// ---------------------------------------------------------------------------
+// Review findings fixed in the whole-system pass
+// ---------------------------------------------------------------------------
+
+test("a reproduction settles only once confirmed; a dismissed one costs its finder, not the author", () => {
+  // The change-detector attack: a test that pins the old text "reproduces"
+  // against any change. Undecided, it pays and slashes nobody.
+  const w = reviewedSubmission({ b1: 0.1, c1: 0.2 });
+  w.file("f1", { submissionId: "s1" }, "medium", "e1");
+  w.result("f1", true, "none");
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), [], "undecided: nobody paid or slashed");
+  assert.deepEqual(settleFalseFinding(w.state, "f1"), []);
+  w.decide("f1", false); // an operator: it tests the intended change
+  assert.deepEqual(settleFinding(w.state, "f1", "dev"), []);
+  assert.deepEqual(summary(settleFalseFinding(w.state, "f1")), ["eve falseFinding -5"]);
+
+  const c = reviewedSubmission({ b1: 0.1, c1: 0.2 });
+  c.file("f1", { submissionId: "s1" }, "medium", "e1");
+  c.result("f1", true, "none");
+  c.decide("f1", true);
+  assert.ok(settleFinding(c.state, "f1", "dev").some((b) => b.reason === "authorSlash"), "confirmed: settles as before");
+});
+
+test("a class settles nothing until its leader (the first reproduction) is decided; a dismissed leader passes it on", () => {
+  const w = reviewedSubmission({ b1: 0.1 });
+  w.file("f1", { submissionId: "s1" }, "medium", "e1");
+  w.file("f2", { submissionId: "s1" }, "medium", "c1");
+  w.result("f1", true, "none");
+  w.result("f2", true, "confirm");
+  assert.deepEqual(settleFinding(w.state, "f2", "dev"), [], "the leader f1 is still undecided");
+  w.decide("f1", false);
+  const bodies = settleFinding(w.state, "f2", "dev");
+  assert.ok(bodies.some((b) => b.reason === "authorSlash" && b.ref === "finding:f2"), "f2 now leads the class");
+});
+
+test("taskless merges vest nothing: activity alone mints no reputation", () => {
+  const w = new World();
+  w.submit("readme");
+  w.reviews("readme", { b1: 1, c1: 1 }); // both reviewers flagged it; the author still tries
+  w.merge("readme");
+  for (const t of [1, 2, 3] as const) assert.deepEqual(settleMerge(w.state, "readme", t, iso(w.minute + 60 * DAY_MIN)), []);
+});
+
+test("missed plant: a seat shut out by someone else's reproduction before its commit deadline is not charged", () => {
+  const w = new World();
+  w.plantCommit("p1");
+  w.submit("p1", "d1"); // dave is the custodian
+  w.assign("p1", ["b1", "c1"]);
+  w.commit("p1", "b1", 0.1); // carol has not committed yet...
+  w.file("f1", { submissionId: "p1" }, "medium", "e1");
+  w.result("f1", true, "none"); // ...when a reproduction closes commits
+  w.endCommitPhase("p1");
+  w.decide("f1", false); // dismissed only after the deadline: a change detector
+  w.reveal("p1", "b1", 0.1);
+  // The window's time runs out with a quorum: the coordinator closes it on the ledger.
+  w.apply({ kind: "reviewWindowClosed", submissionId: "p1", missing: [w.id("c1")] }, w.coord);
+  w.plantReveal("p1");
+  const bodies = settleMissedPlant(w.state, "p1");
+  assert.deepEqual(summary(bodies).filter((x) => x.includes("missedPlant")), ["bob missedPlant -6"], "bob saw and missed it; carol never could commit");
+});
+
+test("expired claims: a claim replaced after it lapsed is still settled", () => {
+  const w = claimWorld();
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 60), stake: 15 }, w.key("a1"));
+  const lapsed = w.state.claims.get("t1")?.seq;
+  w.minute += 61; // it lapses...
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 600), stake: 15 }, w.key("a1")); // ...and its holder re-claims
+  const bodies = settleExpiredClaims(w.state, w.now());
+  assert.deepEqual(summary(bodies), ["alice claimExpired -15", "ivy inviterSlash -4"].sort());
+  assert.ok(bodies.every((b) => b.ref.startsWith(`claim:t1:${lapsed}`)));
+  // A colluder's re-claim does not erase it either; an extension while live is no expiry.
+  const v = claimWorld();
+  v.apply({ kind: "claim", taskId: "t1", until: iso(v.minute + 60), stake: 15 }, v.key("a1"));
+  v.apply({ kind: "claim", taskId: "t1", until: iso(v.minute + 300), stake: 15 }, v.key("a1")); // extended while live
+  v.minute += 400;
+  v.apply({ kind: "claim", taskId: "t1", until: iso(v.minute + 600), stake: 15 }, v.key("c1"));
+  assert.deepEqual(summary(settleExpiredClaims(v.state, v.now())).filter((x) => x.includes("claimExpired")), ["alice claimExpired -15"]);
+});
+
+test("regression: a taskless merge settles nothing for anyone, and an open reviewer within minTreeDistance of the author earns no clean review", () => {
+  const w = new World();
+  // Taskless whitespace edit: assigned seats and an open reviewer (amy, alice's friend) all say p = 0.
+  w.submit("ws1");
+  w.assign("ws1", ["b1", "c1"]);
+  w.reviews("ws1", { b1: 0, c1: 0, m1: 0 });
+  w.merge("ws1");
+  // A task's submission: the same reviewers.
+  w.submitTask("t1");
+  w.assign("t1", ["b1", "c1"]);
+  w.reviews("t1", { b1: 0, c1: 0, m1: 0 });
+  w.merge("t1");
+  w.snapshot("S1", ["ws1", "t1"]);
+  w.promote("S1");
+  const later = iso(w.minute + 31 * DAY_MIN);
+  assert.deepEqual([1, 2, 3].flatMap((t) => settleMerge(w.state, "ws1", t as 1 | 2 | 3, later)), []);
+  const bodies = settleCleanReviews(w.state, "S1", later);
+  assert.ok(bodies.every((b) => b.ref === "review:t1"), "nothing for the taskless merge");
+  assert.deepEqual(summary(bodies), ["bob cleanReview 2", "carol cleanReview 2"].sort(), "nothing for amy, within distance 2 of alice");
+});
+
+test("regression: key rotation hands a live claim's run to the owner's next agent, and ends the old agent's submission without stranding stakes", () => {
+  const w = claimWorld();
+  // a1 submits s1, b1 and c1 commit reviews; a2 holds a claim on t1.
+  w.submit("s0", "a1");
+  w.assign("s0", ["b1", "c1"]);
+  w.commit("s0", "b1", 0.1);
+  w.commit("s0", "c1", 0.1);
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 600), stake: 15 }, w.key("a2"));
+  assert.equal(w.state.owners.get("bob")?.lockedStake, 5);
+  // alice rotates both keys; her new agent n1 re-claims t1 and delivers.
+  w.apply({ kind: "agentRevoked", agent: w.id("a1"), reason: "key rotation" }, w.key("alice"));
+  w.apply({ kind: "agentRevoked", agent: w.id("a2"), reason: "key rotation" }, w.key("alice"));
+  assert.equal(submissionDead(w.state, "s0"), true, "the coordinator never progresses a revoked author's work");
+  assert.equal(w.state.owners.get("bob")?.lockedStake, 0, "reviewers' stakes released");
+  assert.equal(w.state.owners.get("carol")?.lockedStake, 0);
+  w.apply({ kind: "agentRegistered", owner: "alice", publicKey: w.key("n1").publicKey, modelFamily: "claude", harness: "cli" }, w.key("alice"));
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 600), stake: 15 }, w.key("n1"));
+  w.submit("s1", "n1", "t1");
+  assert.deepEqual(settleExpiredClaims(w.state, iso(w.minute + 2000)), [], "the run passed to n1, which delivered");
+  // Rotating without re-claiming still abandons the task.
+  const v = claimWorld();
+  v.apply({ kind: "claim", taskId: "t1", until: iso(v.minute + 60), stake: 15 }, v.key("a2"));
+  v.apply({ kind: "agentRevoked", agent: v.id("a2"), reason: "key rotation" }, v.key("alice"));
+  assert.deepEqual(summary(settleExpiredClaims(v.state, iso(v.minute + 700))), ["alice claimExpired -15", "ivy inviterSlash -4"].sort());
 });

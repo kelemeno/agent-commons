@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { generateKeyPair, keyIdOf } from "../src/crypto";
 import { applyEntry, emptyState, signEntry, type LedgerState, type Signer } from "../src/ledger";
-import { claimStake, defaultRules, ringOf as rulesRingOf } from "../src/rules";
+import { claimStake, defaultRules, globToRegExp } from "../src/rules";
 import {
   BYTES_PER_LINE,
   checkAirlock,
@@ -15,6 +15,7 @@ import {
   checkTaskRing,
   decodeIdentifierEscapes,
   isAcceptancePath,
+  isLocked,
   normalizeRepoPath,
   ringOf,
   runStaticGates,
@@ -23,9 +24,29 @@ import {
 } from "../src/gates";
 import type { EntryBody, Rules } from "../src/types";
 
-const rules = defaultRules();
-const ENGINE = "anthill-backend/src/engine.ts";
-const UI = "anthill-frontend/src";
+// An example target project, as its .commons/rules.json would declare it
+// (defaultRules names no project paths): a server whose engine and auth are
+// kernel, contracts, the bare submodule pointers, and a web UI in ring 2. The
+// UI glob comes after the defaults, so the generic ring-0 files under web/
+// (vite.config.*, .gitattributes, ...) stay ring 0: first match wins.
+function projectRules(): Rules {
+  const base = defaultRules();
+  base.rings = [
+    { glob: "server/src/engine.ts", ring: 0 },
+    { glob: "server/src/auth.ts", ring: 0 },
+    { glob: "contracts/src/**", ring: 0 },
+    { glob: "server", ring: 0 },
+    { glob: "contracts", ring: 0 },
+    { glob: "web", ring: 0 },
+    { glob: "web/index.html", ring: 0 },
+    ...base.rings,
+    { glob: "web/**", ring: 2 },
+  ];
+  return base;
+}
+const rules = projectRules();
+const ENGINE = "server/src/engine.ts";
+const UI = "web/src";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gates-test-"));
 after(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
@@ -44,7 +65,7 @@ function repo(files: Record<string, string>): string {
   return dir;
 }
 
-const kernel = { [ENGINE]: "export const k = 1;\n", "anthill-backend/src/util.ts": "export const u = 1;\n" };
+const kernel = { [ENGINE]: "export const k = 1;\n", "server/src/util.ts": "export const u = 1;\n" };
 
 // One ring-2 file `a.ts` (or `name`) with `source`, beside a kernel; the gate's verdict on it.
 function importGate(source: string, name = `${UI}/a.ts`, extra: Record<string, string> = {}) {
@@ -69,27 +90,27 @@ test("normalizeRepoPath: one spelling, unusable paths are null", () => {
   assert.equal(normalizeRepoPath("a/b.ts"), "a/b.ts");
   assert.equal(normalizeRepoPath("./a//b/./c.ts"), "a/b/c.ts");
   assert.equal(normalizeRepoPath("a/b/"), "a/b");
-  assert.equal(normalizeRepoPath("anthill-frontend/../anthill-backend/src/engine.ts"), ENGINE);
-  for (const bad of ["", ".", "./", "..", "../x", "a/../../x", "/etc/passwd", "/anthill-frontend/a.ts", "a\\b", "a\0b"]) {
+  assert.equal(normalizeRepoPath("web/../server/src/engine.ts"), ENGINE);
+  for (const bad of ["", ".", "./", "..", "../x", "a/../../x", "/etc/passwd", "/web/a.ts", "a\\b", "a\0b"]) {
     assert.equal(normalizeRepoPath(bad), null, JSON.stringify(bad));
   }
 });
 
 test("ringOf: first matching glob on the normalised path, unmatched ring 1, unusable ring 0", () => {
   assert.equal(ringOf(ENGINE, rules), 0);
-  assert.equal(ringOf("anthill-frontend/src/App.tsx", rules), 2);
-  assert.equal(ringOf("anthill-frontend/vite.config.ts", rules), 0); // listed before the UI glob
-  assert.equal(ringOf("anthill-backend/src/routes.ts", rules), 1);
+  assert.equal(ringOf("web/src/App.tsx", rules), 2);
+  assert.equal(ringOf("web/vite.config.ts", rules), 0); // a default listed before the UI glob
+  assert.equal(ringOf("server/src/routes.ts", rules), 1);
   assert.equal(ringOf("docs/x.md", rules), 1);
   // Normalisation attacks are classified by what they name.
-  assert.equal(ringOf("anthill-frontend/../anthill-backend/src/engine.ts", rules), 0);
-  assert.equal(ringOf("./anthill-frontend/src/App.tsx", rules), 2);
-  assert.equal(ringOf("anthill-frontend//src/../../anthill-commons/src/ledger.ts", rules), 0);
-  assert.equal(ringOf("/anthill-frontend/src/App.tsx", rules), 0);
-  assert.equal(ringOf("../anthill-frontend/src/App.tsx", rules), 0);
-  // Agrees with rules.ts on canonical paths.
-  for (const p of [ENGINE, "anthill-frontend/src/x.ts", "README.md", ".github/workflows/ci.yml", "anthill-frontend"]) {
-    assert.equal(ringOf(p, rules), rulesRingOf(p, rules), p);
+  assert.equal(ringOf("web/../server/src/engine.ts", rules), 0);
+  assert.equal(ringOf("./web/src/App.tsx", rules), 2);
+  assert.equal(ringOf("web//src/../../server/src/auth.ts", rules), 0);
+  assert.equal(ringOf("/web/src/App.tsx", rules), 0);
+  assert.equal(ringOf("../web/src/App.tsx", rules), 0);
+  // Canonical paths: the first matching glob, unmatched ring 1.
+  for (const p of [ENGINE, "web/src/x.ts", "README.md", ".github/workflows/ci.yml", "web"]) {
+    assert.equal(ringOf(p, rules), rules.rings.find((r) => globToRegExp(r.glob).test(p))?.ring ?? 1, p);
   }
 });
 
@@ -97,7 +118,7 @@ test("submissionRing: the lowest ring touched", () => {
   assert.equal(submissionRing([`${UI}/a.ts`, `${UI}/b.tsx`], rules), 2);
   assert.equal(submissionRing([`${UI}/a.ts`, "README.md"], rules), 1);
   assert.equal(submissionRing([`${UI}/a.ts`, "README.md", ENGINE], rules), 0);
-  assert.equal(submissionRing([`${UI}/../../anthill-backend/src/engine.ts`], rules), 0);
+  assert.equal(submissionRing([`${UI}/../../server/src/engine.ts`], rules), 0);
   assert.equal(submissionRing([`${UI}/a.ts`, "/abs"], rules), 0);
   assert.equal(submissionRing([], rules), 1);
 });
@@ -131,19 +152,19 @@ test("rings: UI importing UI, ring 1 and packages passes", () => {
 
 test("rings: relative kernel imports fail, with or without extension", () => {
   for (const spec of [
-    "../../anthill-backend/src/engine",
-    "../../anthill-backend/src/engine.ts",
-    "../../anthill-backend/src/engine.js", // TS ESM style names engine.ts
-    "./../../anthill-backend//src/./engine",
-    "../../anthill-frontend/../anthill-backend/src/engine",
-    "../../anthill-commons/src/ledger",
+    "../../server/src/engine",
+    "../../server/src/engine.ts",
+    "../../server/src/engine.js", // TS ESM style names engine.ts
+    "./../../server//src/./engine",
+    "../../web/../server/src/engine",
+    "../../server/src/auth",
   ]) {
     fails(importGate(`import { k } from "${spec}";\n`), /ring-0/);
   }
 });
 
 test("rings: every import form is seen", () => {
-  const E = "../../anthill-backend/src/engine";
+  const E = "../../server/src/engine";
   const forms = [
     `import k from "${E}";`,
     `import { k as kk, type T } from '${E}';`,
@@ -166,80 +187,80 @@ test("rings: every import form is seen", () => {
 
 test("rings: lexical obfuscation is seen through", () => {
   const forms = [
-    'import/**/k/**/from/**/"../../anthill-backend/src/engine";',
-    'import k from /* a long comment, "with quotes" */ "../../anthill-backend/src/engine";',
-    'import k from // trailing\n "../../anthill-backend/src/engine";',
-    'import k from "\\x2e\\x2e/\\x2e\\x2e/anthill-backend/src/engine";',
-    'import k from "\\u002e\\u002e/../anthill-backend/src/engin\\u{65}";',
-    'import k from "../../anthill-backend/src/en\\\ngine";', // line continuation
-    'const a = "/*"; import k from /* */ "../../anthill-backend/src/engine"; const b = "*/";',
-    'if (a) /\'/.test(s); import k from "../../anthill-backend/src/engine"; /\'/',
-    'await import /* c */ ( "../../anthill-backend/src/engine" );',
-    'import k from "../../anthill-backend/src/engine?raw";',
-    "// import k from '../../anthill-backend/src/engine'", // commented out still fails: conservative
+    'import/**/k/**/from/**/"../../server/src/engine";',
+    'import k from /* a long comment, "with quotes" */ "../../server/src/engine";',
+    'import k from // trailing\n "../../server/src/engine";',
+    'import k from "\\x2e\\x2e/\\x2e\\x2e/server/src/engine";',
+    'import k from "\\u002e\\u002e/../server/src/engin\\u{65}";',
+    'import k from "../../server/src/en\\\ngine";', // line continuation
+    'const a = "/*"; import k from /* */ "../../server/src/engine"; const b = "*/";',
+    'if (a) /\'/.test(s); import k from "../../server/src/engine"; /\'/',
+    'await import /* c */ ( "../../server/src/engine" );',
+    'import k from "../../server/src/engine?raw";',
+    "// import k from '../../server/src/engine'", // commented out still fails: conservative
   ];
   for (const f of forms) fails(importGate(f + "\n"), /ring-0/);
 });
 
 test("rings: computed and absolute specifiers cannot be checked and fail", () => {
-  fails(importGate('const m = await import("../../anthill-backend/src/" + "engine");\n'), /computed/);
-  fails(importGate("const m = await import(`../../anthill-backend/src/${name}`);\n"), /computed/);
+  fails(importGate('const m = await import("../../server/src/" + "engine");\n'), /computed/);
+  fails(importGate("const m = await import(`../../server/src/${name}`);\n"), /computed/);
   fails(importGate("const m = require(name);\n"), /computed/);
-  fails(importGate('import k from "/anthill-backend/src/engine.ts";\n'), /absolute/);
+  fails(importGate('import k from "/server/src/engine.ts";\n'), /absolute/);
   fails(importGate('import k from "file:///etc/passwd";\n'), /absolute/);
   fails(importGate('import k from "../../../outside";\n'), /outside the repository/);
   // Not imports: member names and prose without a call.
-  passes(importGate('x.import("../../anthill-backend/src/engine"); const from = 1; y.from = 2;\n'));
+  passes(importGate('x.import("../../server/src/engine"); const from = 1; y.from = 2;\n'));
   passes(importGate("const s = require.resolve; // what is required\n"));
 });
 
 test("rings: a missing kernel file still classifies (submodules absent from the checkout)", () => {
-  const dir = repo({ [`${UI}/a.ts`]: 'import k from "../../anthill-backend/src/engine";\n' });
-  fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /ring-0 anthill-backend\/src\/engine\.ts/);
+  const dir = repo({ [`${UI}/a.ts`]: 'import k from "../../server/src/engine";\n' });
+  fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /ring-0 server\/src\/engine\.ts/);
 });
 
 test("rings: index resolution and directory imports", () => {
-  const extra = { "anthill-contracts/src/index.ts": "export {};\n" };
-  fails(importGate('import c from "../../anthill-contracts/src";\n', undefined, extra), /ring-0/);
-  fails(importGate('import c from "../../anthill-contracts/src/";\n', undefined, extra), /ring-0/);
+  const extra = { "contracts/src/index.ts": "export {};\n" };
+  fails(importGate('import c from "../../contracts/src";\n', undefined, extra), /ring-0/);
+  fails(importGate('import c from "../../contracts/src/";\n', undefined, extra), /ring-0/);
   // A directory that is itself a kernel pointer (the backend submodule).
-  fails(importGate('import b from "../../anthill-backend";\n'), /ring-0 anthill-backend/);
+  fails(importGate('import b from "../../server";\n'), /ring-0 server/);
 });
 
 test("rings: files in other rings are not scanned; declared deletions are skipped", () => {
-  const dir = repo({ ...kernel, "lib/x.ts": 'import k from "../anthill-backend/src/engine";\n' });
+  const dir = repo({ ...kernel, "lib/x.ts": 'import k from "../server/src/engine";\n' });
   const r = checkRingImports(dir, ["lib/x.ts", ENGINE, `${UI}/deleted.ts`], rules, { deleted: [`${UI}/deleted.ts`] });
   passes(r);
   assert.match(r.details, /0 ring-2 code files scanned, 1 deleted/);
   // Non-code UI files (docs, styles) are not parsed.
-  passes(importGate('see "../../anthill-backend/src/engine" from "../../anthill-backend/src/engine"\n', `${UI}/notes.md`));
+  passes(importGate('see "../../server/src/engine" from "../../server/src/engine"\n', `${UI}/notes.md`));
 });
 
 test("rings: ring-2 files in .tsx, .vue and .html are scanned", () => {
-  fails(importGate('import k from "../../anthill-backend/src/engine";\nexport const A = () => <div/>;\n', `${UI}/A.tsx`));
-  fails(importGate('<script setup>\nimport k from "../../anthill-backend/src/engine";\n</script>\n', `${UI}/A.vue`));
-  fails(importGate('<script type="module">import "../../anthill-backend/src/engine";</script>\n', `${UI}/page.html`));
+  fails(importGate('import k from "../../server/src/engine";\nexport const A = () => <div/>;\n', `${UI}/A.tsx`));
+  fails(importGate('<script setup>\nimport k from "../../server/src/engine";\n</script>\n', `${UI}/A.vue`));
+  fails(importGate('<script type="module">import "../../server/src/engine";</script>\n', `${UI}/page.html`));
 });
 
 test("rings: symlinks out of ring 2 fail", () => {
   // The changed file is itself a link to the kernel.
-  let dir = repo({ ...kernel, [`${UI}/a.ts`]: "->../../anthill-backend/src/engine.ts" });
-  fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /symlink to anthill-backend\/src\/engine\.ts/);
+  let dir = repo({ ...kernel, [`${UI}/a.ts`]: "->../../server/src/engine.ts" });
+  fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /symlink to server\/src\/engine\.ts/);
   // ...or to ring 1, or outside the repository, or dangling into the kernel.
   dir = repo({ "lib/x.ts": "export {};\n", [`${UI}/a.ts`]: "->../../lib/x.ts" });
   fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /outside ring 2/);
   dir = repo({ [`${UI}/a.ts`]: "->/etc/hostname" });
   fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /outside the repository/);
-  dir = repo({ [`${UI}/a.ts`]: "->../../anthill-backend/src/engine.ts" });
+  dir = repo({ [`${UI}/a.ts`]: "->../../server/src/engine.ts" });
   fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /symlink/);
   // A link within ring 2 is fine.
   dir = repo({ [`${UI}/b.ts`]: "export const b = 1;\n", [`${UI}/a.ts`]: "->b.ts" });
   passes(checkRingImports(dir, [`${UI}/a.ts`], rules));
   // An unchanged ring-2 link to the kernel, imported by a changed file.
-  dir = repo({ ...kernel, [`${UI}/link.ts`]: "->../../anthill-backend/src/engine.ts", [`${UI}/a.ts`]: 'import "./link";\n' });
+  dir = repo({ ...kernel, [`${UI}/link.ts`]: "->../../server/src/engine.ts", [`${UI}/a.ts`]: 'import "./link";\n' });
   fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /symlink to ring-0/);
   // A linked directory inside ring 2 that leads into the kernel.
-  dir = repo({ ...kernel, [`${UI}/k`]: "->../../anthill-backend/src", [`${UI}/a.ts`]: 'import "./k/engine";\n' });
+  dir = repo({ ...kernel, [`${UI}/k`]: "->../../server/src", [`${UI}/a.ts`]: 'import "./k/engine";\n' });
   fails(checkRingImports(dir, [`${UI}/a.ts`], rules), /symlink to ring-0/);
 });
 
@@ -247,29 +268,29 @@ test("rings: import.meta.glob is walked", () => {
   const pages = { [`${UI}/pages/Home.tsx`]: "export default 1;\n", [`${UI}/pages/About.tsx`]: "export default 2;\n" };
   passes(importGate('const pages = import.meta.glob("./pages/*.tsx");\n', undefined, pages));
   passes(importGate('const pages = import.meta.glob(["./pages/*.tsx", "!./pages/Secret.tsx"], { eager: true });\n', undefined, pages));
-  fails(importGate('const m = import.meta.glob("../../anthill-backend/src/*.ts");\n'), /outside ring 2/);
-  fails(importGate('const m = import.meta.globEager("../../anthill-backend/**");\n'), /outside ring 2/);
+  fails(importGate('const m = import.meta.glob("../../server/src/*.ts");\n'), /outside ring 2/);
+  fails(importGate('const m = import.meta.globEager("../../server/**");\n'), /outside ring 2/);
   // Ring-0 files inside the UI tree (vite config) are reachable by a broad glob.
   fails(
-    importGate('const m = import.meta.glob("../*.ts");\n', undefined, { "anthill-frontend/vite.config.ts": "export {};\n" }),
-    /ring-0 anthill-frontend\/vite\.config\.ts/,
+    importGate('const m = import.meta.glob("../*.ts");\n', undefined, { "web/vite.config.ts": "export {};\n" }),
+    /ring-0 web\/vite\.config\.ts/,
   );
   fails(importGate("const m = import.meta.glob(patterns);\n"), /computed/);
   fails(importGate('const m = import.meta.glob("/src/**");\n'), /absolute/);
-  fails(importGate('const m = import.meta.glob("./x/*.ts");\n', undefined, { [`${UI}/x/l`]: "->../../../anthill-backend/src" }), /symlink/);
+  fails(importGate('const m = import.meta.glob("./x/*.ts");\n', undefined, { [`${UI}/x/l`]: "->../../../server/src" }), /symlink/);
 });
 
 test("rings: unusable changed paths fail", () => {
   const dir = repo({});
   fails(checkRingImports(dir, ["/etc/passwd"], rules), /not a path inside the repository/);
-  fails(checkRingImports(dir, ["anthill-frontend/../../x.ts"], rules), /not a path inside/);
+  fails(checkRingImports(dir, ["web/../../x.ts"], rules), /not a path inside/);
   // A traversal spelling of a UI file is read as that file.
-  const d2 = repo({ ...kernel, [`${UI}/a.ts`]: 'import "../../anthill-backend/src/engine";\n' });
-  fails(checkRingImports(d2, [`anthill-backend/../${UI}/./a.ts`], rules), /ring-0/);
+  const d2 = repo({ ...kernel, [`${UI}/a.ts`]: 'import "../../server/src/engine";\n' });
+  fails(checkRingImports(d2, [`server/../${UI}/./a.ts`], rules), /ring-0/);
 });
 
 test("rings: problem lists are capped", () => {
-  const src = Array.from({ length: 50 }, (_, i) => `import k${i} from "../../anthill-backend/src/engine";`).join("\n");
+  const src = Array.from({ length: 50 }, (_, i) => `import k${i} from "../../server/src/engine";`).join("\n");
   const r = importGate(src);
   fails(r, /; and 30 more$/);
   assert.match(r.details, /a\.ts:1:/);
@@ -304,15 +325,15 @@ test("scanImports: reports kinds and specifiers", () => {
 
 test("airlock: locked paths need the dependency track", () => {
   passes(checkAirlock(["src/a.ts", "README.md"], rules, { dependencyTrack: false }));
-  const r = checkAirlock(["src/a.ts", "package-lock.json", "anthill-frontend/package.json", ".npmrc"], rules, { dependencyTrack: false });
-  fails(r, /package-lock\.json, anthill-frontend\/package\.json, \.npmrc/);
+  const r = checkAirlock(["src/a.ts", "package-lock.json", "web/package.json", ".npmrc"], rules, { dependencyTrack: false });
+  fails(r, /package-lock\.json, web\/package\.json, \.npmrc/);
   assert.equal(r.gate, "airlock");
-  passes(checkAirlock(["package-lock.json", "anthill-frontend/yarn.lock"], rules, { dependencyTrack: true }));
+  passes(checkAirlock(["package-lock.json", "web/yarn.lock"], rules, { dependencyTrack: true }));
 });
 
 test("airlock: normalisation does not hide a lockfile; unusable paths always fail", () => {
   fails(checkAirlock(["src/../package-lock.json"], rules, { dependencyTrack: false }), /package-lock\.json/);
-  fails(checkAirlock(["./anthill-frontend//package.json"], rules, { dependencyTrack: false }), /anthill-frontend\/package\.json/);
+  fails(checkAirlock(["./web//package.json"], rules, { dependencyTrack: false }), /web\/package\.json/);
   fails(checkAirlock(["../package-lock.json"], rules, { dependencyTrack: true }), /not a path inside/);
   fails(checkAirlock(["/package.json"], rules, { dependencyTrack: true }), /not a path inside/);
   // Look-alikes are not locked.
@@ -342,8 +363,8 @@ class World {
   state: LedgerState;
   minute = 0;
 
-  constructor(r: Rules = defaultRules()) {
-    this.state = emptyState({ kind: "genesis", project: "anthill", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules: r }, AT(0));
+  constructor(r: Rules = projectRules()) {
+    this.state = emptyState({ kind: "genesis", project: "demo", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules: r }, AT(0));
   }
   append(body: EntryBody, signer: Signer) {
     applyEntry(this.state, signEntry(this.state, body, signer, AT(++this.minute)));
@@ -476,8 +497,8 @@ test("runStaticGates: all four reports, in order", () => {
 test("runStaticGates: each gate fails on its own problem", () => {
   const w = world();
   w.task("t1", "alice", ["test/a.test.ts"]);
-  const dir = repo({ ...kernel, [`${UI}/a.ts`]: 'import { k } from "../../anthill-backend/src/engine";\n' });
-  w.submit("s1", "a1", "t1", [`${UI}/a.ts`, "anthill-frontend/package.json", "test/a.test.ts"], 401);
+  const dir = repo({ ...kernel, [`${UI}/a.ts`]: 'import { k } from "../../server/src/engine";\n' });
+  w.submit("s1", "a1", "t1", [`${UI}/a.ts`, "web/package.json", "test/a.test.ts"], 401);
   const reports = runStaticGates(w.state, "s1", dir, { dependencyTrack: false });
   assert.deepEqual(
     reports.map((r) => [r.gate, r.pass]),
@@ -514,7 +535,7 @@ test("runStaticGates: unknown submission and missing repo are harness errors", (
 // Regressions from review
 // ---------------------------------------------------------------------------
 
-const E = "../../anthill-backend/src/engine";
+const E = "../../server/src/engine";
 
 test("rings: a spread does not hide import() or new URL() (it is not a member dot)", () => {
   for (const f of [
@@ -533,7 +554,7 @@ test("rings: a spread does not hide import() or new URL() (it is not a member do
 test("rings: a changed ring-2 file absent from the checkout fails unless deleted (uninitialised submodule)", () => {
   // The superproject checkout of a submodule that was never initialised: an empty directory.
   const dir = repo({ ...kernel });
-  fs.mkdirSync(path.join(dir, "anthill-frontend"));
+  fs.mkdirSync(path.join(dir, "web"));
   const file = `${UI}/App.tsx`;
   fails(checkRingImports(dir, [file], rules), /App\.tsx is not present in the checkout and cannot be checked/);
   fails(checkRingImports(dir, [file, `${UI}/gone.ts`], rules, { deleted: [`${UI}/gone.ts`] }), /App\.tsx is not present/);
@@ -564,10 +585,10 @@ test("rings: import.meta.glob options are read; base or anything unreadable fail
     passes(importGate(`const m = ${ok};\n`, undefined, pages));
   }
   for (const bad of [
-    'import.meta.glob("./*.ts", { base: "../../anthill-backend/src" })',
-    'import.meta.glob("./*.ts", { eager: true, base: "../../anthill-backend/src" })',
-    'import.meta.glob("./*.ts", { "base": "../../anthill-backend/src" })',
-    'import.meta.glob("./*.ts", { b\\u0061se: "../../anthill-backend/src" })',
+    'import.meta.glob("./*.ts", { base: "../../server/src" })',
+    'import.meta.glob("./*.ts", { eager: true, base: "../../server/src" })',
+    'import.meta.glob("./*.ts", { "base": "../../server/src" })',
+    'import.meta.glob("./*.ts", { b\\u0061se: "../../server/src" })',
     'import.meta.glob("./*.ts", { base })',
     'import.meta.glob("./*.ts", { ...opts })',
     'import.meta.glob("./*.ts", opts)',
@@ -581,7 +602,7 @@ test("rings: import.meta.glob options are read; base or anything unreadable fail
 });
 
 test("rings: import.meta.glob with type arguments and every glob variant is seen", () => {
-  const B = "../../anthill-backend/src/*.ts";
+  const B = "../../server/src/*.ts";
   for (const f of [
     `import.meta.glob<Mod>("${B}", { eager: true })`,
     `import.meta.glob<{ a: T }>("${B}")`,
@@ -604,7 +625,7 @@ test("rings: import.meta.glob with type arguments and every glob variant is seen
 });
 
 test("rings: legacy octal and \\8/\\9 escapes are not guessed at", () => {
-  fails(importGate('const m = require("\\56\\56/\\56\\56/anthill-backend/src/engine");\n'), /computed/);
+  fails(importGate('const m = require("\\56\\56/\\56\\56/server/src/engine");\n'), /computed/);
   fails(importGate('const m = require("./\\8");\n'), /computed/);
   fails(importGate('import k from "./a\\01";\n'), /computed/);
   // \0 not followed by a digit is a NUL, valid everywhere.
@@ -615,8 +636,8 @@ test("rings: legacy octal and \\8/\\9 escapes are not guessed at", () => {
 });
 
 test("rings: '?' and '#' are path characters to require(); both readings are judged", () => {
-  fails(importGate('const m = require("./x?/../../../anthill-backend/src/engine");\n'), /ring-0/);
-  fails(importGate('const m = require("./x#/../../../anthill-backend/src/engine");\n'), /ring-0/);
+  fails(importGate('const m = require("./x?/../../../server/src/engine");\n'), /ring-0/);
+  fails(importGate('const m = require("./x#/../../../server/src/engine");\n'), /ring-0/);
   passes(importGate('import u from "./logo.svg?url"; import r from "./a.ts?raw#x";\n'));
 });
 
@@ -626,7 +647,7 @@ test("rings: identifier escapes expose require/import", () => {
     `const m = re\\u{71}uire("${E}");`,
     `const m = await \\u0069mport("${E}");`,
     `im\\u0070ort k fr\\u006fm "${E}";`,
-    `const m = import.met\\u0061.glob("../../anthill-backend/src/*.ts");`,
+    `const m = import.met\\u0061.glob("../../server/src/*.ts");`,
   ]) {
     fails(importGate(f + "\n"), /ring-0|outside ring 2/);
   }
@@ -640,20 +661,20 @@ test("rings: identifier escapes expose require/import", () => {
 });
 
 test("rings: a glob without wildcards and extensionless JSON are classified even when absent", () => {
-  fails(importGate('const m = import.meta.glob("../vite.config.ts");\n'), /names ring-0 anthill-frontend\/vite\.config\.ts/);
+  fails(importGate('const m = import.meta.glob("../vite.config.ts");\n'), /names ring-0 web\/vite\.config\.ts/);
   fails(importGate('const m = import.meta.glob("../index.html", { query: "?raw" });\n'), /ring-0/);
-  fails(importGate('import c from "../../anthill-backend/tsconfig";\n'), /ring-0 anthill-backend\/tsconfig\.json/);
+  fails(importGate('import c from "../../server/tsconfig";\n'), /ring-0 server\/tsconfig\.json/);
   passes(importGate('import d from "./data";\n', undefined, { [`${UI}/data.json`]: "{}\n" }));
 });
 
 test("rings: kernel paths in another letter case fail (case-insensitive filesystems)", () => {
-  fails(importGate('import k from "../../anthill-backend/src/Engine";\n'), /ring-0 anthill-backend\/src\/Engine/);
-  fails(importGate('import k from "../../Anthill-Backend/src/AUTH.ts";\n'), /ring-0/);
+  fails(importGate('import k from "../../server/src/Engine";\n'), /ring-0 server\/src\/Engine/);
+  fails(importGate('import k from "../../Server/src/AUTH.ts";\n'), /ring-0/);
   fails(importGate('const m = import.meta.glob("../Vite.Config.ts");\n'), /ring-0/);
 });
 
 test("rings: new URL() with an interpolated template fails as computed", () => {
-  fails(importGate("const u = new URL(`../../anthill-backend/src/${n}.ts`, import.meta.url);\n"), /new URL\(\) with a computed specifier/);
+  fails(importGate("const u = new URL(`../../server/src/${n}.ts`, import.meta.url);\n"), /new URL\(\) with a computed specifier/);
   passes(importGate("const u = new URL(`./${n}.png`, location.href);\n")); // not import.meta.url: not bundled
 });
 
@@ -714,7 +735,7 @@ test("task ring: kernel files under a ring-2 task fail the rings gate", () => {
   w.submit("s1", "b1", "t2", [`${UI}/a.ts`, ENGINE]);
   const t = checkTaskRing(w.state, "s1");
   assert.equal(t?.pass, false);
-  assert.match(t?.details ?? "", /task t2 is scoped at ring 2 .*anthill-backend\/src\/engine\.ts/);
+  assert.match(t?.details ?? "", /task t2 is scoped at ring 2 .*server\/src\/engine\.ts/);
   assert.doesNotMatch(t?.details ?? "", /a\.ts/);
   const [rings] = runStaticGates(w.state, "s1", dir, { dependencyTrack: false });
   assert.equal(rings?.gate, "rings");
@@ -740,18 +761,18 @@ test("task ring: kernel files under a ring-2 task fail the rings gate", () => {
 
 test("specSeparation: runner config, mocks and the acceptance tests' snapshots are off limits", () => {
   const w = world();
-  w.task("t1", "alice", ["anthill-backend/test/a.test.ts"]);
+  w.task("t1", "alice", ["server/test/a.test.ts"]);
   const cases: [string, boolean][] = [
-    ["anthill-backend/vitest.config.ts", false],
-    ["anthill-backend/vitest.workspace.mjs", false],
-    ["anthill-backend/jest.config.js", false],
-    ["anthill-backend/.mocharc.json", false],
-    ["anthill-backend/test/setupTests.ts", false],
-    ["anthill-backend/src/__mocks__/store.ts", false],
-    ["anthill-backend/test/__snapshots__/a.test.ts.snap", false],
-    ["anthill-backend/test/__snapshots__/other.test.ts.snap", true], // another test's snapshot
-    ["anthill-backend/test/new.test.ts", true], // the implementer's own new test
-    ["anthill-backend/src/routes.ts", true],
+    ["server/vitest.config.ts", false],
+    ["server/vitest.workspace.mjs", false],
+    ["server/jest.config.js", false],
+    ["server/.mocharc.json", false],
+    ["server/test/setupTests.ts", false],
+    ["server/src/__mocks__/store.ts", false],
+    ["server/test/__snapshots__/a.test.ts.snap", false],
+    ["server/test/__snapshots__/other.test.ts.snap", true], // another test's snapshot
+    ["server/test/new.test.ts", true], // the implementer's own new test
+    ["server/src/routes.ts", true],
   ];
   cases.forEach(([file, ok], i) => {
     w.submit(`s${i}`, "b1", "t1", [file]);
@@ -763,31 +784,31 @@ test("specSeparation: runner config, mocks and the acceptance tests' snapshots a
 
 test("specSeparation: with the checkout, changed helpers the acceptance tests import fail", () => {
   const w = world();
-  w.task("t1", "alice", ["anthill-backend/test/a.test.ts"]);
+  w.task("t1", "alice", ["server/test/a.test.ts"]);
   const dir = repo({
-    "anthill-backend/test/a.test.ts": [
+    "server/test/a.test.ts": [
       'import { check } from "./helpers/assert";',
       'import { fixture } from "../fixtures/data";',
       'import { route } from "../src/routes";',
       'import assert from "node:assert";',
     ].join("\n"),
-    "anthill-backend/test/helpers/assert.ts": 'export { deep } from "./deep.js";\nexport const check = 1;\n',
-    "anthill-backend/test/helpers/deep.ts": "export const deep = 1;\n",
-    "anthill-backend/fixtures/data.ts": "export const fixture = 1;\n",
-    "anthill-backend/src/routes.ts": 'import { util } from "./util";\nexport const route = 1;\n',
-    "anthill-backend/src/util.ts": "export const util = 1;\n",
-    "anthill-backend/test/unrelated.helper.ts": "export {};\n",
+    "server/test/helpers/assert.ts": 'export { deep } from "./deep.js";\nexport const check = 1;\n',
+    "server/test/helpers/deep.ts": "export const deep = 1;\n",
+    "server/fixtures/data.ts": "export const fixture = 1;\n",
+    "server/src/routes.ts": 'import { util } from "./util";\nexport const route = 1;\n',
+    "server/src/util.ts": "export const util = 1;\n",
+    "server/test/unrelated.helper.ts": "export {};\n",
   });
   // The module under test (and what it imports) is the implementation: fine.
-  w.submit("s1", "b1", "t1", ["anthill-backend/src/routes.ts", "anthill-backend/src/util.ts", "anthill-backend/test/unrelated.helper.ts"]);
+  w.submit("s1", "b1", "t1", ["server/src/routes.ts", "server/src/util.ts", "server/test/unrelated.helper.ts"]);
   passes(checkSpecSeparation(w.state, "s1", dir));
   // A direct helper, a transitive one (imported as .js) and a fixture all fail.
-  w.submit("s2", "b1", "t1", ["anthill-backend/src/routes.ts", "anthill-backend/test/helpers/assert.ts"]);
-  fails(checkSpecSeparation(w.state, "s2", dir), /test helpers .*: anthill-backend\/test\/helpers\/assert\.ts/);
-  w.submit("s3", "b1", "t1", ["anthill-backend/test/helpers/deep.ts"]);
-  fails(checkSpecSeparation(w.state, "s3", dir), /anthill-backend\/test\/helpers\/deep\.ts/);
-  w.submit("s4", "b1", "t1", ["anthill-backend/fixtures/data.ts"]);
-  fails(checkSpecSeparation(w.state, "s4", dir), /anthill-backend\/fixtures\/data\.ts/);
+  w.submit("s2", "b1", "t1", ["server/src/routes.ts", "server/test/helpers/assert.ts"]);
+  fails(checkSpecSeparation(w.state, "s2", dir), /test helpers .*: server\/test\/helpers\/assert\.ts/);
+  w.submit("s3", "b1", "t1", ["server/test/helpers/deep.ts"]);
+  fails(checkSpecSeparation(w.state, "s3", dir), /server\/test\/helpers\/deep\.ts/);
+  w.submit("s4", "b1", "t1", ["server/fixtures/data.ts"]);
+  fails(checkSpecSeparation(w.state, "s4", dir), /server\/fixtures\/data\.ts/);
   // Without the checkout only paths are judged.
   passes(checkSpecSeparation(w.state, "s4"));
   // runStaticGates passes the checkout.
@@ -808,4 +829,37 @@ test("specSeparation: acceptance globs and directories are followed too", () => 
   fails(checkSpecSeparation(w.state, "s1", dir), /test\/support\/env\.ts/);
   w.submit("s2", "b1", "t1", ["src/a.ts"]);
   passes(checkSpecSeparation(w.state, "s2", dir));
+});
+
+test("regression: rings follows <script src> and <link href> in ring-2 markup, as the bundler does", () => {
+  // UI is web/src, so ../../ reaches the repository root.
+  fails(importGate(`<script type="module" src="../../server/src/engine.ts"></script>\n`, `${UI}/page.html`), /<script src> .*ring-0/);
+  fails(importGate(`<template/>\n<script lang="ts" src="../../server/src/engine.ts"></script>\n`, `${UI}/X.vue`), /ring-0/);
+  fails(importGate(`<link rel="modulepreload" href='../../server/src/engine.ts'>\n`, `${UI}/p.htm`), /<link href> .*ring-0/);
+  fails(importGate(`<script src={kernel}></script>\n`, `${UI}/C.svelte`), /cannot be checked/);
+  // Ordinary pages pass: relative files in ring 2, external URLs, fragments.
+  passes(
+    importGate(`<script src="main.ts"></script><script src="https://cdn.example/x.js"></script><link rel="icon" href="#i">\n`, `${UI}/ok.html`, {
+      [`${UI}/main.ts`]: "export {};\n",
+    }),
+  );
+});
+
+test("regression: another letter case of a ring-0 or locked path is judged as the file it becomes on a case-insensitive filesystem", async () => {
+  const base = defaultRules();
+  const rules: Rules = {
+    ...base,
+    rings: [{ glob: "src/engine.ts", ring: 0 }, { glob: "src/offchain*.ts", ring: 0 }, { glob: "state.json", ring: 0 }, { glob: "data/**", ring: 0 }, ...base.rings],
+  };
+  for (const p of ["Src/offchain.ts", "SRC/engine.ts", "State.JSON", "TSConfig.json", "Data/log.jsonl", "procfile", "DOCKERFILE"]) {
+    assert.equal(ringOf(p, rules), 0, p);
+  }
+  assert.equal(submissionRing(["README.md", "Src/offchain.ts"], rules), 0);
+  for (const p of ["Package.json", "PACKAGE.JSON", ".NPMRC", "Package-Lock.json"]) {
+    assert.equal(isLocked(p, rules), true, p);
+  }
+  assert.equal(checkAirlock(["Package.json"], rules, { dependencyTrack: false }).pass, false);
+  // Ordinary files keep their ring.
+  assert.equal(ringOf("scripts/helper.js", rules), 1);
+  assert.equal(isLocked("docs/package.md", rules), false);
 });

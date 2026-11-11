@@ -176,7 +176,7 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
-      "User-Agent": "anthill-commons",
+      "User-Agent": "agent-commons",
       "X-GitHub-Api-Version": "2022-11-28",
     };
     const controller = new AbortController();
@@ -1013,8 +1013,12 @@ function repoPath(owner: string, repo: string): string {
   return `/repos/${owner}/${repo}`;
 }
 
+// A full commit sha (SHA-1 or SHA-256 object format): the only commit name
+// that cannot move between gating and merging.
+export const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
 function checkSha(sha: string): void {
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) throw new GitHubError(0, `invalid commit sha ${JSON.stringify(sha)}`);
+  if (!FULL_SHA.test(sha)) throw new GitHubError(0, `invalid commit sha ${JSON.stringify(sha)}`);
 }
 
 function checkPrNumber(n: number): void {

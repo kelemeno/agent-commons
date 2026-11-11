@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { claimStake, defaultRules, globToRegExp, ringOf, validateRules } from "../src/rules";
+import { ringOf } from "../src/gates/rings";
+import { clopperPearsonOneSided, poissonUpper } from "../src/risk";
+import { claimStake, defaultRules, globToRegExp, phase1Rules, validateRules } from "../src/rules";
 import type { Ring, Rules } from "../src/types";
 
 function withRules(edit: (r: Rules) => void): string[] {
@@ -28,7 +28,7 @@ test("defaultRules is valid and carries the design values", () => {
   assert.equal(r.assignedReviewers, 3);
   assert.equal(r.requireOtherModelFamily, true);
   assert.equal(r.plantRate, 0.15);
-  assert.deepEqual(r.stake, { base: 10, exponent: 1.5, ringMultiplier: [4, 1.5, 1], review: 5, finding: 5 });
+  assert.deepEqual(r.stake, { base: 10, exponent: 1.5, ringMultiplier: [4, 1.5, 1], review: 5, finding: 5, allowance: 100 });
   assert.deepEqual(r.rewards.bounty, { low: 5, medium: 15, high: 40, critical: 100 });
   assert.deepEqual(r.rewards.stageMultiplier, { dev: 1, release: 2, main: 4 });
   assert.equal(r.rewards.missedPlantPenalty, 6);
@@ -49,30 +49,44 @@ test("defaultRules returns a fresh object each call", () => {
   assert.ok(!b.rings.some((r) => r.glob === "x"));
 });
 
-test("default rings classify the Anthill monorepo", () => {
+test("default rings are generic: config, CI, build and checkout-writing files are ring 0, the rest ring 1", () => {
   const r = defaultRules();
   const cases: [string, Ring][] = [
-    ["anthill-backend/src/engine.ts", 0],
-    ["anthill-backend/src/auth.ts", 0],
-    ["anthill-backend/src/store.ts", 0],
-    ["anthill-backend/src/offchain.ts", 0],
-    ["anthill-backend/src/offchainVotes.ts", 0],
-    ["anthill-contracts/src/Anthill.sol", 0],
-    ["anthill-contracts/src/lib/Tree.sol", 0],
-    ["anthill-commons/src/ledger.ts", 0],
+    [".commons/rules.json", 0],
     [".github/workflows/ci.yml", 0],
-    ["anthill-backend/Dockerfile", 0],
+    [".github/CODEOWNERS", 0],
+    ["binding.gyp", 0], // npm runs it on install
+    ["server/binding.gyp", 0],
+    ["server/src/common.gypi", 0],
+    [".gitattributes", 0], // rewrites every checkout's bytes
+    ["web/.gitattributes", 0],
     ["Dockerfile", 0],
-    ["anthill-backend/render.yaml", 0],
+    ["server/Dockerfile", 0],
+    ["server/render.yaml", 0],
     ["docker-compose.yml", 0],
-    ["anthill-frontend/src/App.tsx", 2],
-    ["anthill-backend/src/routes.ts", 1],
-    ["anthill-backend/src/engine.test.ts", 1],
-    ["anthill-backend/src/sub/engine.ts", 1],
-    ["anthill-contracts/test/Anthill.t.sol", 1],
+    // No project's kernel is built in: a target declares its own.
+    ["server/src/auth.ts", 1],
+    ["server/src/engine.ts", 1],
+    ["web/src/App.tsx", 1],
+    ["src/ledger.ts", 1],
     ["README.md", 1],
   ];
   for (const [path, ring] of cases) assert.equal(ringOf(path, r), ring, path);
+  assert.ok(!r.rings.some((g) => g.ring === 2), "no default UI ring: that is project-specific too");
+});
+
+test("a target project's own kernel globs (anywhere) and UI globs (after the defaults) take effect", () => {
+  const base = defaultRules();
+  const r: Rules = { ...base, rings: [{ glob: "server/src/auth.ts", ring: 0 }, ...base.rings, { glob: "web/**", ring: 2 }] };
+  assert.deepEqual(validateRules(r), []);
+  assert.equal(ringOf("server/src/auth.ts", r), 0);
+  assert.equal(ringOf("web/src/App.tsx", r), 2);
+  assert.equal(ringOf("server/src/routes.ts", r), 1);
+  // Generic kernel files under the UI stay ring 0 because the UI glob comes last.
+  for (const p of ["web/vite.config.ts", "web/tsconfig.json", "web/scripts/build.sh", "web/index.html"]) assert.equal(ringOf(p, r), 0, p);
+  // Placed first, the UI glob would take them out of ring 0: the order matters.
+  const uiFirst: Rules = { ...base, rings: [{ glob: "web/**", ring: 2 }, ...base.rings] };
+  assert.equal(ringOf("web/vite.config.ts", uiFirst), 2);
 });
 
 test("default locked paths cover lockfiles and manifests", () => {
@@ -80,16 +94,40 @@ test("default locked paths cover lockfiles and manifests", () => {
   const isLocked = (p: string) => locked.some((re) => re.test(p));
   for (const p of [
     "package.json",
-    "anthill-backend/package.json",
+    "server/package.json",
     "package-lock.json",
-    "anthill-frontend/yarn.lock",
+    "web/yarn.lock",
     "a/b/pnpm-lock.yaml",
-    "anthill-contracts/foundry.toml",
+    "contracts/foundry.toml",
     ".gitmodules",
+    // What the package manager runs or pins at install.
+    ".pnpmfile.cjs",
+    ".yarn/releases/yarn-4.1.0.cjs",
+    ".yarn/plugins/plugin.cjs",
+    ".pnp.cjs",
+    ".pnp.loader.mjs",
+    "bun.lock",
+    "web/bun.lockb",
+    "deno.lock",
+    "npm-shrinkwrap.json",
+    "pnpm-workspace.yaml",
+    // Other ecosystems' manifests and lockfiles.
+    "Cargo.toml",
+    "crates/x/Cargo.lock",
+    "go.mod",
+    "go.sum",
+    "pyproject.toml",
+    "poetry.lock",
+    "uv.lock",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "Pipfile.lock",
+    "Gemfile",
+    "Gemfile.lock",
   ]) {
     assert.ok(isLocked(p), p);
   }
-  for (const p of ["anthill-backend/src/package.ts", "sub/.gitmodules", "package.json.bak"]) assert.ok(!isLocked(p), p);
+  for (const p of ["server/src/package.ts", "sub/.gitmodules", "package.json.bak"]) assert.ok(!isLocked(p), p);
 });
 
 test("globToRegExp: ** spans segments, * and ? stay within one", () => {
@@ -163,6 +201,18 @@ test("validateRules: counts", () => {
   rejects((r) => (r.reviewsPerSubmitCredit = 0), /reviewsPerSubmitCredit/);
 });
 
+test("validateRules: modelFamilies is a non-empty closed list of distinct lowercase names", () => {
+  assert.deepEqual(defaultRules().modelFamilies, ["claude", "gpt", "gemini", "qwen", "deepseek", "kimi", "glm", "llama", "mistral", "other"]);
+  rejects((r) => (r.modelFamilies = []), /modelFamilies must not be empty/);
+  rejects((r) => (r.modelFamilies = ["claude", "Claude"]), /modelFamilies\[1\] must be a lowercase name/);
+  rejects((r) => (r.modelFamilies = ["claude", "claude"]), /modelFamilies\[1\] duplicates claude/);
+  rejects((r) => (r.modelFamilies = ["claude", " gpt"]), /modelFamilies\[1\]/);
+  rejects((r) => (r.modelFamilies = ["x".repeat(65)]), /modelFamilies\[0\]/);
+  rejects((r) => (r.modelFamilies = [3 as unknown as string]), /modelFamilies\[0\]/);
+  rejects((r) => delete (r as Partial<Rules>).modelFamilies, /modelFamilies is missing/);
+  assert.deepEqual(withRules((r) => (r.modelFamilies = ["claude", "grok-2", "other"])), []);
+});
+
 test("validateRules: kernelSignoffs cannot exceed a non-empty kernelSigners list", () => {
   rejects((r) => (r.kernelSigners = ["alice"]), /kernelSignoffs exceeds/);
   assert.deepEqual(withRules((r) => (r.kernelSigners = ["alice", "bob"])), []);
@@ -221,49 +271,83 @@ test("claimStake: the protocol formula, superlinear in lines and scaled by ring"
   assert.ok(claimStake(200, 1, r) > 2 * claimStake(100, 1, r));
 });
 
-// Regression: these decide who may act or what runs, so they are kernel.
-test("default rings put auth wiring, build, deploy and toolchain config in ring 0", () => {
+// Regression: these decide what runs or how a checkout is written, so they are kernel.
+test("default rings put build, deploy and toolchain config in ring 0", () => {
   const r = defaultRules();
   for (const p of [
-    "anthill-backend/src/http.ts",
-    "anthill-backend/src/App.ts",
-    "anthill-backend/Procfile",
+    "server/Procfile",
     "Procfile",
-    "anthill-backend/tsconfig.json",
-    "anthill-frontend/tsconfig.app.json",
-    "anthill-backend/scripts/backupLog.sh",
-    "anthill-contracts/remappings.txt",
-    "anthill-contracts/lib/forge-std/src/Test.sol",
-    "anthill-backend/docker-compose.yml",
-    "anthill-frontend/.github-like/ci.yaml",
-    "anthill-backend/Dockerfile.prod",
-    "anthill-frontend/vite.config.ts",
-    "anthill-frontend/index.html",
+    "Makefile",
+    "server/Makefile",
+    "Jenkinsfile",
+    "server/tsconfig.json",
+    "web/tsconfig.app.json",
+    "server/scripts/backupLog.sh",
+    "server/docker-compose.yml",
+    "web/.github-like/ci.yaml",
+    "server/Dockerfile.prod",
+    "web/vite.config.ts",
     ".commons/rules.json",
-    "anthill-backend",
+    // Bundler, compiler and test-runner config: aliases redirect imports.
+    "webpack.config.js",
+    "rollup.config.mjs",
+    "esbuild.config.mjs",
+    "babel.config.js",
+    "web/.babelrc",
+    ".babelrc.json",
+    "next.config.js",
+    "nuxt.config.ts",
+    "svelte.config.js",
+    "astro.config.mjs",
+    "postcss.config.cjs",
+    "tailwind.config.ts",
+    "jest.config.js",
+    "vitest.config.ts",
+    "playwright.config.ts",
+    "web/jsconfig.json",
+    "contracts/remappings.txt",
+    // The HTML entry decides which scripts load.
+    "index.html",
+    "web/index.html",
+    // Build entry points.
+    "GNUmakefile",
+    "build/rules.mk",
+    "Containerfile",
+    "server/Containerfile.dev",
+    "CMakeLists.txt",
+    "cmake/deps.cmake",
+    "build.gradle",
+    "app/build.gradle.kts",
+    "settings.gradle.kts",
+    "gradlew",
+    "gradlew.bat",
+    "pom.xml",
+    "build.rs",
+    "setup.py",
+    "Rakefile",
+    "scripts/deploy.ps1",
+    "scripts/build.bat",
+    "scripts/build.cmd",
+    // Git hooks and deploy configs.
+    ".husky/pre-commit",
+    "netlify.toml",
+    "web/vercel.json",
+    "fly.toml",
+    "wrangler.toml",
   ]) {
     assert.equal(ringOf(p, r), 0, p);
   }
-  assert.equal(ringOf("anthill-backend/scripts/diffEngine.ts", r), 1);
-  assert.equal(ringOf("anthill-frontend/src/main.tsx", r), 2);
+  // Ordinary code and app config stay ring 1.
+  for (const p of ["src/config.ts", "web/src/site.ts", "docs/guide.md", "src/build.ts"]) assert.equal(ringOf(p, r), 1, p);
+  assert.equal(ringOf("server/scripts/diffEngine.ts", r), 1);
+  assert.equal(ringOf("web/src/main.tsx", r), 1);
 });
 
 test("default locked paths cover registry and toolchain overrides", () => {
   const locked = defaultRules().lockedPaths.map(globToRegExp);
-  for (const p of [".npmrc", "anthill-backend/.npmrc", "anthill-frontend/.yarnrc.yml", ".yarnrc", "anthill-backend/.nvmrc"]) {
+  for (const p of [".npmrc", "server/.npmrc", "web/.yarnrc.yml", ".yarnrc", "server/.nvmrc"]) {
     assert.ok(locked.some((re) => re.test(p)), p);
   }
-});
-
-// Regression: any backend source that checks admin tokens, passkeys, sessions
-// or reads the environment is kernel. Scans the real checkout when present.
-test("every Anthill backend source with auth or env handling is ring 0", (t) => {
-  const dir = path.join(__dirname, "..", "..", "anthill-backend", "src");
-  if (!fs.existsSync(dir)) return t.skip("anthill-backend not checked out");
-  const marker = /ADMIN_TOKEN|requireAdmin|passkey|webauthn|cookie|process\.env/i;
-  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".ts") && marker.test(fs.readFileSync(path.join(dir, f), "utf8")));
-  assert.ok(files.length > 0);
-  for (const f of files) assert.equal(ringOf(`anthill-backend/src/${f}`, defaultRules()), 0, f);
 });
 
 // Regression: `key in template` let Object.prototype names through as fields.
@@ -274,4 +358,59 @@ test("validateRules: Object.prototype names are not known fields", () => {
   }
   const proto = JSON.parse(JSON.stringify(defaultRules()).replace(/^\{/, '{"__proto__":{"x":1},')) as Rules;
   assert.ok(validateRules(proto).some((p) => /__proto__ is not a known field/.test(p)));
+});
+
+test("phase1Rules: the Phase 1 preset is valid and carries its values", () => {
+  const r = phase1Rules();
+  assert.deepEqual(validateRules(r), []);
+  assert.equal(r.minTreeDistance, 1, "owners admitted with no inviter are all at distance 2");
+  assert.equal(r.assignedReviewers, 2);
+  assert.equal(r.requireOtherModelFamily, true);
+  assert.equal(r.promotion.kernelSignoffs, 1);
+  assert.equal(r.promotion.minSeeds, 10);
+  // The allowance covers the largest claim the rules allow (a ring-0 task at
+  // maxLinesPerSubmission), or that task could not be claimed before anyone
+  // earned reputation, with headroom: a pending review commit, an open
+  // finding or a small slash must not put that task out of reach, and the
+  // claim's holder must still be able to back its review seats (regression:
+  // the allowance was exactly the largest claim). Phase 1's vesting tail is a
+  // week, not a month.
+  const largest = claimStake(r.maxLinesPerSubmission, 0, r);
+  assert.equal(largest, 320);
+  assert.equal(r.stake.allowance, 370);
+  assert.ok(r.stake.allowance - largest >= r.assignedReviewers * r.stake.review + r.stake.finding + r.rewards.falseFindingPenalty);
+  assert.equal(r.reviewsPerSubmitCredit, 1, "reviewed submissions must add credits, or gate failures freeze the group");
+  assert.equal(r.vesting.tailDays, 7);
+  assert.equal(r.review.commitHours, 12);
+  assert.deepEqual(r.rewards.bounty, { low: 5, medium: 10, high: 20, critical: 50 });
+  assert.ok(r.rewards.missedPlantPenalty > r.rewards.cleanReview);
+});
+
+test("phase1Rules keeps its base's rings, locked paths and families, and does not mutate it", () => {
+  const base = defaultRules();
+  base.rings = [{ glob: "server/src/auth.ts", ring: 0 }, ...base.rings];
+  base.lockedPaths = [...base.lockedPaths, "vendor/**"];
+  base.modelFamilies = ["claude", "gpt", "other"];
+  const before = structuredClone(base);
+  const r = phase1Rules(base);
+  assert.deepEqual(base, before);
+  assert.deepEqual(r.rings, base.rings);
+  assert.deepEqual(r.lockedPaths, base.lockedPaths);
+  assert.deepEqual(r.modelFamilies, base.modelFamilies);
+  assert.deepEqual(validateRules(r), []);
+  assert.deepEqual(phase1Rules().rings, defaultRules().rings);
+});
+
+test("phase1Rules: ten seeds pass recall and the critical bound only if all ten were caught", () => {
+  // The same arithmetic as promotion's recall and criticals checks, with no
+  // critical escapes and no calibration data (factor 1).
+  const p = phase1Rules().promotion;
+  const passes = (caught: number, seeds: number) => {
+    const r = clopperPearsonOneSided(caught, seeds, 0.9).lower;
+    const critical = (poissonUpper(0, 0.9) * (1 - r)) / r;
+    return seeds >= p.minSeeds && r >= p.minRecallLowerBound90 && critical < p.maxCriticalUpperBound90;
+  };
+  assert.equal(passes(10, 10), true);
+  assert.equal(passes(9, 10), false, "the bounds are wide: one miss in ten fails");
+  assert.equal(passes(9, 9), false, "fewer than minSeeds");
 });

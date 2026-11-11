@@ -1,0 +1,69 @@
+#!/bin/sh
+# A coordinator sandbox for strangers' finding tests: the argv prefix
+# `--sandbox` takes (src/findings.ts runs `<this> /bin/sh -c <command>` with
+# its cwd in the checkout). Use with --share-checkout, so the container's uid
+# can use the harness's directory:
+#
+#   commons coordinator run-once ... \
+#     --sandbox '["/abs/path/agent-commons/scripts/sandbox-docker"]' --share-checkout
+#
+# What it gives: another uid (65534, nobody), no network, no capabilities, no
+# new privileges, a read-only root with a small /tmp, and only the checkout
+# mounted (at /w). The preflight (`sandboxLeaks`) checks the uid, the checkout
+# and that nothing of the coordinator's is reachable before the first test.
+#
+# Notes for the operator:
+# - The harness runs this with a minimal environment (no DOCKER_HOST, a temp
+#   HOME). If the docker CLI cannot find its daemon that way, prefix the argv:
+#   ["env", "DOCKER_HOST=unix:///path/to/docker.sock", "<this script>"].
+# - Pin the image by digest for reproducible results:
+#   COMMONS_SANDBOX_IMAGE=node:22-bookworm-slim@sha256:... (set it in the argv
+#   the same way, with env).
+# - On a timeout the harness sends this script SIGTERM, and SIGKILL 10 s later
+#   (findings.ts KILL_GRACE_MS). SIGKILL would stop only the docker client,
+#   not the container, which could then keep writing the checkout while the
+#   harness removes it. So this script names its container, and on SIGTERM
+#   kills it and waits for the client before exiting. As a second line, the
+#   command inside runs under `timeout` (COMMONS_SANDBOX_SECONDS, default 600)
+#   and the harness removes checkouts with `rm -rf`, which never follows a
+#   link the container swaps in. Reap any stragglers too, e.g. from cron:
+#   docker ps -q --filter label=commons-sandbox | xargs -r docker kill
+# - The checkout is a bind mount of the host's temp directory, which this
+#   script cannot size-limit: run the coordinator with TMPDIR (or the
+#   harness's tmpRoot) on a small filesystem of its own (a tmpfs or loop mount
+#   of a few GB), so a test that writes until the disk is full fills that, not
+#   the disk that holds the ledger. Leftovers the container's uid made (Linux
+#   bind mounts keep its ownership) are opened up by the harness through this
+#   sandbox and removed; what remains is logged as a cleanup error.
+# - Dependencies: run them with --setup-command (e.g. 'npm ci --ignore-scripts'
+#   for a target with a lockfile; for one without,
+#   'npm install --ignore-scripts --no-package-lock --no-audit --no-fund')
+#   under a --setup-sandbox that has network, since this one has none.
+set -eu
+image="${COMMONS_SANDBOX_IMAGE:-node:22-bookworm-slim}"
+name="commons-sandbox-$$-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+client=""
+stop() {
+  docker kill "$name" >/dev/null 2>&1 || true
+  [ -z "$client" ] || wait "$client" 2>/dev/null || true
+  exit 143
+}
+trap stop TERM INT HUP
+docker run --rm -i --name "$name" \
+  --label commons-sandbox=1 \
+  --network=none \
+  --user 65534:65534 \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --pids-limit=512 \
+  --memory=2g \
+  --cpus=2 \
+  --read-only \
+  --tmpfs /tmp:rw,size=512m \
+  -e HOME=/tmp -e CI=1 -e LANG=C.UTF-8 \
+  -v "$PWD":/w -w /w \
+  "$image" timeout -s KILL "${COMMONS_SANDBOX_SECONDS:-600}" "$@" &
+client=$!
+set +e
+wait "$client"
+exit $?

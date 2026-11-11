@@ -8,6 +8,7 @@ import { Ledger, LedgerError, type Signer } from "../src/ledger";
 import { brier, commitmentFor, reviewerScores, submissionOutcome, validateVerdict } from "../src/review";
 import { defaultRules } from "../src/rules";
 import type { CommonsState, EntryBody, KeyId, ReviewVerdict, Severity } from "../src/types";
+import { assignmentBody } from "../src/selection";
 
 // ---------------------------------------------------------------------------
 // Fixture: a file-backed ledger with a clock in minutes. Owners alice (the
@@ -34,7 +35,7 @@ class World {
       path.join(this.dir, "ledger.jsonl"),
       {
         kind: "genesis",
-        project: "anthill",
+        project: "demo",
         admins: [this.admin.publicKey],
         coordinator: this.coord.publicKey,
         rules: defaultRules(),
@@ -99,7 +100,7 @@ class World {
         taskId: null,
         baseCommit: "base",
         headCommit: `head-${id}`,
-        changedFiles: ["anthill-backend/src/feature.ts"],
+        changedFiles: ["src/feature.ts"],
         linesChanged: 10,
       },
       this.key(agent),
@@ -108,13 +109,13 @@ class World {
   }
 
   assign(submissionId: string, agents: string[]): this {
-    this.append({ kind: "reviewAssignment", submissionId, beacon: "b", reviewers: agents.map((a) => this.id(a)) }, this.coord);
+    this.append(assignmentBody(this.state, submissionId, agents.map((a) => this.id(a)), "e"), this.coord);
     return this;
   }
 
   commit(submissionId: string, agent: string, v: ReviewVerdict): string {
     const salt = `salt-${agent}-${submissionId}`;
-    this.append({ kind: "reviewCommit", submissionId, commitment: commitmentFor(v, salt), stake: 5 }, this.key(agent));
+    this.append({ kind: "reviewCommit", submissionId, commitment: commitmentFor(v, salt, this.id(agent), { submissionId }), stake: 5 }, this.key(agent));
     return salt;
   }
 
@@ -146,11 +147,15 @@ class World {
       { kind: "findingResult", findingId: id, reproduced, failsOnHead: reproduced, passesOnParent: true, logDigest: "d" },
       this.coord,
     );
+    // An operator confirms every reproduction here: only a confirmed one is a known defect.
+    if (reproduced) this.append({ kind: "findingDecision", findingId: id, confirmed: true, reason: "real" }, this.admin);
     return id;
   }
 
+  // The ledger merges nothing unassigned; d1 is drawn when nobody was.
   merge(submissionId: string): this {
     this.append({ kind: "gateResult", submissionId, gate: "size", pass: true, details: "" }, this.coord);
+    if (!this.state.submissions.get(submissionId)?.assignment) this.assign(submissionId, ["d1"]);
     this.append({ kind: "merge", submissionId, commit: `m-${submissionId}` }, this.coord);
     return this;
   }
@@ -189,13 +194,18 @@ function setup(t: { after: (f: () => void) => void }): World {
 // commitmentFor / validateVerdict / brier
 // ---------------------------------------------------------------------------
 
-test("commitmentFor is sha256hex(canonical(verdict) + salt) and binds verdict and salt", () => {
+test("commitmentFor binds verdict, salt, reviewer and subject", () => {
   const v = verdict(0.3);
-  assert.equal(commitmentFor(v, "s"), sha256hex(canonical(v) + "s"));
-  // Key order does not matter (canonical), content and salt do.
-  assert.equal(commitmentFor({ findingIds: [], summary: v.summary, defectProbability: 0.3 }, "s"), commitmentFor(v, "s"));
-  assert.notEqual(commitmentFor(verdict(0.31), "s"), commitmentFor(v, "s"));
-  assert.notEqual(commitmentFor(v, "t"), commitmentFor(v, "s"));
+  const c = (vv: ReviewVerdict, salt = "s", reviewer = "k1", subject: { submissionId: string } | { snapshotId: string } = { submissionId: "s1" }) =>
+    commitmentFor(vv, salt, reviewer, subject);
+  assert.equal(c(v), sha256hex(canonical({ verdict: v, salt: "s", reviewer: "k1", subject: { submissionId: "s1" } })));
+  // Key order does not matter (canonical); content, salt, reviewer and subject do.
+  assert.equal(c({ findingIds: [], summary: v.summary, defectProbability: 0.3 }), c(v));
+  assert.notEqual(c(verdict(0.31)), c(v));
+  assert.notEqual(c(v, "t"), c(v));
+  assert.notEqual(c(v, "s", "k2"), c(v), "another reviewer cannot reuse the commitment");
+  assert.notEqual(c(v, "s", "k1", { submissionId: "s2" }), c(v), "nor another submission");
+  assert.notEqual(c(v, "s", "k1", { snapshotId: "s1" }), c(v), "nor a snapshot of the same id");
 });
 
 test("gaming: the ledger refuses a reveal that differs from the commitment", (t) => {

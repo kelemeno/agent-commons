@@ -9,21 +9,30 @@
 // they committed earlier only because it turned out to be a plant. So every
 // catch here is cut off at the seq where the review window closed
 // (reviewWindowCloseSeq). That is sound only while plantReveal happens after
-// the window closed. ARCHITECTURE.md requires it, but ledger.ts does not
-// enforce it yet, and SubmissionState.planted does not record the reveal seq.
-// A plant revealed early whose window closes later leaks the catches in
-// between.
+// the window closed. `commons plant reveal` refuses to reveal earlier
+// (reviewWindowClosed), but ledger.ts does not, and SubmissionState.planted
+// does not record the reveal seq: a custodian who bypasses the CLI and reveals
+// early, with the window closing later, leaks the catches in between.
+//
+// Timing outside the window matters too. Commitments are made in batches, well
+// ahead of any submission (the CLI takes at least PLANT_BATCH_MIN at once), and
+// plants are submitted by rotating agents that also do ordinary work, so
+// neither a fresh plantCommit nor the submitting agent marks a change. The
+// author's owner still does: every plant is the custodian's owner's, and that
+// is public. A reviewer who flags only that owner's work catches every plant
+// it is drawn for; plantStats.flagsOnPlantAuthorsWork shows it, nothing
+// corrects for it.
 
-import { createHash } from "node:crypto";
-
-import type { CommonsState, KeyId, ModelFamily, SubmissionState } from "./types";
+import { sha256hex } from "./crypto";
+import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
+import type { CommonsState, FindingState, KeyId, ModelFamily, Rules, SubmissionState } from "./types";
 
 // A revealed review at or above this probability counts as flagging the change.
 export const CATCH_THRESHOLD = 0.5;
 
 // sha256hex(submissionId + ":" + salt), the plantCommit contract in types.ts.
 export function plantCommitment(submissionId: string, salt: string): string {
-  return createHash("sha256").update(`${submissionId}:${salt}`, "utf8").digest("hex");
+  return sha256hex(`${submissionId}:${salt}`);
 }
 
 // True if (submissionId, salt) opens one of the recorded plant commitments
@@ -69,28 +78,54 @@ export function atOrAfter(iso: string, sinceIso: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Review window
+// Commit phase and review window
 // ---------------------------------------------------------------------------
 
-function findingsOn(state: CommonsState, s: SubmissionState) {
-  return [...state.findings.values()].filter((f) => "submissionId" in f.target && f.target.submissionId === s.id);
+// When the commit phase that starts at `startIso` (a reviewAssignment's or a
+// snapshot's `at`) ends, in ms: commitHours later. A missing start (a
+// hand-built state) counts as long ended.
+export function commitDeadlineMs(rules: Rules, startIso: string | undefined): number {
+  const start = startIso === undefined ? Number.NaN : Date.parse(startIso);
+  return Number.isNaN(start) ? Number.NEGATIVE_INFINITY : start + rules.review.commitHours * 3_600_000;
+}
+
+// When a reviewer of a commit phase starting at `startIso` must have revealed:
+// commitHours after the phase ended. Past it, on a subject that can never
+// close (a confirmed defect, a revealed plant), an unrevealed review counts
+// as p = 0 for the approver slash (incentives.settleFinding), so withholding a
+// confident "clean" once a defect is known is never cheaper than revealing it.
+export function revealDeadlineMs(rules: Rules, startIso: string | undefined): number {
+  return commitDeadlineMs(rules, startIso) + rules.review.commitHours * 3_600_000;
+}
+
+// The findings filed against the submission, in filing order (the ledger
+// keeps s.findingIds), without scanning every finding.
+function findingsOn(state: CommonsState, s: SubmissionState): FindingState[] {
+  return s.findingIds.map((id) => state.findings.get(id)).filter((f): f is FindingState => f !== undefined);
 }
 
 // The seq of the entry that closed the submission's review window, or null
 // while it is open. The window closes at the first of:
 // - the merge;
+// - the coordinator's reviewWindowClosed entry: the window's time ran out with
+//   a quorum of reveals. It lands before any merge, so a custodian always has
+//   the plant-reveal grace between it and the merge;
 // - the reveal that completed the assigned reviewers' verdicts. This needs at
 //   least one assigned reviewer: an empty assignment closes nothing;
-// - the result of the first reproduced finding. The submission can no longer
-//   merge, and the ledger stops taking review commits then.
-// An assigned reviewer who never reveals does not hold the window open for
-// ever. The coordinator merges once its review window has passed, and the merge
-// closes it.
+// - the result of the first reproduced finding nobody dismissed. The
+//   submission cannot merge then, and the ledger stops taking review commits.
+//   A dismissed one (it tested the intended change) closes nothing;
+// - the plant's reveal. Once the description is public nothing after it is
+//   blind, so the close never moves past it: without this, dismissing the
+//   reproduction that closed the window (after the custodian revealed in
+//   it) would reopen it, and reveals made after the plant was announced
+//   would count as catches.
 export function reviewWindowCloseSeq(state: CommonsState, submissionId: string): number | null {
   const s = state.submissions.get(submissionId);
   if (!s) return null;
   let close = Number.POSITIVE_INFINITY;
   if (s.merged) close = s.merged.seq;
+  if (s.windowClosed) close = Math.min(close, s.windowClosed.seq);
   const assigned = s.assignment?.reviewers ?? [];
   if (assigned.length > 0) {
     let last = Number.NEGATIVE_INFINITY;
@@ -102,8 +137,9 @@ export function reviewWindowCloseSeq(state: CommonsState, submissionId: string):
     close = Math.min(close, last);
   }
   for (const f of findingsOn(state, s)) {
-    if (f.result?.reproduced === true) close = Math.min(close, f.result.seq);
+    if (f.result && isReproducedOpen(f)) close = Math.min(close, f.result.seq);
   }
+  if (s.planted?.seq !== undefined) close = Math.min(close, s.planted.seq);
   return close === Number.POSITIVE_INFINITY ? null : close;
 }
 
@@ -125,12 +161,14 @@ function sameOwnerAsAuthor(state: CommonsState, s: SubmissionState, agent: KeyId
   return authorOwner !== undefined && state.agents.get(agent)?.owner === authorOwner;
 }
 
-// Finders whose reproduced finding was filed by `cutoff`. The harness result
-// may come later: the test was fixed when the finding was filed.
-function reproducedFindersOn(state: CommonsState, s: SubmissionState, cutoff: number): Set<KeyId> {
+// Finders whose confirmed finding was filed by `cutoff`. The harness result
+// and the operator's confirmation may come later: the test was fixed when the
+// finding was filed. A reproduction alone is no catch: filing a test that
+// pins the old text on every submission "reproduces" on every plant.
+function confirmedFindersOn(state: CommonsState, s: SubmissionState, cutoff: number): Set<KeyId> {
   const finders = new Set<KeyId>();
   for (const f of findingsOn(state, s)) {
-    if (f.result?.reproduced !== true || !(f.seq <= cutoff)) continue;
+    if (!isConfirmedDefect(f) || !(f.seq <= cutoff)) continue;
     if (sameOwnerAsAuthor(state, s, f.finder)) continue;
     finders.add(f.finder);
   }
@@ -152,32 +190,32 @@ function flaggers(state: CommonsState, s: SubmissionState, cutoff: number): Set<
 }
 
 // System-level catch, the one seeded recall counts. Within the review window,
-// either someone outside the author's owner filed a finding that reproduced, or
+// either someone outside the author's owner filed a finding later confirmed, or
 // an *assigned* reviewer revealed p >= 0.5. Open reviewers choose what they
 // review and pay only stake and Brier score for a flag. If their flags counted,
 // one agent flagging every submission would make recall 100%. Assigned seats
 // are drawn by beacon, so nobody can steer towards the plants. An
 // indiscriminate assigned reviewer still inflates recall on the plants they
 // are drawn for. plantStats.flagsOnOtherWork exposes that.
-// An open window gives false. For a revealed plant that means it was revealed
-// early, and no catch on it can be ordered before the reveal.
+// An open window gives false. A revealed plant's window is closed by its
+// reveal at the latest, so only catches made before the reveal count.
 export function plantCaught(state: CommonsState, submissionId: string): boolean {
   const s = state.submissions.get(submissionId);
   const cutoff = reviewWindowCloseSeq(state, submissionId);
   if (!s || cutoff === null) return false;
   const assigned = new Set(s.assignment?.reviewers ?? []);
   for (const r of flaggers(state, s, cutoff)) if (assigned.has(r)) return true;
-  return reproducedFindersOn(state, s, cutoff).size > 0;
+  return confirmedFindersOn(state, s, cutoff).size > 0;
 }
 
 // Per-reviewer statistic: this agent's own flag (assigned or open) or
-// reproduced finding, within the review window. It is a track record, not
+// confirmed finding, within the review window. It is a track record, not
 // evidence that the system stopped the plant.
 export function plantCaughtBy(state: CommonsState, submissionId: string, reviewer: KeyId): boolean {
   const s = state.submissions.get(submissionId);
   const cutoff = reviewWindowCloseSeq(state, submissionId);
   if (!s || cutoff === null) return false;
-  return flaggers(state, s, cutoff).has(reviewer) || reproducedFindersOn(state, s, cutoff).has(reviewer);
+  return flaggers(state, s, cutoff).has(reviewer) || confirmedFindersOn(state, s, cutoff).has(reviewer);
 }
 
 // Agents that looked at a submission within its review window. That means a
@@ -228,6 +266,12 @@ export type PlantStats = {
   // means the reviewer is not telling plants apart. ("Other" includes plants
   // not yet revealed.)
   flagsOnOtherWork: Map<KeyId, { reviewed: number; flagged: number }>;
+  // The same, over only the other submissions whose author's owner also
+  // authored a revealed plant in the window (in Phase 1: the custodian's
+  // ordinary work). Every plant comes from the custodian's owner, which is
+  // public, so a reviewer can catch plants by flagging that owner alone; a
+  // flag rate here far above flagsOnOtherWork shows it.
+  flagsOnPlantAuthorsWork: Map<KeyId, { reviewed: number; flagged: number }>;
 };
 
 // Agents missing from state.agents are grouped under this family.
@@ -247,7 +291,10 @@ export function plantStats(state: CommonsState, sinceIso: string): PlantStats {
     byReviewer: new Map(),
     byFamily: new Map(),
     flagsOnOtherWork: new Map(),
+    flagsOnPlantAuthorsWork: new Map(),
   };
+  const plantOwners = new Set(revealedPlants(state, sinceIso).map((s) => state.agents.get(s.author)?.owner));
+  plantOwners.delete(undefined);
   for (const s of revealedPlants(state, sinceIso)) {
     stats.seeds += 1;
     if (plantCaught(state, s.id)) stats.caught += 1;
@@ -268,13 +315,17 @@ export function plantStats(state: CommonsState, sinceIso: string): PlantStats {
     if (s.planted !== undefined || !atOrAfter(s.submittedAt, sinceIso)) continue;
     const cutoff = reviewWindowCloseSeq(state, s.id);
     if (cutoff === null) continue;
+    const byPlantAuthor = plantOwners.has(state.agents.get(s.author)?.owner);
     for (const r of s.reviews) {
       if (r.verdict === undefined || r.revealedSeq === undefined || r.revealedSeq > cutoff) continue;
       if (sameOwnerAsAuthor(state, s, r.reviewer)) continue;
-      const t = stats.flagsOnOtherWork.get(r.reviewer) ?? { reviewed: 0, flagged: 0 };
-      t.reviewed += 1;
-      if (r.verdict.defectProbability >= CATCH_THRESHOLD) t.flagged += 1;
-      stats.flagsOnOtherWork.set(r.reviewer, t);
+      const flagged = r.verdict.defectProbability >= CATCH_THRESHOLD;
+      for (const m of byPlantAuthor ? [stats.flagsOnOtherWork, stats.flagsOnPlantAuthorsWork] : [stats.flagsOnOtherWork]) {
+        const t = m.get(r.reviewer) ?? { reviewed: 0, flagged: 0 };
+        t.reviewed += 1;
+        if (flagged) t.flagged += 1;
+        m.set(r.reviewer, t);
+      }
     }
   }
   return stats;

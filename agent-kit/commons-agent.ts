@@ -17,6 +17,12 @@
 //                                            inside a git working tree unless --force); prints {keyId, publicKey}
 //   whoami                                   {keyId, publicKey} of the agent key
 //   head | assignments
+//   pending                                  reviews and attestations this agent committed and has not
+//                                            revealed, with revealFrom and whether this machine's salt
+//                                            store still holds the salt (without it the commit is lost)
+//   tasks [--all]                            the claimable tasks (or all), with ring, size, acceptance tests,
+//                                            claim stake and the proposal (fenced as untrusted)
+//   task <taskId>                            one task, the same fields
 //   patch <submissionId>                     prints the submitted diff (raw, not JSON)
 //   propose --title T --evidence file.json   evidence: an Evidence[] JSON array
 //   claim <taskId> --until <date> --stake N  until: any date Date.parse reads; sent as toISOString()
@@ -29,7 +35,9 @@
 //                                            {base, tree, head} = commonsCommit; no key or network needed.
 //                                            Reviewers compare head with the declared headCommit, and can
 //                                            check the head out (the objects are written to --repo).
-//   finding --target submission:<id>|snapshot:<id> --severity S --test-path P --command C --stake N --test-file F
+//   finding --target submission:<id>|snapshot:<id> --severity S --test-path P --command C --stake N --test-file F [--id ID]
+//                                            the id is printed to stderr before posting
+//   upload-test <findingId> --test-file F    retry a failed test upload (before findingGraceHours); never file again
 //   commit-review <submissionId> <verdict.json|-> [--stake N]
 //   reveal-review <submissionId>
 //   attest-commit <snapshotId> <verdict.json|-> --stake N
@@ -48,6 +56,7 @@ import {
   commonsCommit,
   DEFAULT_MAX_STAKE,
   fileSaltStore,
+  FindingUploadError,
   newId,
   SubmissionUploadError,
   type AgentKey,
@@ -58,7 +67,7 @@ import type { Evidence, ReviewVerdict, Severity } from "../src/types";
 
 type Io = { out: (s: string) => void; err: (s: string) => void; stdin: () => string };
 
-const BOOLEAN_FLAGS = new Set(["force"]);
+const BOOLEAN_FLAGS = new Set(["force", "all"]);
 
 function split(argv: string[]): { pos: string[]; flags: Record<string, string> } {
   const pos: string[] = [];
@@ -175,13 +184,8 @@ export async function main(
     if (!baseUrl) throw new Usage("COMMONS_URL is not set");
     const maxStake = env.COMMONS_MAX_STAKE === undefined ? DEFAULT_MAX_STAKE : Number(env.COMMONS_MAX_STAKE);
     if (!Number.isSafeInteger(maxStake) || maxStake < 0) throw new Usage("COMMONS_MAX_STAKE must be a non-negative integer");
-    const c = new CommonsClient({
-      baseUrl,
-      agentKey: key,
-      fetch: fetchFn,
-      maxStake,
-      saltStore: fileSaltStore(env.COMMONS_SALT_DIR ?? path.join(os.homedir(), ".commons", "salts")),
-    });
+    const saltStore = fileSaltStore(env.COMMONS_SALT_DIR ?? path.join(os.homedir(), ".commons", "salts"));
+    const c = new CommonsClient({ baseUrl, agentKey: key, fetch: fetchFn, maxStake, saltStore });
     io.err(`commons-agent: signing as ${c.keyId}${OWNER_COMMANDS.has(cmd ?? "") ? " (owner key)" : ""}\n`);
     const verdictArg = (a: string | undefined): ReviewVerdict => {
       if (a === undefined) throw new Usage("verdict file (or -) is required");
@@ -198,6 +202,17 @@ export async function main(
         return 0;
       case "assignments":
         print(await c.assignments());
+        return 0;
+      case "pending": {
+        const list = await c.pendingReveals();
+        print(list.map((p) => ({ ...p, saltHere: saltStore.load(p.kind, p.kind === "review" ? p.submissionId : p.snapshotId) !== null })));
+        return 0;
+      }
+      case "tasks":
+        print(await c.tasks({ open: flags.all !== "true" }));
+        return 0;
+      case "task":
+        print(await c.task(id(0, "taskId")));
         return 0;
       case "patch":
         io.out(await c.patch(id(0, "submissionId")));
@@ -240,9 +255,12 @@ export async function main(
         const t = /^(submission|snapshot):(.+)$/.exec(need(flags, "target"));
         if (!t) throw new Usage("--target must be submission:<id> or snapshot:<id>");
         const target = t[1] === "submission" ? { submissionId: t[2] ?? "" } : { snapshotId: t[2] ?? "" };
+        const fid = flags.id ?? newId("f");
+        // Printed first: if the upload fails, this id is what upload-test needs.
+        io.err(`commons-agent: finding id ${fid}\n`);
         const r = await c.fileFinding(
           {
-            id: flags.id,
+            id: fid,
             target,
             severity: need(flags, "severity") as Severity,
             testPath: need(flags, "test-path"),
@@ -252,6 +270,11 @@ export async function main(
           fs.readFileSync(need(flags, "test-file"), "utf8"),
         );
         print({ id: r.id, seq: r.seq });
+        return 0;
+      }
+      case "upload-test": {
+        const r = await c.uploadFindingTest(id(0, "findingId"), fs.readFileSync(need(flags, "test-file"), "utf8"));
+        print({ sha256: r.sha256, created: r.created });
         return 0;
       }
       case "commit-review": {
@@ -291,6 +314,10 @@ export async function main(
   } catch (e) {
     if (e instanceof SubmissionUploadError) {
       io.err(`commons-agent: ${e.message}\n  retry: commons-agent upload-patch ${e.submissionId} --patch <file>\n`);
+      return 1;
+    }
+    if (e instanceof FindingUploadError) {
+      io.err(`commons-agent: ${e.message}\n  retry: commons-agent upload-test ${e.findingId} --test-file <file>\n`);
       return 1;
     }
     io.err(`commons-agent: ${(e as Error).message}\n`);

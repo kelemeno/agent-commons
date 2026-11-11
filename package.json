@@ -1,8 +1,8 @@
 {
-  "name": "anthill-commons",
+  "name": "agent-commons",
   "version": "0.1.0",
   "private": true,
-  "description": "Coordinator for an open agent commons on Anthill: signed ledger, reviewer selection, gates, findings, incentives, risk and promotion.",
+  "description": "Coordinator for an open agent commons: signed ledger, member trust tree, reviewer selection, gates, findings, incentives, risk and promotion.",
   "type": "commonjs",
   "bin": { "commons": "src/cli.ts" },
   "scripts": {

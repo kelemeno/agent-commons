@@ -7,10 +7,13 @@ import * as path from "node:path";
 import { canonical, generateKeyPair, keyIdOf, sha256hex } from "../src/crypto";
 import { Ledger } from "../src/ledger";
 import { plantCommitment } from "../src/plants";
+import { assignmentBeacon, commitmentFor } from "../src/review";
 import { coveredSubmissionIds, evaluatePromotion } from "../src/promotion";
-import { claimStake, defaultRules } from "../src/rules";
-import { treeFromParents } from "../src/tree";
+import { claimStake, defaultRules, phase1Rules } from "../src/rules";
+import { MEMBER_ROOT, treeDigest, treeFromParents } from "../src/members";
+import { submitCredits } from "../src/incentives";
 import type { EntryBody, KeyId, ModelFamily, Rules, Severity } from "../src/types";
+import { assignmentBody, drawAssignment } from "../src/selection";
 
 // --- a real, signed ledger ----------------------------------------------------
 
@@ -22,7 +25,15 @@ const key = (): Key => {
 
 const T0 = Date.UTC(2026, 9, 1); // 2026-10-01
 const HOUR = 3_600_000;
-const ring1 = (name: string) => [`anthill-backend/src/${name}.ts`];
+const ring1 = (name: string) => [`src/${name}.ts`];
+// The fixture project's kernel, declared in its rules as a target project
+// declares its own (defaultRules names no project paths).
+const KERNEL_FILE = "src/kernel/engine.ts";
+function projectRules(): Rules {
+  const r = defaultRules();
+  r.rings = [{ glob: "src/kernel/**", ring: 0 }, ...r.rings];
+  return r;
+}
 
 const dirs: string[] = [];
 after(() => {
@@ -43,7 +54,7 @@ class World {
     dirs.push(dir);
     this.ledger = Ledger.create(
       path.join(dir, "ledger.jsonl"),
-      { kind: "genesis", project: "anthill", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules },
+      { kind: "genesis", project: "demo", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules },
       new Date(this.t).toISOString(),
     );
   }
@@ -102,26 +113,52 @@ class World {
     );
     this.coordinator({ kind: "gateResult", submissionId: id, gate: "tests", pass: true, details: "ok" });
   }
+  // A genuine draw over the member tree, with entropy tried until it seats
+  // exactly the first rules.assignedReviewers of `reviewers` (the rest review
+  // openly, which coverage counts the same). When the rules have more seats
+  // than `reviewers`, a draw that also seats others is taken; those never
+  // commit, so reveals wait for the commit deadline. Promotion verifies it.
   assign(id: string, reviewers: string[]): void {
-    this.coordinator({
-      kind: "reviewAssignment",
-      submissionId: id,
-      beacon: "beacon",
-      reviewers: reviewers.map((r) => this.agentKey(r).keyId),
-    });
+    const want = reviewers.slice(0, this.state.rules.assignedReviewers).map((r) => this.agentKey(r).keyId);
+    let fallback: EntryBody | undefined;
+    for (let i = 0; i < 1024; i++) {
+      const d = drawAssignment(this.state, id, `e-${i}`);
+      if (!want.every((k) => d.reviewers.includes(k))) continue;
+      if (d.reviewers.length === want.length) {
+        this.coordinator(d.body);
+        return;
+      }
+      fallback ??= d.body;
+    }
+    assert.ok(fallback, `no draw seats ${reviewers.join(", ")} on ${id}`);
+    this.coordinator(fallback);
   }
-  // All commits first, then all reveals: the ledger closes commits at the first reveal.
+  // All commits first, then all reveals: the ledger closes commits at the first
+  // reveal, and reveals wait for the commit phase (every assigned reviewer
+  // committed, or its deadline; a snapshot's always runs to its deadline).
+  // A submission without an assignment gets the reviewers given.
   reviews(id: string, verdicts: [string, number][], on: "submission" | "snapshot" = "submission"): void {
+    if (on === "submission" && !this.state.submissions.get(id)?.assignment) this.assign(id, verdicts.map(([a]) => a));
     const salts = verdicts.map(([agent]) => `salt-${id}-${agent}-${this.n++}`);
     verdicts.forEach(([agent, p], i) => {
       const v = { defectProbability: p, summary: "looked", findingIds: [] };
-      const commitment = sha256hex(canonical(v) + salts[i]);
+      const commitment = commitmentFor(v, salts[i] as string, this.agentKey(agent).keyId, on === "submission" ? { submissionId: id } : { snapshotId: id });
       const body: EntryBody =
         on === "submission"
           ? { kind: "reviewCommit", submissionId: id, commitment, stake: 5 }
           : { kind: "attestCommit", snapshotId: id, commitment, stake: 5 };
       this.append(body, this.agentKey(agent));
     });
+    const hours = this.state.rules.review.commitHours;
+    if (on === "snapshot") {
+      this.t = Math.max(this.t, Date.parse(this.state.snapshots.get(id)?.at ?? "") + hours * HOUR);
+    } else {
+      const s = this.state.submissions.get(id);
+      const a = s?.assignment;
+      if (a && !a.reviewers.every((k) => s.reviews.some((r) => r.reviewer === k))) {
+        this.t = Math.max(this.t, Date.parse(a.at ?? "") + hours * HOUR);
+      }
+    }
     verdicts.forEach(([agent, p], i) => {
       const verdict = { defectProbability: p, summary: "looked", findingIds: [] };
       const salt = salts[i] as string;
@@ -132,7 +169,15 @@ class World {
       this.append(body, this.agentKey(agent));
     });
   }
+  // The ledger merges nothing unassigned: without an assignment one
+  // reviewer outside the author's owner is drawn (and never reviews).
   merge(id: string): void {
+    const s = this.state.submissions.get(id);
+    if (s && !s.assignment) {
+      const author = this.state.agents.get(s.author)?.owner;
+      const pick = ["b1", "c1", "d1"].find((a) => this.state.agents.get(this.agentKey(a).keyId)?.owner !== author) as string;
+      this.assign(id, [pick]);
+    }
     this.coordinator({ kind: "merge", submissionId: id, commit: `merge-${id}` });
   }
   snapshot(id: string, submissionIds: string[], previousSnapshotId: string | null = null): void {
@@ -157,7 +202,8 @@ class World {
       this.agentKey(finder),
     );
   }
-  result(findingId: string, reproduced: boolean): void {
+  // A reproduction is confirmed by the admin unless decide says otherwise.
+  result(findingId: string, reproduced: boolean, decide: "confirm" | "dismiss" | "none" = "confirm"): void {
     this.coordinator({
       kind: "findingResult",
       findingId,
@@ -166,6 +212,9 @@ class World {
       passesOnParent: true,
       logDigest: "d",
     });
+    if (reproduced && decide !== "none") {
+      this.append({ kind: "findingDecision", findingId, confirmed: decide === "confirm", reason: "judged" }, this.admin);
+    }
   }
 
   // A plant through the normal path: committed by the custodian before the
@@ -189,11 +238,15 @@ class World {
   }
 }
 
-const tree = treeFromParents({ root: null, alice: "root", bob: "root", carol: "root", dave: "root", cust: "root" });
-
+// Every owner is admitted with no inviter, so every pair is at distance 2 in
+// the member tree, and minTreeDistance 1 makes every non-author eligible.
+// One assigned seat, so World.assign can seat exactly the reviewer a test
+// names; the other reviewers a test names review openly.
 function rules(over: (r: Rules) => void = () => {}): Rules {
-  const r = defaultRules();
+  const r = projectRules();
   r.kernelSigners = ["erin", "frank"];
+  r.minTreeDistance = 1;
+  r.assignedReviewers = 1;
   over(r);
   return r;
 }
@@ -238,7 +291,7 @@ function healthy(opts: { plants?: number; missed?: number; rules?: Rules } = {})
 }
 
 function check(w: World, snapshotId: string, name: string, now = w.nowPlus(0)) {
-  const r = evaluatePromotion(w.state, tree, snapshotId, now);
+  const r = evaluatePromotion(w.state, snapshotId, now);
   const c = r.checks.find((x) => x.name === name);
   assert.ok(c, `no check ${name} in ${JSON.stringify(r.checks)}`);
   return { ...c, overall: r.pass };
@@ -248,26 +301,58 @@ function check(w: World, snapshotId: string, name: string, now = w.nowPlus(0)) {
 
 test("a healthy snapshot passes every check, in the documented order", () => {
   const w = healthy();
-  const r = evaluatePromotion(w.state, tree, "S1", w.nowPlus(0));
+  const r = evaluatePromotion(w.state, "S1", w.nowPlus(0));
   assert.deepEqual(
     r.checks.map((c) => c.name),
-    ["notPromoted", "lineage", "coverage", "recall", "criticals", "openIssues", "kernel", "soak"],
+    ["notPromoted", "lineage", "coverage", "assignments", "recall", "criticals", "openIssues", "kernel", "soak"],
   );
   for (const c of r.checks) assert.equal(c.pass, true, `${c.name}: ${c.detail}`);
   assert.equal(r.pass, true);
   assert.match(check(w, "S1", "recall").detail, /^60\/60 /);
 });
 
+test("assignments: every covered draw must verify over the member tree before it; a hand-picked panel fails", () => {
+  const w = people(rules((r) => (r.assignedReviewers = 2)));
+  w.submit("s1", "a1", ring1("routes"));
+  w.coordinator(drawAssignment(w.state, "s1", "round-1").body);
+  w.submit("s2", "b1", ring1("votes"));
+  // A hand-picked panel recorded with an honest beacon and tree digest: the ledger cannot tell.
+  const honest = drawAssignment(w.state, "s2", "round-2").reviewers;
+  const other = ["a1", "c1", "d1", "k1"].map((a) => w.agentKey(a).keyId).find((k) => !honest.includes(k));
+  assert.ok(other);
+  w.coordinator(assignmentBody(w.state, "s2", [honest[0] as KeyId, other], "round-2"));
+  // Owners admitted later change the current tree, not the one each draw used.
+  w.owner("gus");
+  for (const sid of ["s1", "s2"]) w.merge(sid);
+  w.snapshot("S1", ["s1", "s2"]);
+  const c = check(w, "S1", "assignments");
+  assert.equal(c.pass, false);
+  assert.equal(c.overall, false);
+  assert.match(c.detail, /^draw does not verify: s2$/);
+});
+
+test("assignments: a panel recorded over a made-up tree digest never reaches the ledger", () => {
+  const w = people(rules((r) => (r.assignedReviewers = 2)));
+  w.submit("s1", "a1", ring1("routes"));
+  // A tree of the coordinator's choosing, in which only bob and carol are eligible.
+  const made = treeDigest(
+    treeFromParents({ [MEMBER_ROOT]: null, far: MEMBER_ROOT, alice: MEMBER_ROOT, bob: "far", carol: "far", dave: "alice", cust: "alice", erin: "alice", frank: "alice" }),
+  );
+  const body = assignmentBody(w.state, "s1", [w.agentKey("b1").keyId, w.agentKey("c1").keyId], "round-1");
+  assert.throws(() => w.coordinator({ ...body, treeDigest: made, beacon: assignmentBeacon("s1", "head-s1", "round-1") }), /treeDigest/);
+  assert.equal(w.state.submissions.get("s1")?.assignment, undefined);
+});
+
 test("unknown snapshot fails; a nowIso without a zone throws", () => {
   const w = people();
-  const r = evaluatePromotion(w.state, tree, "nope", "2026-10-02T00:00:00.000Z");
+  const r = evaluatePromotion(w.state, "nope", "2026-10-02T00:00:00.000Z");
   assert.equal(r.pass, false);
   assert.deepEqual(
     r.checks.map((c) => c.name),
     ["snapshot"],
   );
-  assert.throws(() => evaluatePromotion(w.state, tree, "nope", "2026-10-02T00:00:00"), RangeError);
-  assert.throws(() => evaluatePromotion(w.state, tree, "nope", "yesterday"), RangeError);
+  assert.throws(() => evaluatePromotion(w.state, "nope", "2026-10-02T00:00:00"), RangeError);
+  assert.throws(() => evaluatePromotion(w.state, "nope", "yesterday"), RangeError);
 });
 
 test("notPromoted: a promoted snapshot cannot be promoted again", () => {
@@ -305,11 +390,10 @@ test("coverage: a submission reviewed by two families fails and is named", () =>
   ]);
   w.merge("s3");
   w.snapshot("S2", ["s3"], "S1"); // S1's attestation does not count for s3
-  w.advance(100);
   const c = check(w, "S2", "coverage");
   assert.equal(c.pass, false);
   assert.match(c.detail, /s3: 2\/3 families \[gpt,qwen\], 2\/2 owners/);
-  // An attestation from a third family fixes it.
+  // An attestation from a third family, within S2's commit phase, fixes it.
   w.reviews("S2", [["d1", 0.1]], "snapshot");
   assert.equal(check(w, "S2", "coverage").pass, true);
 });
@@ -356,6 +440,15 @@ test("coverage: an agent that obeyed a honeytoken stops vouching", () => {
   assert.match(c.detail, /s1: 2\/3 families \[deepseek,gpt\]/);
 });
 
+test("coverage: an agent the coordinator revoked for another reason (a leaked key) stops vouching too", () => {
+  const w = healthy();
+  w.coordinator({ kind: "agentRevoked", agent: w.agentKey("c1").keyId, reason: "key leaked" });
+  assert.equal(w.state.agents.get(w.agentKey("c1").keyId)?.revokedBy, "coordinator");
+  const c = check(w, "S1", "coverage");
+  assert.equal(c.pass, false);
+  assert.match(c.detail, /s1: 2\/3 families \[deepseek,gpt\]/);
+});
+
 test("coverage: an owner revoking their own agent (key rotation) does not withdraw its verdicts", () => {
   // Regression: revocation used to drop the verdicts, so an owner could make a
   // snapshot unpromotable for free once nobody could replace the coverage.
@@ -364,9 +457,10 @@ test("coverage: an owner revoking their own agent (key rotation) does not withdr
     { kind: "agentRevoked", agent: w.agentKey("c1").keyId, reason: "rotating keys" },
     w.owners.get("carol") as Key,
   );
+  assert.equal(w.state.agents.get(w.agentKey("c1").keyId)?.revokedBy, "owner");
   w.agent("c2", "carol", "qwen");
   assert.equal(check(w, "S1", "coverage").pass, true);
-  assert.equal(evaluatePromotion(w.state, tree, "S1", w.nowPlus(0)).pass, true);
+  assert.equal(evaluatePromotion(w.state, "S1", w.nowPlus(0)).pass, true);
 });
 
 test("coverage runs over unpromoted ancestors; attestations count only on the snapshot that lists the work", () => {
@@ -427,7 +521,7 @@ test("coverage: attesters of a later snapshot do not vouch for an unattested anc
     "snapshot",
   );
   w.advance(100);
-  const r = evaluatePromotion(w.state, tree, "S2", w.nowPlus(0));
+  const r = evaluatePromotion(w.state, "S2", w.nowPlus(0));
   const c = r.checks.find((x) => x.name === "coverage");
   assert.equal(c?.pass, false);
   assert.match(c?.detail ?? "", /s0: 1\/3 families \[gpt\], 1\/2 owners/);
@@ -600,16 +694,30 @@ test("openIssues: an unresolved high finding blocks; not reproduced clears it; r
   assert.equal(check(w, "S1", "openIssues").pass, true);
 
   w.finding("f2", "c1", { submissionId: "s2" }, "critical");
-  w.result("f2", true);
+  w.result("f2", true, "none");
   c = check(w, "S1", "openIssues");
   assert.equal(c.pass, false);
-  assert.match(c.detail, /f2 \(critical\) reproduced/);
+  assert.match(c.detail, /f2 \(critical\) reproduced, awaiting an operator's decision/);
+  w.append({ kind: "findingDecision", findingId: "f2", confirmed: true, reason: "real" }, w.admin);
+  assert.match(check(w, "S1", "openIssues").detail, /f2 \(critical\) a confirmed defect/);
 });
 
-test("openIssues: unresolved low and medium findings do not block; a reproduced one of any severity does (probe P4)", () => {
+test("openIssues: a dismissed reproduction (a change detector) is cleared", () => {
+  const w = healthy();
+  w.finding("f1", "c1", { submissionId: "s1" }, "critical");
+  w.result("f1", true, "dismiss");
+  assert.equal(check(w, "S1", "openIssues").pass, true);
+});
+
+test("openIssues: an unresolved finding of any severity blocks, as the coordinator's rule did; a reproduced one of any severity does (probe P4)", () => {
+  // One rule: `commons promote run` and the coordinator used to disagree here
+  // (the CLI shipped a snapshot with a pending low or medium finding).
   const w = healthy();
   w.finding("f1", "c1", { submissionId: "s1" }, "low");
   w.finding("f2", "d1", { submissionId: "s1" }, "medium");
+  assert.equal(check(w, "S1", "openIssues").detail, "f1 (low) unresolved; f2 (medium) unresolved");
+  w.result("f1", false);
+  w.result("f2", false);
   w.finding("f3", "c1", { submissionId: "s2" }, "medium");
   w.result("f3", false);
   assert.equal(check(w, "S1", "openIssues").pass, true);
@@ -618,11 +726,11 @@ test("openIssues: unresolved low and medium findings do not block; a reproduced 
   w.result("f4", true);
   const c = check(w, "S1", "openIssues");
   assert.equal(c.pass, false);
-  assert.equal(c.detail, "f4 (medium) reproduced");
+  assert.equal(c.detail, "f4 (medium) a confirmed defect");
   assert.equal(c.overall, false);
   w.finding("f5", "d1", { submissionId: "s1" }, "low");
   w.result("f5", true);
-  assert.equal(check(w, "S1", "openIssues").detail, "f4 (medium) reproduced; f5 (low) reproduced");
+  assert.equal(check(w, "S1", "openIssues").detail, "f4 (medium) a confirmed defect; f5 (low) a confirmed defect");
 });
 
 test("openIssues: findings on the snapshot or a covered ancestor snapshot block; on another snapshot they do not", () => {
@@ -683,7 +791,7 @@ function kernelWorld(r: Rules = rules()): World {
       kind: "proposal",
       id: "P1",
       title: "fix engine",
-      evidence: [{ kind: "location", file: "anthill-backend/src/engine.ts", line: 1, note: "n" }],
+      evidence: [{ kind: "location", file: KERNEL_FILE, line: 1, note: "n" }],
     },
     w.agentKey("a1"),
   );
@@ -700,7 +808,7 @@ function kernelWorld(r: Rules = rules()): World {
     { kind: "claim", taskId: "T1", until: w.nowPlus(24), stake: claimStake(50, 0, w.state.rules) },
     w.agentKey("a1"),
   );
-  w.submit("sk", "a1", ["anthill-backend/src/engine.ts"], "T1");
+  w.submit("sk", "a1", [KERNEL_FILE], "T1");
   w.assign("sk", ["b1", "c1"]);
   w.reviews("sk", [
     ["b1", 0.1],
@@ -731,7 +839,7 @@ test("kernel: a ring 0 change needs k sign-offs from kernel signers", () => {
   assert.match(c.detail, /1\/2 kernel sign-offs \[erin\]/);
   w.signoff("S2", "frank");
   assert.equal(check(w, "S2", "kernel").pass, true);
-  assert.equal(evaluatePromotion(w.state, tree, "S2", w.nowPlus(0)).pass, true);
+  assert.equal(evaluatePromotion(w.state, "S2", w.nowPlus(0)).pass, true);
 });
 
 test("kernel: sign-offs on an ancestor snapshot do not count; the ancestor's own ring 0 work is still covered", () => {
@@ -766,6 +874,24 @@ test("kernel: a signer removed by a rules change no longer counts", () => {
   assert.match(c.detail, /1\/2 kernel sign-offs \[erin\]/);
 });
 
+test("regression: a kernel signer's own non-kernel work in the snapshot does not stop its sign-off (Phase 1 would deadlock)", () => {
+  // dave (agent d1) is a kernel signer and wrote a ring-1 change that S3
+  // covers with alice's kernel change sk; alice, the kernel author, may not sign.
+  const w = kernelWorld(rules((r) => (r.kernelSigners = ["dave", "alice"])));
+  w.submit("sd", "d1", ring1("dave-docs"));
+  w.assign("sd", ["b1", "c1"]);
+  w.reviews("sd", [
+    ["b1", 0.1],
+    ["c1", 0.1],
+  ]);
+  w.merge("sd");
+  w.snapshot("S3", ["sd"], "S2");
+  assert.throws(() => w.signoff("S3", "alice"), /kernel changes include your own agents' work/);
+  w.signoff("S3", "dave");
+  const c = check(w, "S3", "kernel");
+  assert.match(c.detail, /1\/\d kernel sign-offs \[dave\]/);
+});
+
 test("kernel: with no kernel signers named, ring 0 work cannot be promoted", () => {
   const w = kernelWorld(rules((r) => (r.kernelSigners = [])));
   const c = check(w, "S2", "kernel");
@@ -792,7 +918,7 @@ test("soak: a submission merged less than soakFloorHours ago blocks; exactly the
   assert.match(young.detail, /s1 merged 50\.0h ago \(need >= 72h\)/);
   assert.equal(young.overall, false);
   assert.equal(check(w, "S1", "soak", at(72)).pass, true);
-  assert.equal(evaluatePromotion(w.state, tree, "S1", at(72)).pass, true);
+  assert.equal(evaluatePromotion(w.state, "S1", at(72)).pass, true);
 });
 
 test("soak: a fresh submission in an unpromoted ancestor blocks a later snapshot", () => {
@@ -813,4 +939,77 @@ test("soak: a fresh submission in an unpromoted ancestor blocks a later snapshot
   assert.equal(c.pass, false);
   assert.match(c.detail, /^s3 merged 30\.0h ago/);
   assert.doesNotMatch(c.detail, /s4|s1|s2/);
+});
+
+test("Phase 1 promotes: ten caught plants under phase1Rules pass the whole rule (protocol §5.11)", () => {
+  const r = phase1Rules(projectRules());
+  r.kernelSigners = ["erin"];
+  const w = healthy({ plants: 10, rules: r });
+  const result = evaluatePromotion(w.state, "S1", w.nowPlus(0));
+  for (const c of result.checks) assert.equal(c.pass, true, `${c.name}: ${c.detail}`);
+  // Nine of ten is not enough while there are fewer than twelve seeds.
+  const missed = healthy({ plants: 10, missed: 1, rules: r });
+  assert.equal(check(missed, "S1", "recall").pass, false);
+});
+
+test("Phase 1 as documented promotes: three owners, the custodian's agents review, two kernel signers, one signer's ring-0 work signed by the other", () => {
+  // README / HANDOFF: alice holds the admin key and is the plant custodian;
+  // alice, bob and carol each run two agents of different families; the
+  // kernel signers are alice and bob. Every submission is checked against
+  // the server's submit-credit rule before it is made.
+  const r = phase1Rules(projectRules());
+  r.kernelSigners = ["alice", "bob"];
+  const w = new World(r);
+  for (const o of ["alice", "bob", "carol"]) w.owner(o);
+  w.agent("a1", "alice", "claude");
+  w.agent("a2", "alice", "gpt");
+  w.agent("b1", "bob", "gpt");
+  w.agent("b2", "bob", "gemini");
+  w.agent("c1", "carol", "gemini");
+  w.agent("c2", "carol", "claude");
+  const ownerOf = (a: string) => w.state.agents.get(w.agentKey(a).keyId)?.owner as string;
+  const submit = (id: string, author: string, files: string[], taskId: string | null = null) => {
+    assert.ok(submitCredits(w.state, ownerOf(author)) >= 1, `${ownerOf(author)} has a submit credit for ${id}`);
+    w.submit(id, author, files, taskId);
+  };
+  // The custodian's batch, well ahead of any plant.
+  const salts = Array.from({ length: 10 }, (_, i) => `plantsalt-${i}`);
+  for (const [i, salt] of salts.entries()) w.append({ kind: "plantCommit", commitment: plantCommitment(`plant-${i}`, salt) }, w.admin);
+  const merged: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    // A plant through the custodian's own agents, rotating.
+    const plant = `plant-${i}`;
+    submit(plant, i % 2 === 0 ? "a1" : "a2", ring1(`p${i}`));
+    w.reviews(plant, [
+      [i % 2 === 0 ? "b1" : "b2", 0.9],
+      [i % 2 === 0 ? "c1" : "c2", 0.8],
+    ]);
+    w.append({ kind: "plantReveal", submissionId: plant, salt: salts[i] as string, description: "off by one", severity: "high" }, w.admin);
+    // Ordinary work by bob or carol, reviewed by the custodian's agent and the third owner's.
+    const id = `work-${i}`;
+    const [author, other] = i % 2 === 0 ? ["b1", "c1"] : ["c1", "b2"];
+    submit(id, author, ring1(`w${i}`));
+    w.reviews(id, [
+      [i % 2 === 0 ? "a1" : "a2", 0.1],
+      [other, 0.1],
+    ]);
+    w.merge(id);
+    merged.push(id);
+  }
+  // A kernel change by alice, a kernel signer: bob signs it off.
+  w.append({ kind: "proposal", id: "P1", title: "fix engine", evidence: [{ kind: "location", file: KERNEL_FILE, line: 1, note: "n" }] }, w.agentKey("a1"));
+  w.coordinator({ kind: "task", id: "T1", proposalId: "P1", ring: 0, acceptanceTestPaths: ["test/engine.test.ts"], sizeEstimate: 50, specAuthor: "carol" });
+  w.append({ kind: "claim", taskId: "T1", until: w.nowPlus(24), stake: claimStake(50, 0, w.state.rules) }, w.agentKey("a1"));
+  submit("kernel", "a1", [KERNEL_FILE], "T1");
+  w.reviews("kernel", [
+    ["b2", 0.1],
+    ["c2", 0.1],
+  ]);
+  w.merge("kernel");
+  w.snapshot("S1", [...merged, "kernel"]);
+  assert.throws(() => w.signoff("S1", "alice"), /your own agents' work/);
+  w.signoff("S1", "bob");
+  w.advance(r.promotion.soakFloorHours + 1);
+  const result = evaluatePromotion(w.state, "S1", w.nowPlus(0));
+  for (const c of result.checks) assert.equal(c.pass, true, `${c.name}: ${c.detail}`);
 });

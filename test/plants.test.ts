@@ -79,7 +79,7 @@ function submission(
     reviews: [],
     findingIds: [],
   };
-  if (opts.assigned) x.assignment = { beacon: "b", reviewers: opts.assigned, seq: next(s) };
+  if (opts.assigned) x.assignment = { beacon: "b", entropy: "e", treeDigest: "t", reviewers: opts.assigned, seq: next(s) };
   if (opts.planted) x.planted = { severity: opts.planted, description: "planted bug" };
   s.submissions.set(id, x);
   return x;
@@ -124,10 +124,13 @@ function finding(
   if ("submissionId" in target) s.submissions.get(target.submissionId)?.findingIds.push(id);
 }
 
-function result(s: CommonsState, findingId: string, reproduced: boolean): void {
+// A reproduced result is confirmed by an operator (a real defect) unless
+// `decide` says otherwise; only a confirmed one catches a plant.
+function result(s: CommonsState, findingId: string, reproduced: boolean, decide: "confirm" | "dismiss" | "none" = "confirm"): void {
   const f = s.findings.get(findingId);
   assert.ok(f);
   f.result = { reproduced, failsOnHead: reproduced, passesOnParent: true, logDigest: "d", seq: next(s) };
+  if (reproduced && decide !== "none") f.decision = { confirmed: decide === "confirm", reason: "", by: "admin", seq: next(s) };
 }
 
 function merge(s: CommonsState, submissionId: string): void {
@@ -208,7 +211,7 @@ test("reviewWindowClosed requires every assigned reviewer to have revealed, or a
   const s = world();
   const x = submission(s, "s1", "A");
   assert.equal(reviewWindowClosed(s, "s1"), false, "no assignment yet");
-  x.assignment = { beacon: "b", reviewers: ["R1", "R2"], seq: next(s) };
+  x.assignment = { beacon: "b", entropy: "e", treeDigest: "t", reviewers: ["R1", "R2"], seq: next(s) };
   assert.equal(reviewWindowClosed(s, "s1"), false);
   review(s, "s1", "R1", 0.2);
   commit(s, "s1", "R2");
@@ -326,6 +329,36 @@ test("plantCaught: only a reproduced finding on the submission catches", () => {
   assert.equal(plantCaught(s, "s2"), true);
   assert.equal(plantCaughtBy(s, "s2", "R3"), true);
   assert.equal(plantCaughtBy(s, "s2", "R1"), false);
+});
+
+test("plantCaught: a reproduction counts only once confirmed, so filing change detectors blindly catches nothing", () => {
+  // A test asserting the old text "reproduces" against every change. Filed on
+  // every submission, it would otherwise catch every plant.
+  const s = world();
+  submission(s, "s1", "A", { planted: "high", assigned: ["R1"] });
+  finding(s, "f1", "X", { submissionId: "s1" });
+  result(s, "f1", true, "none");
+  merge(s, "s1"); // closes the window
+  assert.equal(plantCaught(s, "s1"), false, "undecided");
+  assert.equal(plantCaughtBy(s, "s1", "X"), false);
+  const f = s.findings.get("f1");
+  assert.ok(f);
+  f.decision = { confirmed: false, reason: "tests the intended change", by: "admin", seq: next(s) };
+  assert.equal(plantCaught(s, "s1"), false, "dismissed");
+  f.decision = { confirmed: true, reason: "the planted bug", by: "admin", seq: next(s) };
+  assert.equal(plantCaught(s, "s1"), true, "confirmed");
+});
+
+test("reviewWindowCloseSeq: the coordinator's reviewWindowClosed entry closes the window before any merge", () => {
+  const s = world();
+  submission(s, "s1", "A", { planted: "high", assigned: ["R1", "R2"] });
+  review(s, "s1", "R1", 0.9); // R2 never reveals
+  assert.equal(reviewWindowCloseSeq(s, "s1"), null);
+  const x = s.submissions.get("s1");
+  assert.ok(x);
+  x.windowClosed = { missing: ["R2"], seq: next(s), at: "2026-10-03T00:00:00Z" };
+  assert.equal(reviewWindowCloseSeq(s, "s1"), x.windowClosed.seq);
+  assert.equal(plantCaught(s, "s1"), true);
 });
 
 test("plantCaught: catches after the review window closed do not count (post-reveal regression)", () => {
@@ -515,4 +548,25 @@ test("plantStats: a sybil reviewing 60 plants after the window gets nothing (cri
   assert.equal(st.caught, 0);
   assert.deepEqual(st.byReviewer.get("X"), { seen: 60, caught: 0 });
   assert.deepEqual(st.byReviewer.get("R1"), { seen: 60, caught: 0 });
+});
+
+test("plantStats: flagsOnPlantAuthorsWork exposes a reviewer who flags only the plant author's owner", () => {
+  // Every plant comes from owner oa (the custodian). R1 flags all of oa's
+  // work and nothing else; its catch rate looks perfect and its overall flag
+  // rate moderate, but on oa's ordinary work it flags everything.
+  const s = world();
+  for (let i = 0; i < 3; i++) {
+    submission(s, `p${i}`, "A", { planted: "high", assigned: ["R1"] });
+    review(s, `p${i}`, "R1", 0.9);
+    submission(s, `oa${i}`, "A2", { assigned: ["R1"] });
+    review(s, `oa${i}`, "R1", 0.9);
+    for (let j = 0; j < 3; j++) {
+      submission(s, `x${i}-${j}`, "X", { assigned: ["R1"] });
+      review(s, `x${i}-${j}`, "R1", 0.1);
+    }
+  }
+  const st = plantStats(s, "2026-01-01T00:00:00Z");
+  assert.deepEqual(st.byReviewer.get("R1"), { seen: 3, caught: 3 });
+  assert.deepEqual(st.flagsOnOtherWork.get("R1"), { reviewed: 12, flagged: 3 });
+  assert.deepEqual(st.flagsOnPlantAuthorsWork.get("R1"), { reviewed: 3, flagged: 3 });
 });

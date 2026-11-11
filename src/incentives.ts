@@ -21,7 +21,11 @@
 // hide each other's inviter charge.
 // Zero amounts are never returned. All amounts are integers, and no delta is -0.
 
-import { instantMs, plantCaughtBy, reviewWindowCloseSeq } from "./plants";
+import { blocksTarget, isConfirmedDefect, isReproducedOpen } from "./findingStatus";
+import { memberTree } from "./members";
+import { commitDeadlineMs, instantMs, plantCaughtBy, revealDeadlineMs, reviewWindowCloseSeq } from "./plants";
+import { coveredSubmissionIds } from "./promotion";
+import { isFalseFinding } from "./review";
 import { claimStake } from "./rules";
 import type {
   CommonsState,
@@ -57,9 +61,11 @@ const DAY_MS = 24 * 3_600_000;
 // ---------------------------------------------------------------------------
 
 // Open-submission slots for an owner: 1 + floor(log2(1 + reputation)), log
-// base 2. One slot at 0 reputation, two at 1, three at 3, four at 7, and so on:
-// volume grows with standing, but slowly. Negative or non-finite reputation
-// counts as 0.
+// base 2, where reputation is the owner's commons reputation
+// (OwnerState.reputationDelta). One slot at 0 reputation, two at 1, three at
+// 3, four at 7, and so on: volume grows with standing, but slowly. Negative or
+// non-finite reputation counts as 0, so a newcomer, or an owner slashed below
+// zero, still has the base slot.
 export function prSlots(reputation: number): number {
   const r = Number.isFinite(reputation) && reputation > 0 ? reputation : 0;
   return 1 + Math.floor(Math.log2(1 + r));
@@ -120,13 +126,18 @@ export function apportion(total: number, weights: number[]): number[] {
 // Findings
 // ---------------------------------------------------------------------------
 
-// Settles a reproduced finding. Returns [] if it has no reproduced result, if
-// it is a duplicate filed after its class reproduced, or if it is superseded.
+// Settles a confirmed finding. Returns [] if it is not confirmed (a
+// reproduction alone shows only that its test tells head from parent, which a
+// test pinning the old behaviour does against any change: findingStatus.ts),
+// if its class leader is not confirmed yet, if it is a duplicate filed after
+// its class reproduced, or if it is superseded.
 //
 // Classes. Findings on the same target are one class, whatever severity they
 // declare: severity is not checked (see SETTLED_SEVERITY), so it cannot tell
 // two bugs apart. The leader is the finding whose reproduced result landed
-// first. The class's early findings are those filed before that result, minus
+// first, among those not dismissed; nothing in the class settles until the
+// leader is confirmed, so the leader never changes after anyone was paid. The
+// class's early findings are those filed before that result, minus
 // those already resolved as not reproduced by then. They are treated as the
 // same bug. All of this is fixed once the leader's result is on the ledger, so
 // nothing waits on findings that may never get a result (§5.8).
@@ -143,8 +154,7 @@ export function apportion(total: number, weights: number[]): number[] {
 //   the leader, as soon as it reproduces.
 //
 // Bounty. A share goes to its finder's owner, unless that owner is within
-// rules.minTreeDistance of an author's owner or is not in the tree (an
-// outsider's distance is not known).
+// rules.minTreeDistance of an author's owner.
 //
 // Slashes. The author pays max(round(bounty × stageMultiplier[stage]), bounty).
 // The shares sum to at most the bounty, so that is never less than what was
@@ -155,11 +165,13 @@ export function apportion(total: number, weights: number[]): number[] {
 // a review (an attestation, for a snapshot). Once the subject merged (was
 // promoted), a review not revealed before that counts as p = 0. Otherwise a
 // reviewer could hold back a confident "clean" until the outcome was known and
-// reveal it only if it shipped clean. While the subject is still open, an
-// unrevealed review is settled once it is revealed or the subject closes. A
-// submission whose finding reproduced before merge never merges, so a review
-// on it that is never revealed is never slashed. Its stake stays locked
-// instead (§6.1 gap).
+// reveal it only if it shipped clean. A subject with a confirmed defect never
+// merges (is never promoted), and its review stakes are released, so there
+// the same rule runs on a deadline: an unrevealed review counts as p = 0 once
+// plants.revealDeadlineMs (commitHours after the commit phase) has passed by
+// `nowIso`. Otherwise a reviewer could commit p = 0 everywhere and reveal only
+// where no defect turned up. A review that could never be revealed (no
+// assignment, so no commit phase) is left out.
 //
 // Snapshot targets name no culprit. The authors are the owners of every
 // submission the snapshot covers (it and its unpromoted ancestors, as the
@@ -184,13 +196,19 @@ export function apportion(total: number, weights: number[]): number[] {
 // work if settled before the reveal and as nothing after it. Removing that needs
 // the reveal's seq on SubmissionState.planted. A custodian who reveals early
 // leaks the same way, as in plants.ts.
-export function settleFinding(state: CommonsState, tree: TreeView, findingId: string, stage: Stage): SettlementBody[] {
+// `nowIso` defaults to the time of the ledger's last entry.
+export function settleFinding(
+  state: CommonsState,
+  findingId: string,
+  stage: Stage,
+  nowIso: string = (state as { headAt?: string }).headAt ?? "",
+): SettlementBody[] {
   const f = state.findings.get(findingId);
-  if (!f?.result?.reproduced) return [];
+  if (f === undefined || !isConfirmedDefect(f)) return [];
   const subject = findingSubject(state, f);
   if (subject === null || subject.authors.length === 0 || !(f.seq <= subject.maxSeq)) return [];
   const cls = findingClass(state, f, subject.maxSeq);
-  if (cls === null || !cls.early.includes(f)) return [];
+  if (cls === null || !isConfirmedDefect(cls.leader) || !cls.early.includes(f)) return [];
   if (subject.snapshot !== undefined && superseded(state, subject.snapshot, cls)) return [];
 
   const rules = state.rules;
@@ -203,7 +221,7 @@ export function settleFinding(state: CommonsState, tree: TreeView, findingId: st
 
   const book = new Book(state);
   const finder = ownerOf(state, f.finder);
-  if (finder !== undefined && farEnough(tree, finder, subject.authors, rules.minTreeDistance)) {
+  if (finder !== undefined && farEnough(memberTree(state), finder, subject.authors, rules.minTreeDistance)) {
     book.credit(finder, "bounty", `finding:${f.id}`, shares[cls.early.indexOf(f)] ?? 0);
   }
   if (cls.leader === f) {
@@ -211,7 +229,8 @@ export function settleFinding(state: CommonsState, tree: TreeView, findingId: st
     subject.authors.forEach((owner, i) => book.slash(owner, "authorSlash", ref, authorParts[i] ?? 0));
     // bm − bm·p, not bm·(1 − p): 1 − 0.9 is 0.0999…, which would round 1.5 down to 1.
     const bm = bounty * multiplier;
-    for (const a of approvals(subject.reviews, subject.closeSeq)) {
+    const withheldCounts = subject.revealBy !== undefined && Date.parse(nowIso) >= subject.revealBy;
+    for (const a of approvals(subject.reviews, subject.closeSeq, withheldCounts)) {
       const owner = ownerOf(state, a.reviewer);
       if (owner !== undefined) book.slash(owner, "approverSlash", ref, Math.round(bm - bm * clamp01(a.p)));
     }
@@ -219,12 +238,15 @@ export function settleFinding(state: CommonsState, tree: TreeView, findingId: st
   return book.bodies();
 }
 
-// A finding with a result that did not reproduce costs its finder's owner
-// falseFindingPenalty. The harness counts a timeout or a harness error as not
-// reproduced.
+// A finding the harness judged and did not reproduce, or a reproduction an
+// operator dismissed as testing the intended change, costs its finder's owner
+// falseFindingPenalty: a change-detector "finding" vetoes nothing for free. A
+// result with harnessError (the harness could not run the test, e.g. timeouts
+// past the retry limit) costs nothing: it proves nothing about the finding
+// (findingStatus.isFalseFinding).
 export function settleFalseFinding(state: CommonsState, findingId: string): SettlementBody[] {
   const f = state.findings.get(findingId);
-  if (f?.result === undefined || f.result.reproduced) return [];
+  if (f === undefined || !isFalseFinding(f)) return [];
   const owner = ownerOf(state, f.finder);
   if (owner === undefined) return [];
   const book = new Book(state);
@@ -236,6 +258,7 @@ type Subject = {
   authors: OwnerId[]; // one entry per authored submission, so an owner can repeat
   reviews: ReviewState[];
   closeSeq: number | undefined; // merge or promotion; reveals after it count as p = 0
+  revealBy: number | undefined; // ms; past it an unrevealed review counts as p = 0 (see settleFinding)
   maxSeq: number; // findings filed after this settle nothing (a revealed plant's window close)
   snapshot?: SnapshotState;
 };
@@ -252,7 +275,13 @@ function findingSubject(state: CommonsState, f: FindingState): Subject | null {
       if (close === null) return null;
       maxSeq = close;
     }
-    return { authors: owner === undefined ? [] : [owner], reviews: s.reviews, closeSeq: s.merged?.seq, maxSeq };
+    return {
+      authors: owner === undefined ? [] : [owner],
+      reviews: s.reviews,
+      closeSeq: s.merged?.seq,
+      revealBy: s.assignment ? revealDeadlineMs(state.rules, s.assignment.at) : undefined,
+      maxSeq,
+    };
   }
   const snap = state.snapshots.get(f.target.snapshotId);
   if (!snap) return null;
@@ -265,18 +294,20 @@ function findingSubject(state: CommonsState, f: FindingState): Subject | null {
     authors,
     reviews: snap.attestations,
     closeSeq: snap.promoted?.seq,
+    revealBy: revealDeadlineMs(state.rules, snap.at),
     maxSeq: Number.POSITIVE_INFINITY,
     snapshot: snap,
   };
 }
 
 // The stated p of each approver. Unrevealed reviews of an open subject are
-// left out until they are revealed or the subject closes.
-function approvals(reviews: ReviewState[], closeSeq: number | undefined): { reviewer: KeyId; p: number }[] {
+// left out until they are revealed, the subject closes, or (withheldCounts)
+// the reveal deadline of a subject that can never close has passed.
+function approvals(reviews: ReviewState[], closeSeq: number | undefined, withheldCounts = false): { reviewer: KeyId; p: number }[] {
   const out: { reviewer: KeyId; p: number }[] = [];
   for (const r of reviews) {
     if (r.verdict !== undefined && revealedInTime(r, closeSeq)) out.push({ reviewer: r.reviewer, p: r.verdict.defectProbability });
-    else if (closeSeq !== undefined) out.push({ reviewer: r.reviewer, p: 0 });
+    else if (closeSeq !== undefined || withheldCounts) out.push({ reviewer: r.reviewer, p: 0 });
   }
   return out;
 }
@@ -296,7 +327,7 @@ function findingClass(state: CommonsState, f: FindingState, maxSeq: number): Fin
   let leader: FindingState | null = null;
   let firstResult = Number.POSITIVE_INFINITY;
   for (const g of same) {
-    if (g.result?.reproduced && g.result.seq < firstResult) {
+    if (g.result && isReproducedOpen(g) && g.result.seq < firstResult) {
       leader = g;
       firstResult = g.result.seq;
     }
@@ -319,7 +350,7 @@ function superseded(state: CommonsState, snap: SnapshotState, cls: FindingClass)
   const firstFiled = cls.early[0]?.seq ?? cls.leader.seq;
   const leaderResult = cls.leader.result?.seq ?? Number.POSITIVE_INFINITY;
   for (const g of state.findings.values()) {
-    if (!g.result?.reproduced || targetKey(g) === cls.key) continue;
+    if (!isConfirmedDefect(g) || targetKey(g) === cls.key) continue;
     if ("submissionId" in g.target) {
       if (mine.has(g.target.submissionId) && g.seq < leaderResult) return true;
     } else {
@@ -334,22 +365,22 @@ function targetKey(f: FindingState): string {
   return "submissionId" in f.target ? `submission:${f.target.submissionId}` : `snapshot:${f.target.snapshotId}`;
 }
 
-// The finder must be farther than minTreeDistance from every author's owner.
-// The tree throws on non-members. An owner with no known place in the tree
-// cannot show distance, so it earns nothing.
+// The finder must be farther than minTreeDistance from every author's owner
+// in the member tree. Every owner is a member; the tree throws on anything
+// else (only a corrupt, hand-built state), so no settlement guesses a distance.
 function farEnough(tree: TreeView, finder: OwnerId, authors: OwnerId[], minDistance: number): boolean {
-  if (!tree.has(finder)) return false;
-  for (const a of authors) {
-    if (!tree.has(a) || tree.distance(finder, a) <= minDistance) return false;
-  }
-  return true;
+  return authors.every((a) => tree.distance(finder, a) > minDistance);
 }
 
 // ---------------------------------------------------------------------------
 // Merges and clean reviews
 // ---------------------------------------------------------------------------
 
-// One tranche of the author's merge reward, round(merge / 3).
+// One tranche of the author's merge reward, round(merge / 3), for work someone
+// asked for: a submission for a task. A taskless merge earns nothing. Tasks
+// come from evidenced proposals the operator approved; anything else would
+// mint reputation from activity (whitespace and comment edits nobody can
+// block), not from work.
 // - Tranche 1 vests at merge.
 // - Tranche 2 vests when a promotion ships the submission.
 // - Tranche 3 vests tailDays after that promotion, judged at nowIso.
@@ -362,7 +393,14 @@ function farEnough(tree: TreeView, finder: OwnerId, authors: OwnerId[], minDista
 // tranche cannot be clawed back here.
 //
 // Forfeiture. A reproduced finding that targets the submission directly voids
-// its unpaid tranches 2 and 3. Tranche 1 is never clawed back. A finding on a
+// its unpaid tranches 2 and 3 (while undecided they wait; a dismissal releases
+// them). A finding with no result yet makes them wait too: undecided is not
+// clean, and which way a finding filed at the end of the tail goes must not
+// depend on how fast the harness runs (the 72 h result deadline bounds the
+// wait). Tranche 1 is never clawed back.
+//
+// One task pays once: only the first submission merged for it vests (the
+// ledger refuses a second, so this only guards hand-built states). A finding on a
 // snapshot names no culprit, so it voids no tranche: voiding every covered
 // author's vest would make honest co-authors pay for one author's bug. A
 // finder who can name the culprit targets the submission, which voids it, and
@@ -379,12 +417,15 @@ export function settleMerge(
 ): SettlementBody[] {
   if (tranche !== 1 && tranche !== 2 && tranche !== 3) throw new RangeError(`settleMerge: tranche must be 1, 2 or 3`);
   const s = state.submissions.get(submissionId);
-  if (!s?.merged || s.planted) return [];
+  if (!s?.merged || s.planted || s.taskId === null) return [];
+  for (const x of state.submissions.values()) {
+    if (x.taskId === s.taskId && x.merged && x.merged.seq < s.merged.seq) return [];
+  }
   if (tranche >= 2) {
     const promo = promotionShipping(state, s.id);
     if (promo === null) return [];
     if (tranche === 3 && nowMs(nowIso) < Date.parse(promo.at) + state.rules.vesting.tailDays * DAY_MS) return [];
-    if (hasReproducedFinding(state, s)) return [];
+    if (hasBlockingFinding(state, s)) return [];
   }
   const author = ownerOf(state, s.author);
   if (author === undefined) return [];
@@ -405,7 +446,8 @@ export function settleMerge(
 // Overlapping calls produce the same bodies, and those are recorded once.
 //
 // A submission is clean if no reproduced finding targets it or a snapshot that
-// covers it, of any declared severity. review.ts's submissionOutcome ignores
+// covers it, of any declared severity, and none of those is still without a
+// result (it waits; see settleMerge). review.ts's submissionOutcome ignores
 // low-severity findings, but severity is the finder's claim, and it must not be
 // able to pay reviewers for code with a confirmed bug. An escape always rests
 // on a reproduced finding, so it is covered too.
@@ -414,6 +456,13 @@ export function settleMerge(
 // That is the clean side of the Brier score (protocol §6.2 departs here: a flat
 // reward made p = 1 on everything collect every reward and risk nothing). A
 // reveal after the merge earns nothing: it could have waited to see the outcome.
+//
+// Only work someone asked for pays, as with settleMerge: a taskless merge
+// earns its reviewers nothing, or a ring of owners could submit whitespace
+// edits, open-review each other's at p = 0 and mint reputation without limit.
+// And only reviewers whose owner is farther than minTreeDistance from the
+// author's owner in the member tree earn it, as with the bounty (farEnough): a friend
+// who could never be drawn for the seat must not be paid for approving.
 export function settleCleanReviews(state: CommonsState, snapshotId: string, nowIso: string): SettlementBody[] {
   const now = nowMs(nowIso);
   const snap = state.snapshots.get(snapshotId);
@@ -422,13 +471,16 @@ export function settleCleanReviews(state: CommonsState, snapshotId: string, nowI
   if (!promo) return [];
   if (now < Date.parse(promo.at) + state.rules.vesting.tailDays * DAY_MS) return [];
   const c = state.rules.rewards.cleanReview;
+  const tree = memberTree(state);
   const book = new Book(state);
   for (const sid of snap.promoted ? covered(state, snap) : snap.submissionIds) {
     const s = state.submissions.get(sid);
-    if (!s?.merged || s.planted || hasReproducedFinding(state, s) || snapshotFindingCovers(state, s.id)) continue;
+    if (!s?.merged || s.planted || s.taskId === null || hasBlockingFinding(state, s) || snapshotFindingCovers(state, s.id)) continue;
+    const author = ownerOf(state, s.author);
     for (const r of s.reviews) {
       const owner = ownerOf(state, r.reviewer);
-      if (r.verdict === undefined || owner === undefined || !revealedInTime(r, s.merged.seq)) continue;
+      if (r.verdict === undefined || owner === undefined || author === undefined || !revealedInTime(r, s.merged.seq)) continue;
+      if (!farEnough(tree, owner, [author], state.rules.minTreeDistance)) continue;
       const p = clamp01(r.verdict.defectProbability);
       book.credit(owner, "cleanReview", `review:${s.id}`, Math.round(c - c * p * p));
     }
@@ -443,32 +495,43 @@ export function settleCleanReviews(state: CommonsState, snapshotId: string, nowI
 // Each owner who saw a revealed plant and did not catch it pays
 // missedPlantPenalty. An owner saw the plant if one of its agents held an
 // assigned seat or committed a review on it. That covers a reviewer who never
-// revealed, and a seat that never committed. The plant's author's owner (the
-// custodian) is never charged.
+// revealed, and a seat that never committed while it could. A seat whose
+// commit phase someone else cut short (a reproduction landed before the commit
+// deadline, which closes commits until it is dismissed, and was not dismissed
+// before that deadline) and that had not committed was shut out, not
+// negligent, and is not charged. The plant's author's owner (the custodian)
+// is never charged.
 //
 // A catch is plants.ts's plantCaughtBy: by the close of the review window, the
-// agent revealed p >= 0.5 or filed a finding that reproduced. A finding or a
+// agent revealed p >= 0.5 or filed a finding later confirmed. A finding or a
 // reveal after the close never counts. The plant's description is public by
 // then. An owner whose only possible catch is a finding filed by the close with
-// no result yet waits. That finding was filed blind, so charging now could not
+// no result or no decision yet waits. That finding was filed blind, so charging now could not
 // be undone if it reproduces. A finding filed after the close never defers the
 // charge.
 //
-// A plant revealed while its window is still open broke custodian policy.
-// Nobody's miss can be ordered against the reveal, so nobody is charged until
-// the window closes.
+// A plant revealed while its window was still open broke custodian policy:
+// the reveal itself closed the window (plants.reviewWindowCloseSeq), and
+// nobody's miss can be ordered against it, so nobody is charged.
 export function settleMissedPlant(state: CommonsState, submissionId: string): SettlementBody[] {
   const s = state.submissions.get(submissionId);
   if (!s?.planted) return [];
   const close = reviewWindowCloseSeq(state, s.id);
-  if (close === null) return [];
+  if (close === null || close === s.planted.seq) return [];
   const custodian = ownerOf(state, s.author);
   const saw = new Set<OwnerId>();
   const caught = new Set<OwnerId>();
   const waiting = new Set<OwnerId>();
+  const deadline = commitDeadlineMs(state.rules, s.assignment?.at);
+  const before = (iso: string | undefined) => iso !== undefined && Date.parse(iso) < deadline;
+  const shut = s.findingIds.some((fid) => {
+    const f = state.findings.get(fid);
+    if (!f?.result?.reproduced || !before(f.result.at)) return false;
+    return !(f.decision?.confirmed === false && before(f.decision.at));
+  });
   for (const k of s.assignment?.reviewers ?? []) {
     const o = ownerOf(state, k);
-    if (o !== undefined) saw.add(o);
+    if (o !== undefined && (!shut || s.reviews.some((r) => r.reviewer === k))) saw.add(o);
   }
   for (const r of s.reviews) {
     const o = ownerOf(state, r.reviewer);
@@ -481,7 +544,7 @@ export function settleMissedPlant(state: CommonsState, submissionId: string): Se
     const o = f && ownerOf(state, f.finder);
     if (!f || o === undefined) continue;
     if (plantCaughtBy(state, s.id, f.finder)) caught.add(o);
-    else if (f.result === undefined && f.seq <= close) waiting.add(o);
+    else if ((f.result === undefined || (f.result.reproduced && f.decision === undefined)) && f.seq <= close) waiting.add(o);
   }
   const book = new Book(state);
   for (const o of saw) {
@@ -492,26 +555,62 @@ export function settleMissedPlant(state: CommonsState, submissionId: string): Se
 }
 
 // A claim that has expired (until < now) loses its stake unless it was
-// delivered: its agent submitted for the task after making this claim and by
-// its `until`, or the task merged by then. A submission made under an earlier
-// claim does not count, so one junk submission cannot keep a task claimed
-// through endless extensions.
+// delivered: its agent submitted for the task during the holder's unbroken
+// run of claims (from the first claim of the run, extensions made while live
+// included) and by this claim's `until`, or the task merged by then. A claim
+// its own holder extended while it was live did not expire: the extension
+// carries its stake on, and so its delivery too. Otherwise a worker that
+// submitted and then extended to keep the task through review would lose the
+// stake a worker that did not extend keeps. A submission from an earlier,
+// lapsed run does not count, and the ledger lets a run go past 7 days only
+// with a fresh submission per extension, so one junk submission cannot keep
+// a task claimed for long.
 //
-// state.claims keeps only the latest claim per task. A claim replaced before
-// this ran (re-claimed after expiry by its holder or by anyone) can no longer
-// be settled. Closing that needs a claim history in state, or a ledger rule
-// that refuses to replace an expired, unsettled claim.
+// Every claim entry is judged (state.claimHistory), not only the latest, so
+// re-claiming a lapsed claim a minute after its `until`, by its holder or a
+// colluder, no longer erases its slash.
+//
+// A run passes to another agent of the same owner when the holder was revoked
+// before that agent claimed (key rotation: the ledger lets anyone re-claim a
+// revoked agent's live claim). The new agent carries the run on, so its
+// delivery counts for the old claim, as an extension's would. An owner who
+// revokes and does not re-claim abandoned the task, and pays as before.
 export function settleExpiredClaims(state: CommonsState, nowIso: string): SettlementBody[] {
   const now = nowMs(nowIso);
   const book = new Book(state);
-  for (const c of state.claims.values()) {
+  const history = state.claimHistory ?? [...state.claims.values()];
+  const revokedBefore = (agent: KeyId, seq: number): boolean => {
+    const a = state.agents.get(agent);
+    return a !== undefined && (a.revokedSeq !== undefined ? a.revokedSeq < seq : !a.active);
+  };
+  // Whether claim `c` continues the run of `prev`: the same holder, or the
+  // same owner's next agent after the holder was revoked; made while live.
+  const continues = (prev: (typeof history)[number], c: (typeof history)[number]): boolean =>
+    "at" in c &&
+    Date.parse(c.at) <= Date.parse(prev.until) &&
+    (prev.agent === c.agent || (ownerOf(state, prev.agent) === ownerOf(state, c.agent) && revokedBefore(prev.agent, c.seq)));
+  // The seq of the first claim of each entry's unbroken run, and its holders.
+  const runStart: number[] = [];
+  const runAgents: Set<KeyId>[] = [];
+  const last = new Map<string, number>(); // task -> index of its latest entry so far
+  for (const [i, c] of history.entries()) {
+    const p = last.get(c.taskId);
+    const prev = p === undefined ? undefined : history[p];
+    const extendsRun = prev !== undefined && p !== undefined && continues(prev, c);
+    runStart[i] = extendsRun ? (runStart[p] as number) : c.seq;
+    runAgents[i] = extendsRun ? new Set([...(runAgents[p] as Set<KeyId>), c.agent]) : new Set([c.agent]);
+    last.set(c.taskId, i);
+  }
+  for (const [i, c] of history.entries()) {
     const until = Date.parse(c.until);
     if (!(until < now)) continue;
+    const next = history.slice(i + 1).find((x) => x.taskId === c.taskId);
+    if (next && continues(c, next)) continue;
     let delivered = false;
     for (const s of state.submissions.values()) {
       if (s.taskId !== c.taskId) continue;
       if (s.merged && Date.parse(s.merged.at) <= until) delivered = true;
-      if (s.author === c.agent && s.submittedSeq > c.seq && Date.parse(s.submittedAt) <= until) delivered = true;
+      if (runAgents[i]?.has(s.author) && s.submittedSeq > (runStart[i] as number) && Date.parse(s.submittedAt) <= until) delivered = true;
     }
     const owner = ownerOf(state, c.agent);
     if (!delivered && owner !== undefined) book.slash(owner, "claimExpired", `claim:${c.taskId}:${c.seq}`, c.stake);
@@ -586,39 +685,31 @@ function proposerOf(state: CommonsState, s: SubmissionState): OwnerId | undefine
   return state.ownerByKey.get(by) ?? ownerOf(state, by);
 }
 
-function hasReproducedFinding(state: CommonsState, s: SubmissionState): boolean {
-  return s.findingIds.some((fid) => state.findings.get(fid)?.result?.reproduced === true);
+// A reproduction nobody dismissed: payments that a defect would void wait on it.
+// A finding on the submission still without a result, or reproduced and not
+// dismissed (findingStatus.blocksTarget).
+function hasBlockingFinding(state: CommonsState, s: SubmissionState): boolean {
+  return s.findingIds.some((fid) => {
+    const f = state.findings.get(fid);
+    return f !== undefined && blocksTarget(f);
+  });
 }
 
-// A reproduced finding targets a snapshot that covers the submission.
+// A finding on a snapshot that covers the submission blocks it the same way.
 function snapshotFindingCovers(state: CommonsState, submissionId: string): boolean {
   for (const f of state.findings.values()) {
-    if (!("snapshotId" in f.target) || f.result?.reproduced !== true) continue;
+    if (!("snapshotId" in f.target) || !blocksTarget(f)) continue;
     const snap = state.snapshots.get(f.target.snapshotId);
     if (snap && covered(state, snap).includes(submissionId)) return true;
   }
   return false;
 }
 
-// The snapshot and its ancestors up to (not including) the first promoted
-// one: what a promotion of `snap` ships, and what a finding on it covers. This
-// is the ledger's definition. Ids are unique and only name earlier snapshots,
-// so the walk ends. The seen-set guards a malformed state anyway.
-function ancestry(state: CommonsState, snap: SnapshotState): SnapshotState[] {
-  const out = [snap];
-  const seen = new Set([snap.id]);
-  for (let p = snap.previousSnapshotId; p !== null && !seen.has(p); ) {
-    const prev = state.snapshots.get(p);
-    if (!prev || prev.promoted) break;
-    seen.add(p);
-    out.push(prev);
-    p = prev.previousSnapshotId;
-  }
-  return out;
-}
-
+// What a promotion of `snap` ships and what a finding on it covers: the
+// submissions of the snapshot and its unpromoted ancestors (promotion.ts holds
+// the definition).
 function covered(state: CommonsState, snap: SnapshotState): string[] {
-  return ancestry(state, snap).flatMap((x) => x.submissionIds);
+  return coveredSubmissionIds(state, snap.id);
 }
 
 // The earliest promotion that shipped the submission, or null.

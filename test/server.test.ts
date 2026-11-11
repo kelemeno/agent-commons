@@ -4,13 +4,15 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import { canonical, generateKeyPair, keyIdOf, sha256hex, sign } from "../src/crypto";
-import { Ledger, signEntry, type Signer } from "../src/ledger";
+import { commitmentFor } from "../src/review";
+import { Ledger, replay, signEntry, type Signer } from "../src/ledger";
 import { defaultRules } from "../src/rules";
-import { treeFromParents } from "../src/tree";
 import {
   createCoordinatorServer,
+  DEFAULT_LIMITS,
   summarisePatch,
   uploadMessage,
   type CoordinatorServer,
@@ -21,15 +23,17 @@ import {
   type UploadRoute,
 } from "../src/server";
 import type { EntryBody, LedgerEntry } from "../src/types";
+import { assignmentBody } from "../src/selection";
 
 // ---------------------------------------------------------------------------
-// Fixture: a real ledger file with owners alice (reputation 100) and bob (10),
-// agents a1 (alice) and b1 (bob), a server on port 0, a settable clock and a
-// fake policy.
+// Fixture: a real ledger file with owners alice and bob, agents a1 (alice) and
+// b1 (bob), a server on port 0, a settable clock and a fake policy. Stakes are
+// backed by commons reputation: the rules' allowance (10) plus settlements,
+// so alice (settled +90) can stake 100 and bob 10. PR slots come from the
+// same commons reputation (alice 90, bob 0).
 // ---------------------------------------------------------------------------
 
 const T0 = Date.UTC(2026, 0, 1);
-const tree = treeFromParents({ alice: null, bob: "alice" }, { alice: 100, bob: 10 });
 
 type Fixture = {
   server: CoordinatorServer;
@@ -65,22 +69,24 @@ async function fixture(
   const id = (name: string) => keyIdOf(key(name).publicKey);
   let second = 0;
   const at = () => new Date(T0 + ++second * 1000).toISOString();
-  const rules = { ...defaultRules(), kernelSigners: ["alice", "bob"] };
+  const base = defaultRules();
+  const rules = { ...base, stake: { ...base.stake, allowance: 10 }, kernelSigners: ["alice", "bob"] };
   const ledger = Ledger.create(
     ledgerPath,
-    { kind: "genesis", project: "anthill", admins: [admin.publicKey], coordinator: coord.publicKey, rules },
+    { kind: "genesis", project: "demo", admins: [admin.publicKey], coordinator: coord.publicKey, rules },
     at(),
   );
   ledger.append({ kind: "ownerKey", owner: "alice", publicKey: key("alice").publicKey, inviter: null }, admin, at());
   ledger.append({ kind: "ownerKey", owner: "bob", publicKey: key("bob").publicKey, inviter: "alice" }, admin, at());
   ledger.append({ kind: "agentRegistered", owner: "alice", publicKey: key("a1").publicKey, modelFamily: "claude", harness: "cli" }, key("alice"), at());
   ledger.append({ kind: "agentRegistered", owner: "bob", publicKey: key("b1").publicKey, modelFamily: "gpt", harness: "cli" }, key("bob"), at());
+  ledger.append({ kind: "settlement", owner: "alice", delta: 90, reason: "mergeVest", ref: "fixture" }, coord, at());
 
   let nowMs = T0 + 10 * 60_000;
   const credits = new Map<string, number>([["alice", 5]]);
   const policy: SubmitPolicy = {
     submitCredits: (_state, owner) => credits.get(owner) ?? 0,
-    prSlots: (reputation) => (reputation >= 100 ? 7 : 1),
+    prSlots: (reputation) => (reputation >= 90 ? 7 : 1), // alice 7, bob 1
     // Above the ledger's own floor (15 for 100 lines, ring 1), so a test can
     // tell this policy's refusal from the ledger's.
     claimStake: () => 40,
@@ -88,7 +94,6 @@ async function fixture(
   const server = createCoordinatorServer({
     ledgerPath,
     coordinatorKey: coord,
-    tree,
     clock: () => new Date(nowMs).toISOString(),
     patchesDir,
     policy,
@@ -453,7 +458,7 @@ test("submissions need a submit credit and a free PR slot", async () => {
     assert.equal(noCredit.status, 403);
     assert.equal(noCredit.body.error, "no-submit-credit");
 
-    // bob (reputation 10) has one slot.
+    // bob (commons reputation 0) has one slot.
     f.credits.set("bob", 5);
     assert.equal((await post(f, await signed(f, submission("s1"), "b1"))).status, 201);
     const second = await post(f, await signed(f, submission("s2"), "b1"));
@@ -462,6 +467,33 @@ test("submissions need a submit credit and a free PR slot", async () => {
     // A failed gate frees the slot.
     await f.server.store.appendAsCoordinator({ kind: "gateResult", submissionId: "s1", gate: "size", pass: false, details: "too big" });
     assert.equal((await post(f, await signed(f, submission("s2"), "b1"))).status, 201);
+  } finally {
+    await f.close();
+  }
+});
+
+test("PR slots are sized by the owner's commons reputation, floored at 0", async () => {
+  const seen: number[] = [];
+  const f = await fixture({}, {
+    policy: {
+      submitCredits: () => 5,
+      prSlots: (reputation) => {
+        seen.push(reputation);
+        return reputation >= 90 ? 2 : 1;
+      },
+      claimStake: () => 40,
+    },
+  });
+  try {
+    // alice has settled +90: two slots.
+    assert.equal((await post(f, await signed(f, submission("s1"), "a1"))).status, 201);
+    assert.equal((await post(f, await signed(f, submission("s2"), "a1"))).status, 201);
+    assert.equal((await post(f, await signed(f, submission("s3"), "a1"))).body.error, "no-pr-slot");
+    // bob is slashed below zero: still the base slot, never fewer.
+    await f.server.store.appendAsCoordinator({ kind: "settlement", owner: "bob", delta: -30, reason: "falseFinding", ref: "fixture" });
+    assert.equal((await post(f, await signed(f, submission("s4"), "b1"))).status, 201);
+    assert.equal((await post(f, await signed(f, submission("s5"), "b1"))).body.error, "no-pr-slot");
+    assert.deepEqual(seen, [90, 90, 90, 0, 0]);
   } finally {
     await f.close();
   }
@@ -500,7 +532,7 @@ test("stakes must be covered by available reputation, and upload ids must be fil
   const f = await fixture();
   try {
     assert.equal((await post(f, await signed(f, submission("s1"), "a1"))).status, 201);
-    // bob has reputation 10.
+    // bob can stake his allowance, 10, and nothing more: he has settled nothing.
     const tooMuch = await post(f, await signed(f, finding("f0", "s1", 11), "b1"));
     assert.equal(tooMuch.status, 403);
     assert.equal(tooMuch.body.error, "insufficient-reputation");
@@ -631,7 +663,7 @@ test("assignments list open review seats, with author fields marked untrusted", 
     const reg: EntryBody = { kind: "agentRegistered", owner: "bob", publicKey: f.key("b2").publicKey, modelFamily: "qwen", harness: "h" };
     assert.equal((await post(f, await signed(f, reg, "bob"))).status, 201);
     assert.equal((await post(f, await signed(f, submission("s1"), "a1"))).status, 201);
-    await f.server.store.appendAsCoordinator({ kind: "reviewAssignment", submissionId: "s1", beacon: "x", reviewers: [f.id("b1")] });
+    await f.server.store.appendAsCoordinator((st) => assignmentBody(st, "s1", [f.id("b1")], "e"));
     type A = { submissionId: string; reviewStake: number; untrusted: { changedFiles: string[] } };
     const list = async (agent: string) =>
       ((await (await fetch(`${f.url}/api/assignments?agent=${agent}`)).json()) as { assignments: A[] }).assignments;
@@ -646,7 +678,7 @@ test("assignments list open review seats, with author fields marked untrusted", 
     assert.equal((await fetch(`${f.url}/api/assignments`)).status, 400);
 
     assert.equal((await post(f, await signed(f, submission("s2", { changedFiles: ["src/z.ts"] }), "a1"))).status, 201);
-    await f.server.store.appendAsCoordinator({ kind: "reviewAssignment", submissionId: "s2", beacon: "x", reviewers: [f.id("b2")] });
+    await f.server.store.appendAsCoordinator((st) => assignmentBody(st, "s2", [f.id("b2")], "e"));
     assert.deepEqual((await list(f.id("b2"))).map((a) => a.submissionId), ["s2"]);
     // Revoked agents see nothing.
     assert.equal((await post(f, await signed(f, { kind: "agentRevoked", agent: f.id("b2"), reason: "x" }, "bob"))).status, 201);
@@ -656,7 +688,7 @@ test("assignments list open review seats, with author fields marked untrusted", 
   }
 });
 
-test("a reveal closes the other seats in the listing", async () => {
+test("a seat stays listed through the commit phase: no reveal can close it early", async () => {
   const f = await fixture();
   try {
     const reg: EntryBody = { kind: "ownerKey", owner: "carol", publicKey: f.key("carol").publicKey, inviter: "alice" };
@@ -664,15 +696,200 @@ test("a reveal closes the other seats in the listing", async () => {
     const c1: EntryBody = { kind: "agentRegistered", owner: "carol", publicKey: f.key("c1").publicKey, modelFamily: "kimi", harness: "h" };
     assert.equal((await post(f, await signed(f, c1, "carol"))).status, 201);
     assert.equal((await post(f, await signed(f, submission("s1"), "a1"))).status, 201);
-    await f.server.store.appendAsCoordinator({ kind: "reviewAssignment", submissionId: "s1", beacon: "x", reviewers: [f.id("b1"), f.id("c1")] });
+    await f.server.store.appendAsCoordinator((st) => assignmentBody(st, "s1", [f.id("b1"), f.id("c1")], "e"));
     const verdict = { defectProbability: 0.1, summary: "ok", findingIds: [] };
-    const commitment = sha256hex(canonical(verdict) + "salt");
+    const commitment = commitmentFor(verdict, "salt", f.id("b1"), { submissionId: "s1" });
     assert.equal((await post(f, await signed(f, { kind: "reviewCommit", submissionId: "s1", commitment, stake: 5 }, "b1"))).status, 201);
     const list = async (agent: string) =>
-      ((await (await fetch(`${f.url}/api/assignments?agent=${agent}`)).json()) as { assignments: unknown[] }).assignments;
+      ((await (await fetch(`${f.url}/api/assignments?agent=${agent}`)).json()) as { assignments: { commitBy?: string }[] }).assignments;
+    const seats = await list(f.id("c1"));
+    assert.equal(seats.length, 1);
+    assert.match(seats[0]?.commitBy ?? "", /^\d{4}-/, "the listing says until when the seat may commit");
+    // b1 cannot reveal (and so close c1's seat) before c1 committed or the phase ended.
+    const early = await post(f, await signed(f, { kind: "reviewReveal", submissionId: "s1", verdict, salt: "salt" }, "b1"));
+    assert.equal(early.status, 400);
+    assert.equal(early.body.error, "commit-phase");
     assert.equal((await list(f.id("c1"))).length, 1);
-    assert.equal((await post(f, await signed(f, { kind: "reviewReveal", submissionId: "s1", verdict, salt: "salt" }, "b1"))).status, 201);
+    // A later session of b1 finds its committed, unrevealed review, and when the ledger takes the reveal.
+    const pending = async (agent: string) =>
+      ((await (await fetch(`${f.url}/api/assignments?agent=${agent}`)).json()) as { pendingReveals: { kind: string; submissionId?: string; revealFrom: string }[] })
+        .pendingReveals;
+    const mine = await pending(f.id("b1"));
+    assert.deepEqual(mine.map((p) => [p.kind, p.submissionId]), [["review", "s1"]]);
+    assert.equal(mine[0]?.revealFrom, seats[0]?.commitBy, "c1 has not committed: reveals wait for the phase's end");
+    // Once the phase ends the seat is closed, and b1 may reveal.
+    f.setSeconds(13 * 3600);
     assert.deepEqual(await list(f.id("c1")), [], "the ledger would refuse c1's commit now");
+    assert.equal((await post(f, await signed(f, { kind: "reviewReveal", submissionId: "s1", verdict, salt: "salt" }, "b1"))).status, 201);
+    assert.deepEqual(await pending(f.id("b1")), [], "revealed: nothing pending");
+  } finally {
+    await f.close();
+  }
+});
+
+test("slow clients: idle uploads hold neither the server nor other clients' slots", async () => {
+  // Behind a trusted proxy (here: loopback), clients are told apart by X-Forwarded-For.
+  const f = await fixture({ maxConcurrentPerIp: 4 }, { trustedProxies: ["127.0.0.1"] });
+  const sockets: net.Socket[] = [];
+  try {
+    // maxConcurrent + 1 uploads from one client that send headers and a
+    // Content-Length, then nothing.
+    const { port } = new URL(f.url);
+    for (let i = 0; i < DEFAULT_LIMITS.maxConcurrent + 1; i++) {
+      const sock = net.connect(Number(port), "127.0.0.1");
+      sock.on("error", () => {});
+      sock.write("POST /api/entries HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n");
+      sockets.push(sock);
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    // Beyond 4 they were refused at once, so another client is still served...
+    const other = await fetch(`${f.url}/api/head`, { headers: { "X-Forwarded-For": "198.51.100.7" } });
+    assert.equal(other.status, 200);
+    // ...while the hog's own next request is refused, and a forged hop does not help it.
+    const hog = await fetch(`${f.url}/api/head`, { headers: { "X-Forwarded-For": "203.0.113.9" } });
+    assert.equal(hog.status, 503);
+    // And Node's 5-minute defaults no longer apply.
+    assert.equal(f.server.requestTimeout, DEFAULT_LIMITS.requestTimeoutMs);
+    assert.equal(f.server.headersTimeout, DEFAULT_LIMITS.headersTimeoutMs);
+  } finally {
+    for (const s of sockets) s.destroy();
+    await f.close();
+  }
+});
+
+test("regression: one IPv6 /64 is one client, and a large declared body that goes quiet is dropped as soon as it falls behind", async () => {
+  const f = await fixture({ maxConcurrentPerIp: 4, bodyGraceMs: 300, minBodyBytesPerSecond: 1000 }, { trustedProxies: ["127.0.0.1"] });
+  const sockets: net.Socket[] = [];
+  try {
+    assert.equal((await post(f, await signed(f, submission("s1"), "a1"))).status, 201);
+    const { port } = new URL(f.url);
+    const replies: Promise<string>[] = [];
+    // Eight addresses of one /64, each with a declared 1 MB patch and one byte
+    // sent, claiming the author's public key (public on /api/entries) and no valid signature.
+    const auth = `X-Commons-Key: ${f.key("a1").publicKey}\r\nX-Commons-Sig: AAAA\r\n`;
+    for (let i = 1; i <= 8; i++) {
+      const sock = net.connect(Number(port), "127.0.0.1");
+      sock.on("error", () => {});
+      let reply = "";
+      sock.on("data", (d) => (reply += d.toString()));
+      replies.push(new Promise((r) => sock.on("close", () => r(reply))));
+      sock.write(`POST /api/patches/s1 HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 2001:db8::${i.toString(16)}\r\n${auth}Content-Length: 1000000\r\n\r\nx`);
+      sockets.push(sock);
+    }
+    await new Promise((r) => setTimeout(r, 150));
+    const sameNet = await fetch(`${f.url}/api/head`, { headers: { "X-Forwarded-For": "2001:db8::99" } });
+    assert.equal(sameNet.status, 503, "the /64 has used its slots");
+    const otherNet = await fetch(`${f.url}/api/head`, { headers: { "X-Forwarded-For": "2001:db9::1" } });
+    assert.equal(otherNet.status, 200);
+    // The silent uploads are dropped within the grace plus a check, not after the whole body's time.
+    const settled = await Promise.race([Promise.all(replies), new Promise<null>((r) => setTimeout(() => r(null), 3000))]);
+    assert.ok(settled !== null, "every silent upload was dropped within 3 s");
+    assert.equal((await fetch(`${f.url}/api/head`, { headers: { "X-Forwarded-For": "2001:db8::99" } })).status, 200, "and the slots are free again");
+  } finally {
+    for (const s of sockets) s.destroy();
+    await f.close();
+  }
+});
+
+test("regression: clients that request a large response and never read it lose their sockets, so they cannot hold every slot", async () => {
+  const f = await fixture({ maxConcurrent: 4, maxConcurrentPerIp: 4, requestTimeoutMs: 400, responseTimeoutMs: 400 });
+  const sockets: net.Socket[] = [];
+  try {
+    // An 8 MiB stored patch: far more than loopback buffers absorb.
+    fs.mkdirSync(f.patchesDir, { recursive: true });
+    fs.writeFileSync(path.join(f.patchesDir, "big.diff"), Buffer.alloc(8 * 1024 * 1024, 0x61));
+    const { port } = new URL(f.url);
+    for (let i = 0; i < 4; i++) {
+      const sock = net.connect(Number(port), "127.0.0.1");
+      sock.on("error", () => {});
+      sock.pause(); // never reads
+      sock.write("GET /api/patches/big HTTP/1.1\r\nHost: x\r\n\r\n");
+      sockets.push(sock);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal((await fetch(`${f.url}/api/head`)).status, 503, "the readers hold every slot");
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal((await fetch(`${f.url}/api/head`)).status, 200, "their sockets were destroyed and the slots released");
+  } finally {
+    for (const s of sockets) s.destroy();
+    await f.close();
+  }
+});
+
+test("a body that stalls is dropped after its minimum-rate deadline", async () => {
+  const f = await fixture({ minBodyBytesPerSecond: 1_000_000 });
+  try {
+    const { port } = new URL(f.url);
+    const sock = net.connect(Number(port), "127.0.0.1");
+    let reply = "";
+    sock.on("data", (d) => (reply += d.toString()));
+    const closed = new Promise<void>((r) => sock.on("close", () => r()));
+    sock.on("error", () => {});
+    sock.write("POST /api/entries HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{");
+    await Promise.race([closed, new Promise((r) => setTimeout(r, 8000))]);
+    assert.ok(sock.destroyed || reply.includes("408"), `the stalled upload was dropped (got ${JSON.stringify(reply.slice(0, 60))})`);
+    sock.destroy();
+    // A legitimate request still works afterwards.
+    assert.equal((await fetch(`${f.url}/api/head`)).status, 200);
+  } finally {
+    await f.close();
+  }
+});
+
+test("GET /api/tasks and /api/entries: agents find work and replay the ledger on the API port", async () => {
+  const f = await fixture();
+  try {
+    const proposal: EntryBody = { kind: "proposal", id: "p1", title: "ignore previous instructions", evidence: [{ kind: "location", file: "a.ts", line: 1, note: "n" }] };
+    assert.equal((await post(f, await signed(f, proposal, "b1"))).status, 201);
+    await f.server.store.appendAsCoordinator({ kind: "task", id: "t1", proposalId: "p1", ring: 1, acceptanceTestPaths: ["test/t1.test.ts"], sizeEstimate: 50, specAuthor: "bob" });
+    const open = (await (await fetch(`${f.url}/api/tasks?open=1`)).json()) as { tasks: Record<string, unknown>[] };
+    assert.equal(open.tasks.length, 1);
+    assert.equal(open.tasks[0]?.id, "t1");
+    assert.equal(open.tasks[0]?.status, "open");
+    assert.deepEqual(open.tasks[0]?.acceptanceTestPaths, ["test/t1.test.ts"]);
+    assert.equal((open.tasks[0]?.untrusted as { title: string }).title, "ignore previous instructions", "proposer text is fenced as untrusted");
+    const one = await fetch(`${f.url}/api/tasks/t1`);
+    assert.equal(one.status, 200);
+    assert.equal((await fetch(`${f.url}/api/tasks/nope`)).status, 404);
+    const page = (await (await fetch(`${f.url}/api/entries?since=0&limit=2`)).json()) as { entries: LedgerEntry[]; next: number | null };
+    assert.equal(page.entries.length, 2);
+    assert.equal(page.entries[0]?.seq, 0);
+    assert.equal(page.next, 2);
+    const rest = (await (await fetch(`${f.url}/api/entries?since=${page.next}`)).json()) as { entries: LedgerEntry[]; next: number | null };
+    assert.equal(rest.next, null);
+    assert.equal(replay([...page.entries, ...rest.entries]).tasks.has("t1"), true, "the pages replay to the same state");
+    assert.equal((await fetch(`${f.url}/api/entries?since=x`)).status, 400);
+  } finally {
+    await f.close();
+  }
+});
+
+test("operator decisions are posted through the API by an admin or a kernel signer, never by an agent", async () => {
+  const f = await fixture(); // kernel signers alice and bob
+  try {
+    assert.equal((await post(f, await signed(f, submission("s1"), "a1"))).status, 201);
+    const approve: EntryBody = { kind: "mergeApproval", submissionId: "s1" };
+    assert.equal((await post(f, await signed(f, approve, "b1"))).status, 403, "an agent key is not an operator");
+    const self = await post(f, await signed(f, approve, "alice"));
+    assert.equal(self.status, 400, "alice owns the author");
+    assert.equal(self.body.error, "same-owner");
+    assert.equal((await post(f, await signed(f, approve, "bob"))).status, 201);
+    assert.equal(f.server.store.state().submissions.get("s1")?.approval?.by, f.id("bob"));
+  } finally {
+    await f.close();
+  }
+});
+
+test("a local write by another process does not leave the store stale", async () => {
+  const f = await fixture();
+  try {
+    // An operator appends locally while the server holds the ledger.
+    const local = Ledger.open(f.ledgerPath);
+    local.append({ kind: "ownerKey", owner: "carol", publicKey: f.key("carol").publicKey, inviter: null }, f.admin, f.now());
+    const h = await head(f);
+    assert.equal(h.nextSeq, local.state().length, "the server caught up");
+    const c1: EntryBody = { kind: "agentRegistered", owner: "carol", publicKey: f.key("c1").publicKey, modelFamily: "kimi", harness: "h" };
+    assert.equal((await post(f, await signed(f, c1, "carol"))).status, 201);
   } finally {
     await f.close();
   }

@@ -6,11 +6,12 @@ import * as path from "node:path";
 
 import { canonical, generateKeyPair, keyIdOf, sha256hex } from "../src/crypto";
 import { Ledger } from "../src/ledger";
+import { commitmentFor } from "../src/review";
 import { computeMetrics, gini, median, reciprocity, reviewConcentration, type MetricRow } from "../src/metrics";
 import { plantCommitment } from "../src/plants";
 import { claimStake, defaultRules } from "../src/rules";
-import { treeFromParents } from "../src/tree";
-import type { EntryBody, KeyId, ModelFamily, TreeView } from "../src/types";
+import type { EntryBody, KeyId, ModelFamily, Rules } from "../src/types";
+import { assignmentBody } from "../src/selection";
 
 // --- a real, signed ledger ----------------------------------------------------
 
@@ -23,6 +24,15 @@ const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
 const dirs: string[] = [];
+
+// The fixture project's own rings (defaultRules names no project paths): a
+// kernel directory (ring 0) and a UI directory (ring 2), after the defaults
+// so generic ring-0 files under web/ stay ring 0 (protocol §4).
+function projectRules(): Rules {
+  const r = defaultRules();
+  r.rings = [{ glob: "src/kernel/**", ring: 0 }, ...r.rings, { glob: "web/**", ring: 2 }];
+  return r;
+}
 after(() => {
   for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
 });
@@ -43,10 +53,10 @@ class World {
       path.join(dir, "ledger.jsonl"),
       {
         kind: "genesis",
-        project: "anthill",
+        project: "demo",
         admins: [this.admin.publicKey],
         coordinator: this.coord.publicKey,
-        rules: defaultRules(),
+        rules: projectRules(),
       },
       new Date(this.t).toISOString(),
     );
@@ -91,7 +101,7 @@ class World {
   submit(
     id: string,
     author: string,
-    files = [`anthill-backend/src/${id}.ts`],
+    files = [`src/${id}.ts`],
     gate = true,
     taskId: string | null = null,
   ): void {
@@ -103,24 +113,31 @@ class World {
   }
   // Each reviewer is assigned; commits first, then reveals.
   review(id: string, verdicts: [string, number][]): void {
-    this.coordinator({
-      kind: "reviewAssignment",
-      submissionId: id,
-      beacon: "b",
-      reviewers: verdicts.map(([a]) => this.agentKey(a).keyId),
-    });
+    this.coordinator(assignmentBody(this.state, id, verdicts.map(([a]) => this.agentKey(a).keyId), "e"));
     this.openReview(id, verdicts);
   }
-  // Reviewers who chose to review: no assignment names them.
+  // Reviewers who chose to review: no assignment names them. Reveals wait for
+  // the commit phase, which needs an assignment: without one, the "pool"
+  // owner's agent (used nowhere else) is drawn and never commits, and time
+  // moves past the commit deadline before the reveals.
   openReview(id: string, verdicts: [string, number][]): void {
     const salts = verdicts.map(() => `salt${this.n++}`);
     const verdict = (p: number) => ({ defectProbability: p, summary: "", findingIds: [] });
     verdicts.forEach(([a, p], i) =>
       this.append(
-        { kind: "reviewCommit", submissionId: id, commitment: sha256hex(canonical(verdict(p)) + salts[i]), stake: 5 },
+        { kind: "reviewCommit", submissionId: id, commitment: commitmentFor(verdict(p), salts[i] as string, this.agentKey(a).keyId, { submissionId: id }), stake: 5 },
         this.agentKey(a),
       ),
     );
+    const s = this.state.submissions.get(id);
+    if (s && !s.assignment) {
+      if (!this.agents.has("pool1")) this.person("pool", "other");
+      this.coordinator(assignmentBody(this.state, id, [this.agentKey("pool1").keyId], "e"));
+    }
+    const assigned = this.state.submissions.get(id)?.assignment;
+    if (assigned && !assigned.reviewers.every((k) => this.state.submissions.get(id)?.reviews.some((r) => r.reviewer === k))) {
+      this.t = Math.max(this.t, Date.parse(assigned.at ?? "") + this.state.rules.review.commitHours * HOUR);
+    }
     verdicts.forEach(([a, p], i) =>
       this.append(
         { kind: "reviewReveal", submissionId: id, verdict: verdict(p), salt: salts[i] as string },
@@ -128,7 +145,12 @@ class World {
       ),
     );
   }
+  // The ledger merges nothing unassigned; the pool agent is drawn if no one was.
   merge(id: string): void {
+    if (!this.state.submissions.get(id)?.assignment) {
+      if (!this.agents.has("pool1")) this.person("pool", "other");
+      this.coordinator(assignmentBody(this.state, id, [this.agentKey("pool1").keyId], "e"));
+    }
     this.coordinator({ kind: "merge", submissionId: id, commit: `m-${id}` });
   }
   finding(id: string, finder: string, target: string | { snapshotId: string }, reproduced: boolean | null): void {
@@ -153,6 +175,8 @@ class World {
       passesOnParent: true,
       logDigest: "d",
     });
+    // An operator confirms every reproduction here: a real defect.
+    if (reproduced) this.append({ kind: "findingDecision", findingId: id, confirmed: true, reason: "real" }, this.admin);
   }
   plant(id: string, author: string, reviewer: string, p: number, open = false): void {
     const salt = `ps${this.n++}`;
@@ -177,7 +201,6 @@ const PEOPLE: [string, ModelFamily][] = [
   ["dave", "deepseek"],
   ["erin", "kimi"],
 ];
-const everyone: TreeView = treeFromParents({ root: null, ...Object.fromEntries(PEOPLE.map(([o]) => [o, "root"])) });
 
 function people(): World {
   const w = new World();
@@ -185,8 +208,8 @@ function people(): World {
   return w;
 }
 
-function rowsOf(w: World, now = w.now(), tree = everyone): MetricRow[] {
-  return computeMetrics(w.state, tree, now);
+function rowsOf(w: World, now = w.now()): MetricRow[] {
+  return computeMetrics(w.state, now);
 }
 function get(rows: MetricRow[], metric: string): MetricRow {
   const r = rows.find((x) => x.metric === metric);
@@ -231,7 +254,7 @@ test("every group is present, rows are well-formed, output is deterministic", ()
     if (typeof r.value === "number") assert.ok(Number.isFinite(r.value), r.metric);
   }
   assert.deepEqual(rowsOf(w), rows);
-  assert.throws(() => computeMetrics(w.state, everyone, "2026-10-01T00:00:00"), RangeError);
+  assert.throws(() => computeMetrics(w.state, "2026-10-01T00:00:00"), RangeError);
 });
 
 test("an empty commons: recall unmeasured is bad, absent rates are n/a and not bad", () => {
@@ -445,9 +468,9 @@ test("flow: counts, merge rate, medians, open submissions per ring; plants and d
   w.advance(30);
   w.review("s2", [["carol1", 0.1]]);
   w.merge("s2"); // ~30h
-  w.submit("s3", "carol1", ["anthill-frontend/src/Button.tsx"]); // ring 2, open
+  w.submit("s3", "carol1", ["web/src/Button.tsx"]); // ring 2, open
   w.submit("s4", "dave1"); // ring 1, open
-  w.submit("s5", "dave1", ["anthill-backend/src/x5.ts"]);
+  w.submit("s5", "dave1", ["src/x5.ts"]);
   w.finding("f1", "alice1", "s5", true); // dead: can never merge
   w.proposal("P1", "alice1");
   w.coordinator({
@@ -463,7 +486,7 @@ test("flow: counts, merge rate, medians, open submissions per ring; plants and d
     { kind: "claim", taskId: "T1", until: w.now(24), stake: claimStake(10, 0, w.state.rules) },
     w.agentKey("alice1"),
   );
-  w.submit("s6", "alice1", ["anthill-backend/src/engine.ts", "anthill-frontend/src/A.tsx"], true, "T1"); // ring 0, open
+  w.submit("s6", "alice1", ["src/kernel/engine.ts", "web/src/A.tsx"], true, "T1"); // ring 0, open
   // Dead too: the ledger refuses to merge after any failed gate, even once a re-run passes.
   w.submit("s7", "erin1", undefined, false);
   w.coordinator({ kind: "gateResult", submissionId: "s7", gate: "tests", pass: true, details: "re-run" });
@@ -539,6 +562,8 @@ test("trust: Gini rows ignore owners without agents (kernel signers, the custodi
   for (let i = 0; i < 5; i++) {
     for (const a of ["alice1", "bob1"]) {
       w.submit(`${a}-${i}`, a);
+      // the other owner reviews, so no third owner with an agent is needed
+      w.coordinator(assignmentBody(w.state, `${a}-${i}`, [w.agentKey(a === "alice1" ? "bob1" : "alice1").keyId], "e"));
       w.merge(`${a}-${i}`);
     }
   }
@@ -546,16 +571,6 @@ test("trust: Gini rows ignore owners without agents (kernel signers, the custodi
   assert.equal(row.value, 0);
   assert.equal(row.bad, false);
   assert.match(row.note, /over the 2 owners with an agent, 10 events/);
-});
-
-test("trust: owners the tree does not know are flagged", () => {
-  const w = people();
-  const partial = treeFromParents({ root: null, alice: "root", bob: "root", carol: "root" });
-  const row = get(rowsOf(w, w.now(), partial), "owners outside the tree");
-  assert.equal(row.value, 2);
-  assert.equal(row.bad, true);
-  assert.equal(row.note, "dave, erin");
-  assert.equal(get(rowsOf(w), "owners outside the tree").bad, false);
 });
 
 test("liveness: active agents and owners in the last 7 days; too few owners to staff a panel is bad", () => {
@@ -686,4 +701,23 @@ test("metrics never mutate the state", () => {
   rowsOf(w);
   assert.equal(w.state.headHash, before);
   assert.equal(JSON.stringify([...w.state.submissions.values()]), subs);
+});
+
+test("reviewer quality: a harness error is neither a judged finding nor a false one", () => {
+  const w = people();
+  w.submit("s1", "carol1");
+  w.finding("f1", "alice1", "s1", false);
+  w.finding("f2", "bob1", "s1", null);
+  w.coordinator({
+    kind: "findingResult",
+    findingId: "f2",
+    reproduced: false,
+    failsOnHead: false,
+    passesOnParent: false,
+    logDigest: "d",
+    harnessError: "timed out",
+  });
+  const ff = get(rowsOf(w), "false-finding rate");
+  assert.equal(ff.value, 1);
+  assert.match(ff.note, /^1\/1 judged findings did not reproduce/);
 });

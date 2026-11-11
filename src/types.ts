@@ -3,8 +3,9 @@
 // every module that uses it changes in the same commit.
 //
 // Conventions:
-// - Ids are strings. An OwnerId is an Anthill user id (the same id the Anthill
-//   tree uses for a member). A KeyId is the hex sha256 of a raw ed25519 public
+// - Ids are strings. An OwnerId names a person (or organisation) the admin
+//   registered with an ownerKey entry; owners and their inviters form the
+//   commons' trust tree (members.ts). A KeyId is the hex sha256 of a raw ed25519 public
 //   key, first 16 bytes (32 hex chars).
 // - Time is an ISO-8601 string passed in by the caller. Core modules never read
 //   the clock; the CLI stamps entries. This keeps replay deterministic.
@@ -13,7 +14,7 @@
 
 export type OwnerId = string;
 export type KeyId = string;
-export type ModelFamily = string; // e.g. "claude", "gpt", "qwen", "deepseek", "kimi", "glm"
+export type ModelFamily = string; // one of rules.modelFamilies (lowercase), e.g. "claude", "gpt", "qwen"
 export type CommitSha = string;
 
 // Capability ring of a file or change. 0 = kernel (reputation maths, auth,
@@ -47,13 +48,15 @@ export type EntryBody =
   // signer: none (seq 0 only). Bootstraps trust.
   | {
       kind: "genesis";
-      project: string; // Anthill community id this project belongs to
+      project: string; // a free-form id of the project this ledger governs
       admins: string[]; // raw ed25519 public keys, base64url (SPKI DER)
       coordinator: string; // raw public key, base64url (SPKI DER)
       rules: Rules;
     }
-  // signer: admin. Binds an owner (Anthill user) to a signing key. In production
-  // the admin is the Anthill backend, which checks the owner's passkey session.
+  // signer: admin. Admits an owner and binds it to a signing key. `inviter` is
+  // the existing owner who vouched for it, or null; it is the owner's parent
+  // in the trust tree (members.memberTree). The admin's ownerKey entries are
+  // the allowlist: nobody else can admit an owner.
   | { kind: "ownerKey"; owner: OwnerId; publicKey: string; inviter: OwnerId | null }
   // signer: owner (the owner named). Registers an agent key under the owner.
   | { kind: "agentRegistered"; owner: OwnerId; publicKey: string; modelFamily: ModelFamily; harness: string }
@@ -87,8 +90,21 @@ export type EntryBody =
   // signer: coordinator. Result of a mechanical gate on a submission.
   | { kind: "gateResult"; submissionId: string; gate: string; pass: boolean; details: string }
   // signer: coordinator. Reviewers drawn after the submission is fixed.
-  | { kind: "reviewAssignment"; submissionId: string; beacon: string; reviewers: KeyId[] }
-  // signer: agent (assigned or open reviewer). commitment = sha256hex(canonical(verdict) + salt)
+  // beacon = review.assignmentBeacon(submissionId, the submission's headCommit,
+  // entropy), recomputed and checked by the ledger. entropy must be
+  // the public randomness round fixed by rule (docs/protocol.md §5.6);
+  // treeDigest = members.memberDigest of the state before this entry (the
+  // ledger checks it), so the tree the draw used is fixed by the ledger.
+  | {
+      kind: "reviewAssignment";
+      submissionId: string;
+      beacon: string;
+      entropy: string;
+      treeDigest: string;
+      reviewers: KeyId[];
+    }
+  // signer: agent (assigned or open reviewer). commitment = review.commitmentFor(verdict, salt,
+  // reviewer keyId, { submissionId }) = sha256hex(canonical({ verdict, salt, reviewer, subject }))
   | { kind: "reviewCommit"; submissionId: string; commitment: string; stake: number }
   // signer: same agent as the commit
   | { kind: "reviewReveal"; submissionId: string; verdict: ReviewVerdict; salt: string }
@@ -110,7 +126,31 @@ export type EntryBody =
       failsOnHead: boolean;
       passesOnParent: boolean;
       logDigest: string;
+      // Set when the harness could not judge the test (timeouts and errors
+      // past the retry limit). Then reproduced is false, and the result is
+      // neither a reproduction nor a false finding: nobody is paid or slashed.
+      harnessError?: string;
     }
+  // signer: coordinator. One harness run that could not judge the finding
+  // (timeout, crash). Counted on the ledger, so maxHarnessErrors survives
+  // restarts and every coordinator replica agrees on it.
+  | { kind: "findingAttempt"; findingId: string; harnessError: string }
+  // signer: an operator (a genesis admin, or an owner in rules.kernelSigners
+  // who owns neither the finding nor the work it targets). A reproduced
+  // finding shows only that its test fails on head and passes on the parent,
+  // which a test pinning the old behaviour does against any change. confirmed =
+  // a real defect: only then does it pay, slash or record an escape. Dismissed
+  // = it tests the intended change: it stops blocking and costs its finder
+  // falseFindingPenalty. One decision per finding, after its result.
+  | { kind: "findingDecision"; findingId: string; confirmed: boolean; reason: string }
+  // signer: an operator who does not own the author's agent. A human approved
+  // the merge (Phase 1 every merge; Phase 2 only one the reviewers flagged).
+  | { kind: "mergeApproval"; submissionId: string }
+  // signer: coordinator. The review window passed with a quorum of revealed
+  // assigned reviews; `missing` never revealed. Closes the window on the
+  // ledger (plants.reviewWindowCloseSeq) before any merge, so the plant
+  // custodian can reveal in the grace that follows.
+  | { kind: "reviewWindowClosed"; submissionId: string; missing: KeyId[] }
   // signer: coordinator. Submission merged into dev.
   | { kind: "merge"; submissionId: string; commit: CommitSha }
   // signer: coordinator. A release candidate frozen at a dev commit.
@@ -123,7 +163,9 @@ export type EntryBody =
   // signer: coordinator. main advanced to this snapshot.
   | { kind: "promotion"; snapshotId: string; commit: CommitSha }
   // signer: admin (the seeding custodian). Commitment to a planted bug, made
-  // before the plant is submitted. commitment = sha256hex(submissionId + ":" + salt)
+  // before the plant is submitted: in batches, well ahead, so the commit's
+  // timing does not point at the submission (docs/protocol.md §7.1).
+  // commitment = sha256hex(submissionId + ":" + salt)
   | { kind: "plantCommit"; commitment: string }
   // signer: admin. Reveals a plant after the review window closed.
   | { kind: "plantReveal"; submissionId: string; salt: string; description: string; severity: Severity }
@@ -133,7 +175,7 @@ export type EntryBody =
   | { kind: "escape"; findingId: string; snapshotId: string }
   // signer: coordinator. A reputation movement computed by incentives.ts.
   | { kind: "settlement"; owner: OwnerId; delta: number; reason: SettlementReason; ref: string }
-  // signer: admin. New rules version, ratified by an Anthill poll.
+  // signer: admin. New rules version; pollId names the group decision behind it.
   | { kind: "rulesChange"; rules: Rules; pollId: string };
 
 export type EntryKind = EntryBody["kind"];
@@ -175,6 +217,9 @@ export type Rules = {
   minTreeDistance: number; // N: reviewers and bounty winners must be farther than this from the author
   assignedReviewers: number; // 2-3
   requireOtherModelFamily: boolean;
+  // The closed list of model families an agent may declare, lowercase. A free
+  // spelling ("Claude ", "anthropic") would let one family pass as two.
+  modelFamilies: ModelFamily[];
   plantRate: number; // 0.1..0.2, informational for the custodian
   stake: {
     base: number; // points locked per claim at 100 lines, ring 1
@@ -182,6 +227,9 @@ export type Rules = {
     ringMultiplier: [number, number, number]; // ring 0, 1, 2
     review: number; // points locked per review commit
     finding: number; // points locked per finding
+    // Points of stake every owner may lock before earning any: the server
+    // backs stakes with allowance + reputationDelta - lockedStake.
+    allowance: number;
   };
   rewards: {
     merge: number; // total author reward per merged submission, vests in thirds
@@ -196,6 +244,11 @@ export type Rules = {
     honeytokenPenalty: number;
   };
   vesting: { tailDays: number }; // third tranche vests this many days after release
+  // Commit phase: commits on a submission close commitHours after its
+  // reviewAssignment (on a snapshot, after the snapshot entry), and reveals
+  // wait for that deadline or for every assigned reviewer's commit. Without it
+  // the first reveal, by anyone, would close commits for everyone.
+  review: { commitHours: number };
   reviewsPerSubmitCredit: number; // 2
   promotion: {
     minModelFamilies: number; // 3
@@ -218,8 +271,14 @@ export type OwnerState = {
   id: OwnerId;
   keyId: KeyId;
   inviter: OwnerId | null;
-  reputationDelta: number; // sum of settlements in this project (added to Anthill reputation)
+  // Sum of settlements in this project: the owner's commons reputation. It
+  // backs stakes (with rules.stake.allowance) and sizes PR slots.
+  reputationDelta: number;
   lockedStake: number;
+  // Seq of the ownerKey entry, so the tree an old draw used can be rebuilt
+  // (selection.verifyAssignment). Always set by replay; optional only for
+  // hand-built states.
+  registeredSeq?: number;
 };
 
 export type AgentState = {
@@ -229,6 +288,14 @@ export type AgentState = {
   harness: string;
   active: boolean;
   revokedReason?: string;
+  // Who revoked it: its owner (often key rotation) or the coordinator (a
+  // suspension: honeytoken, leaked key). Set with revokedReason.
+  revokedBy?: "owner" | "coordinator";
+  // Seqs of the registration and the revocation, so an old draw can be
+  // recomputed over the pool as it was (selection.verifyAssignment). Always set
+  // by replay; optional only for hand-built states.
+  registeredSeq?: number;
+  revokedSeq?: number;
 };
 
 export type ReviewState = {
@@ -251,11 +318,13 @@ export type SubmissionState = {
   submittedSeq: number;
   submittedAt: string;
   gates: { gate: string; pass: boolean; details: string }[];
-  assignment?: { beacon: string; reviewers: KeyId[]; seq: number };
+  assignment?: { beacon: string; entropy: string; treeDigest: string; reviewers: KeyId[]; seq: number; at?: string }; // at: always set by replay
+  approval?: { by: KeyId; seq: number; at: string }; // mergeApproval
+  windowClosed?: { missing: KeyId[]; seq: number; at: string }; // reviewWindowClosed
   reviews: ReviewState[];
   findingIds: string[];
   merged?: { commit: CommitSha; seq: number; at: string };
-  planted?: { severity: Severity; description: string }; // set only after plantReveal
+  planted?: { severity: Severity; description: string; seq?: number }; // set only after plantReveal; seq always set by replay
 };
 
 export type FindingState = {
@@ -268,7 +337,17 @@ export type FindingState = {
   stake: number;
   seq: number;
   at: string;
-  result?: { reproduced: boolean; failsOnHead: boolean; passesOnParent: boolean; logDigest: string; seq: number };
+  result?: {
+    reproduced: boolean;
+    failsOnHead: boolean;
+    passesOnParent: boolean;
+    logDigest: string;
+    harnessError?: string; // see findingResult
+    seq: number;
+    at?: string; // always set by replay
+  };
+  harnessErrors?: number; // findingAttempt entries so far (absent = 0)
+  decision?: { confirmed: boolean; reason: string; by: KeyId; seq: number; at?: string }; // findingDecision; at always set by replay
 };
 
 export type SnapshotState = {
@@ -286,6 +365,10 @@ export type SnapshotState = {
 export type CommonsState = {
   project: string;
   rules: Rules;
+  // Every rules value in force, oldest first, with the seq that set it (0 for
+  // genesis), so a draw can be recomputed under the rules it used. Always set
+  // by replay; absent in hand-built states, which then mean "never changed".
+  rulesHistory?: { seq: number; rules: Rules }[];
   adminKeys: KeyId[];
   coordinatorKey: KeyId;
   publicKeys: Map<KeyId, string>; // keyId -> base64url SPKI DER
@@ -294,7 +377,12 @@ export type CommonsState = {
   agents: Map<KeyId, AgentState>;
   proposals: Map<string, { id: string; title: string; evidence: Evidence[]; by: KeyId; seq: number }>;
   tasks: Map<string, Extract<EntryBody, { kind: "task" }> & { seq: number }>;
-  claims: Map<string, { taskId: string; agent: KeyId; until: string; stake: number; seq: number }>; // by taskId, latest
+  // By taskId, the latest claim. `since` is the `at` of the first claim in the
+  // holder's unbroken run of extensions (always set by replay).
+  claims: Map<string, { taskId: string; agent: KeyId; until: string; stake: number; seq: number; since?: string }>;
+  // Every claim entry, in ledger order, so a replaced claim can still be
+  // settled (incentives.settleExpiredClaims). Always set by replay.
+  claimHistory?: { taskId: string; agent: KeyId; until: string; stake: number; seq: number; at: string }[];
   submissions: Map<string, SubmissionState>;
   findings: Map<string, FindingState>;
   snapshots: Map<string, SnapshotState>;
@@ -307,8 +395,8 @@ export type CommonsState = {
 };
 
 // ---------------------------------------------------------------------------
-// The Anthill tree, as seen by the commons. Built from the Anthill engine, a
-// snapshot JSON, or a plain parent map (tests). See tree.ts.
+// The trust tree: owners under their inviters, derived from the ledger by
+// members.memberTree (or from a plain parent map in tests). See members.ts.
 // ---------------------------------------------------------------------------
 
 export interface TreeView {
@@ -319,8 +407,7 @@ export interface TreeView {
   depth(id: OwnerId): number; // root = 0
   // number of edges on the tree path between a and b (0 if a === b)
   distance(a: OwnerId, b: OwnerId): number;
-  members(): OwnerId[];
-  reputation(id: OwnerId): number; // Anthill reputation in points (0 if unknown)
+  members(): OwnerId[]; // every node, sorted
 }
 
 // Result of any gate: pass/fail plus a reason a human can read.

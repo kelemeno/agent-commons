@@ -18,7 +18,8 @@
 // - Without `sandbox`, this is NOT isolation. The command runs as the
 //   coordinator's uid: it can read and write anything that uid can, including
 //   the operator's repository by absolute path, and it can read the
-//   coordinator's launch environment through /proc/<ppid>/environ. The minimal
+//   coordinator's launch environment through /proc/<ppid>/environ (Linux) or
+//   `ps -E` (BSD, macOS). The minimal
 //   environment only stops secrets from being handed to the command; it does
 //   not stop a hostile command from fetching them. As a guard against
 //   accidental leaks, the values of secret-named variables are redacted from
@@ -28,8 +29,13 @@
 //   coordinator's (or any other) processes, so /proc/<pid>/environ and
 //   /proc/<pid>/mem are out of reach, and every process it starts dies with
 //   it, even ones that call setsid. It can still read and write the
-//   filesystem as the coordinator's uid. Findings from strangers need that
-//   plus a separate uid or a container; this module cannot provide that.
+//   filesystem as the coordinator's uid. Findings from strangers need a fresh
+//   container per run (scripts/sandbox-docker); this module cannot provide
+//   that. A plain separate uid is not enough: every run would share it, so
+//   one finding's test (or a process it leaves behind) could write into
+//   another run's world-writable checkout and forge that finding's outcome.
+//   The CLI's preflight refuses a sandbox whose runs share /tmp. The
+//   checkouts' names inside the unlistable root are random as a second line.
 //
 // Outcome rules:
 // - failsOnHead  = the head run finished with a non-zero exit code or died of a
@@ -47,13 +53,25 @@
 // - A testPath that is absolute, empty, climbs out with "..", or touches `.git`,
 //   and a timeout outside (0, MAX_TIMEOUT_MS], are caller errors and reject
 //   before anything is checked out.
+// - Before the test runs on a side, a harness-chosen probe runs there the same
+//   way (sandbox, cwd, environment) and must read a sentinel file the harness
+//   wrote into the checkout and find the checkout writable. If it cannot (a
+//   sandbox uid that cannot enter the coordinator's 0700 temp directory, say),
+//   that side is a harness error: a test that never saw its checkout fails on
+//   both sides, which must not read as a false finding. `shareCheckout` makes
+//   the checkout usable by another uid (root 0711, checkouts world-writable).
+// - `setupCommand` (e.g. `npm ci --ignore-scripts`, which needs a lockfile) runs in each checkout
+//   after export and before the test file is written, under `setupSandbox`
+//   (default `sandbox`), so a test can rely on dependencies; a failed setup
+//   is a harness error, never a failure.
 
+import { randomBytes } from "node:crypto";
 import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
-import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import type { Readable } from "node:stream";
+import { sha256hex } from "./crypto";
 import type { CommitSha } from "./types";
 
 export type ReproduceOptions = {
@@ -68,7 +86,47 @@ export type ReproduceOptions = {
   // argv prefix the shell is run under, e.g. PID_NAMESPACE_SANDBOX. It is
   // spawned with the same minimal environment, so it must be on that PATH.
   sandbox?: readonly string[];
+  // Where the harness makes its temporary root (default os.tmpdir()).
+  tmpRoot?: string;
+  // Make the checkouts usable by a sandbox running as another uid.
+  shareCheckout?: boolean;
+  // Run in each checkout before the test file is written (see the header).
+  setupCommand?: string;
+  setupSandbox?: readonly string[];
 };
+
+// What the harness names its temporary roots; the CLI's sandbox preflight
+// makes its probe directory the same way (cli.sandboxLeaks).
+export const HARNESS_DIR_PREFIX = "commons-finding-";
+// The probe's files. Their names are drawn per run (harnessNames), because the
+// checkout root is the commit's: a commit holding a file (or a directory) of
+// a fixed name could make every run on it a harness error, and after
+// maxHarnessErrors every finding against it void.
+type HarnessNames = { sentinel: string; probe: string };
+function harnessNames(): HarnessNames {
+  const tag = randomBytes(16).toString("hex");
+  return { sentinel: `.commons-harness-${tag}`, probe: `.commons-harness-${tag}-w` };
+}
+
+// The root stays unlistable (0711) but enterable; the checkout and its home
+// become writable by the sandbox's uid.
+async function shareDirs(root: string, dirs: string[]): Promise<void> {
+  await chmod(root, 0o711);
+  for (const d of dirs) await openUp(d);
+}
+
+async function openUp(path: string, recurse = true): Promise<void> {
+  const st = await lstat(path);
+  if (st.isSymbolicLink()) return;
+  await chmod(path, st.isDirectory() ? 0o777 : 0o666 | (st.mode & 0o111));
+  if (recurse && st.isDirectory()) for (const name of await readdir(path)) await openUp(join(path, name));
+}
+
+// The harness's own probe: can the sandboxed command read a file the harness
+// wrote into its checkout, and write there? Exit 0 = yes.
+export function checkoutProbe(names: HarnessNames): string {
+  return `cat ./${names.sentinel} >/dev/null && [ -r . ] && [ -w . ] && : > ./${names.probe} && rm -f ./${names.probe}`;
+}
 
 export type ReproductionResult = {
   failsOnHead: boolean;
@@ -87,6 +145,9 @@ export const MAX_LOG_BYTES_PER_RUN = 64 * 1024;
 // How long to keep reading output after the shell has exited or been killed.
 // A descendant that left the process group can hold the pipes open forever.
 export const DRAIN_MS = 1_000;
+// How long a timed-out run's process group has between SIGTERM and SIGKILL
+// (see runCommand): long enough for a sandbox to stop what it started.
+export const KILL_GRACE_MS = 10_000;
 
 // util-linux recipe: new user/PID/mount namespaces with a private /proc, then
 // drop every capability so the command cannot unmount that /proc to uncover
@@ -165,7 +226,7 @@ export function checkTestPath(testPath: string): string {
 }
 
 type Role = "head" | "base";
-type Prepared = { role: Role; sha: string; dir: string; home: string; error: string | null };
+type Prepared = { role: Role; sha: string; dir: string; home: string; names: HarnessNames; error: string | null };
 
 export async function reproduceFinding(opts: ReproduceOptions): Promise<ReproductionResult> {
   const testPath = checkTestPath(opts.testPath);
@@ -180,7 +241,7 @@ export async function reproduceFinding(opts: ReproduceOptions): Promise<Reproduc
   // Collected before any untrusted code runs.
   const secrets = await secretValues(opts.env ?? {});
 
-  const root = await mkdtemp(join(tmpdir(), "anthill-finding-"));
+  const root = await mkdtemp(join(opts.tmpRoot ?? tmpdir(), HARNESS_DIR_PREFIX));
   let outcome: Omit<ReproductionResult, "cleanupError">;
   try {
     outcome = await reproduceIn(root, opts, testPath, timeoutMs, sandbox, secrets);
@@ -188,7 +249,24 @@ export async function reproduceFinding(opts: ReproduceOptions): Promise<Reproduc
     await removeTree(root);
     throw err;
   }
-  return { ...outcome, cleanupError: await removeTree(root) };
+  return { ...outcome, cleanupError: await removeRoot(root, opts, sandbox) };
+}
+
+// Under a sandbox uid (shareCheckout) the test can leave directories only that
+// uid can empty (mode 0700, owned by it), which the coordinator then cannot
+// remove: every hostile finding would leak disk for good. So when removal
+// fails, the sandbox itself opens the checkouts up, and removal is retried.
+// What still remains is reported in cleanupError (callers log it).
+async function removeRoot(root: string, opts: ReproduceOptions, sandbox: readonly string[]): Promise<string | null> {
+  const first = await removeTree(root);
+  if (first === null || opts.shareCheckout !== true || sandbox.length === 0) return first;
+  for (const name of await readdir(root).catch(() => [] as string[])) {
+    const dir = join(root, name);
+    const st = await lstat(dir).catch(() => null);
+    if (!st?.isDirectory()) continue;
+    await runCommand("chmod -R a+rwX . 2>/dev/null; true", dir, minimalEnv(dir), 60_000, sandbox);
+  }
+  return removeTree(root);
 }
 
 async function reproduceIn(
@@ -202,7 +280,7 @@ async function reproduceIn(
   // Everything that touches the repository happens here, before any command.
   const prepared: Prepared[] = [];
   for (const [role, commit] of [["base", opts.baseCommit], ["head", opts.headCommit]] as const) {
-    prepared.push(await prepare(root, opts.repoDir, role, commit, testPath, opts.testContent));
+    prepared.push(await prepare(root, opts, role, commit, testPath, timeoutMs, sandbox));
   }
 
   const runs: RunResult[] = [];
@@ -212,6 +290,17 @@ async function reproduceIn(
       continue;
     }
     const env = minimalEnv(p.home, opts.env);
+    const probe = await runCommand(checkoutProbe(p.names), p.dir, env, timeoutMs, sandbox);
+    if (probe.kind !== "exit" || probe.code !== 0) {
+      const why =
+        probe.kind === "error"
+          ? probe.error
+          : probe.kind === "timeout"
+            ? "the checkout probe timed out"
+            : "the sandboxed command cannot read and write its checkout (a sandbox uid without access? see shareCheckout)";
+      runs.push(harnessFailure(p.role, p.sha, why));
+      continue;
+    }
     const outcome = await runCommand(opts.testCommand, p.dir, env, timeoutMs, sandbox);
     const scrub = await scrubber([p.dir, p.home, root]);
     const output = scrub(redact(outcome.output.toString("utf8"), secrets, outcome.truncated > 0));
@@ -227,37 +316,70 @@ async function reproduceIn(
     passesOnParent,
     reproduced: failsOnHead && passesOnParent,
     log,
-    logDigest: createHash("sha256").update(log, "utf8").digest("hex"),
+    logDigest: sha256hex(log),
     harnessError: [head, base].map(errorOf).find((e) => e !== null) ?? null,
   };
 }
 
 // Never throws: every failure becomes that run's harness error.
-async function prepare(root: string, repoDir: string, role: Role, commit: string, testPath: string, content: string): Promise<Prepared> {
-  const dir = join(root, role);
-  const home = join(root, `home-${role}`);
+async function prepare(
+  root: string,
+  opts: ReproduceOptions,
+  role: Role,
+  commit: string,
+  testPath: string,
+  timeoutMs: number,
+  sandbox: readonly string[],
+): Promise<Prepared> {
+  const repoDir = opts.repoDir;
+  // Unguessable names inside the unlistable (0711) root: with shareCheckout
+  // the checkouts are world-writable, so their paths must not be known.
+  const tag = randomBytes(8).toString("hex");
+  const dir = join(root, `${role}-${tag}`);
+  const home = join(root, `home-${role}-${tag}`);
+  const names = harnessNames();
   const resolved = await resolveCommit(repoDir, commit, root);
   const sha = resolved.value ?? commit;
-  if (resolved.error !== null) return { role, sha, dir, home, error: resolved.error };
+  if (resolved.error !== null) return { role, sha, dir, home, names, error: resolved.error };
   try {
     await mkdir(dir);
     await mkdir(home);
   } catch (err) {
-    return { role, sha, dir, home, error: `could not create checkout: ${message(err)}` };
+    return { role, sha, dir, home, names, error: `could not create checkout: ${message(err)}` };
   }
   try {
     const index = { GIT_INDEX_FILE: join(root, `index-${role}`) };
     await git(repoDir, ["read-tree", sha], root, index);
     await git(repoDir, ["checkout-index", "--all", "--force", `--prefix=${dir}/`], root, index);
   } catch (err) {
-    return { role, sha, dir, home, error: `checkout failed: ${message(err)}` };
+    return { role, sha, dir, home, names, error: `checkout failed: ${message(err)}` };
+  }
+  if (opts.shareCheckout === true) {
+    try {
+      await shareDirs(root, [dir, home]);
+    } catch (err) {
+      return { role, sha, dir, home, names, error: `could not share the checkout: ${message(err)}` };
+    }
+  }
+  if (opts.setupCommand !== undefined) {
+    const setup = await runCommand(opts.setupCommand, dir, minimalEnv(home, opts.env), timeoutMs, opts.setupSandbox ?? sandbox);
+    if (setup.kind !== "exit" || setup.code !== 0) {
+      const how = setup.kind === "exit" ? `exit ${setup.code}` : setup.kind;
+      return { role, sha, dir, home, names, error: `setup command failed (${how}): ${setup.output.toString("utf8").slice(-400)}` };
+    }
   }
   try {
-    await writeInside(dir, testPath, content);
+    const written = await writeInside(dir, testPath, opts.testContent);
+    const sentinel = join(dir, names.sentinel);
+    await writeFile(sentinel, randomBytes(16).toString("hex"), { flag: "wx" });
+    // Open up only what the harness itself just wrote. Re-walking the tree
+    // would chmod files the setup step made as the sandbox uid, which the
+    // coordinator does not own (EPERM) and the sandbox can already use.
+    if (opts.shareCheckout === true) for (const w of [...written, sentinel]) await openUp(w, false);
   } catch (err) {
-    return { role, sha, dir, home, error: message(err) };
+    return { role, sha, dir, home, names, error: message(err) };
   }
-  return { role, sha, dir, home, error: null };
+  return { role, sha, dir, home, names, error: null };
 }
 
 type Outcome =
@@ -349,8 +471,10 @@ export function redact(text: string, secrets: readonly string[], truncated: bool
 // Writes the test file, creating missing directories, and refuses to follow a
 // symlink anywhere on the way: a commit can contain `test -> /etc`, and writing
 // through it would put the finding's file outside the checkout.
-async function writeInside(dir: string, relPath: string, content: string): Promise<void> {
+// Returns what it created or wrote: new directories, then the file.
+async function writeInside(dir: string, relPath: string, content: string): Promise<string[]> {
   const parts = relPath.split("/");
+  const created: string[] = [];
   let current = dir;
   for (const [i, part] of parts.entries()) {
     current = join(current, part);
@@ -364,15 +488,17 @@ async function writeInside(dir: string, relPath: string, content: string): Promi
       if (st !== null && !st.isFile()) throw new Error(`testPath exists and is not a regular file: ${relPath}`);
     } else if (st === null) {
       await mkdir(current);
+      created.push(current);
     } else if (!st.isDirectory()) {
       throw new Error(`testPath component is not a directory: ${parts.slice(0, i + 1).join("/")}`);
     }
   }
   await writeFile(current, content, "utf8");
+  return [...created, current];
 }
 
 // Runs the command in its own process group so that a timeout kills everything
-// it started, not just the shell. Once the shell exits, stragglers left in the
+// it started, not just the shell (SIGTERM, then SIGKILL after KILL_GRACE_MS). Once the shell exits, stragglers left in the
 // group are killed too. A descendant that left the group (setsid) is out of
 // reach without a sandbox; the promise still settles DRAIN_MS after the shell
 // exits or is killed, whoever holds the pipes.
@@ -404,25 +530,28 @@ export function runCommand(
       return;
     }
     const pid = child.pid;
-    const killGroup = (): void => {
+    const signalGroup = (signal: NodeJS.Signals): void => {
       if (pid === undefined) return;
       try {
-        process.kill(-pid, "SIGKILL");
+        process.kill(-pid, signal);
       } catch {
         // ESRCH: the group is already gone.
       }
     };
+    const killGroup = (): void => signalGroup("SIGKILL");
 
     let timedOut = false;
     let spawnError: string | null = null;
     let exit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     let drain: NodeJS.Timeout | undefined;
+    let hardKill: NodeJS.Timeout | undefined;
     let settled = false;
     const settle = (): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(drain);
+      clearTimeout(hardKill);
       child.stdout.destroy();
       child.stderr.destroy();
       const output = Buffer.concat(chunks);
@@ -436,10 +565,19 @@ export function runCommand(
       if (drain === undefined) drain = setTimeout(settle, DRAIN_MS);
     };
 
+    // On timeout the group first gets SIGTERM, and SIGKILL KILL_GRACE_MS later
+    // (or as soon as the shell exits). The grace is for a sandbox whose
+    // command runs outside this group (a container under dockerd): SIGKILL
+    // would stop only its client, so it traps SIGTERM and stops the command
+    // itself (scripts/sandbox-docker kills its container), and nothing is
+    // left writing the checkout when the harness removes it.
     const timer = setTimeout(() => {
       timedOut = true;
-      killGroup();
-      armDrain();
+      signalGroup("SIGTERM");
+      hardKill = setTimeout(() => {
+        killGroup();
+        armDrain();
+      }, KILL_GRACE_MS);
     }, timeoutMs);
 
     child.stdout.on("data", collect);
@@ -450,8 +588,8 @@ export function runCommand(
       settle();
     });
     child.on("exit", (code, signal) => {
-      // An exit racing the timer after it fired is still a timeout: the
-      // SIGKILL it reports is ours.
+      // An exit after the timer fired is still a timeout: the signal it
+      // reports is ours.
       if (!timedOut) clearTimeout(timer);
       exit = { code, signal };
       killGroup();
@@ -499,30 +637,72 @@ function git(repoDir: string, args: string[], home: string, extra: Record<string
   });
 }
 
-// Never throws. A command can leave directories it made unreadable, so on
-// failure everything is made owner-accessible and removal is retried once.
+// Never throws. A sandboxed process that outlived its run (a container the
+// harness's kill did not reach) may still be writing a checkout while it is
+// removed, and can swap a directory for a symlink between a path-based
+// walk's lstat and its readdir. fs.rm, and `rm -rf` on macOS, then list and
+// unlink the link's target on the host, as the coordinator's uid: the ledger,
+// the patches. Node has no openat, so the walk runs in a child process of its
+// own (REMOVER) that moves with chdir: it enters each directory it lstat'ed,
+// checks that "." is that directory (dev and ino) before touching anything,
+// and from there uses only names relative to it, which a swap elsewhere
+// cannot redirect. A mismatch stops the removal, which is then reported:
+// leaking a directory is better than deleting outside it. Directories a
+// command made unreadable get their owner bits back (chmod adds u+rwx and
+// removes nothing, so even a chmod through a link swapped in at that instant
+// only adds owner bits to something the coordinator already owns).
 export async function removeTree(path: string): Promise<string | null> {
-  try {
-    await rm(path, { recursive: true, force: true });
-    return null;
-  } catch {
-    await makeAccessible(path);
-  }
-  try {
-    await rm(path, { recursive: true, force: true });
-    return null;
-  } catch (err) {
-    return `could not remove ${path}: ${message(err)}`;
-  }
+  const err = await new Promise<string | null>((resolve) => {
+    execFile(process.execPath, ["-e", REMOVER, path], { env: {} }, (e, _stdout, stderr) =>
+      resolve(e ? stderr.trim() || e.message.trim() : null),
+    );
+  });
+  if ((await lstat(path).catch(() => null)) === null) return null;
+  return `could not remove ${path}: ${err ?? "it is still there"}`;
 }
 
-async function makeAccessible(path: string): Promise<void> {
-  const st = await lstat(path).catch(() => null);
-  if (st === null || !st.isDirectory()) return;
-  await chmod(path, 0o700).catch(() => undefined);
-  const names = await readdir(path).catch(() => [] as string[]);
-  for (const name of names) await makeAccessible(join(path, name));
+const REMOVER = `"use strict";
+const fs = require("node:fs"), path = require("node:path");
+const target = path.resolve(process.argv[1]);
+const errors = [];
+class Moved extends Error {}
+const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const gone = (e) => e && e.code === "ENOENT";
+const owner = (name, st) => { if ((st.mode & 0o700) !== 0o700) fs.chmodSync(name, (st.mode | 0o700) & 0o7777); };
+function enter(name, st) {
+  try { process.chdir(name); } catch (e) {
+    if (e.code !== "EACCES") throw e;
+    owner(name, st);
+    process.chdir(name);
+  }
+  if (!same(fs.statSync("."), st)) throw new Moved("a directory was replaced during removal: " + name);
 }
+function leave(parent) {
+  process.chdir("..");
+  if (!same(fs.statSync("."), parent)) throw new Moved("a directory was moved during removal");
+}
+function remove(name, parent) {
+  const st = fs.lstatSync(name);
+  if (!st.isDirectory()) return fs.unlinkSync(name);
+  enter(name, st);
+  try {
+    owner(".", fs.statSync("."));
+    for (const child of fs.readdirSync(".")) {
+      try { remove(child, st); } catch (e) { if (e instanceof Moved) throw e; if (!gone(e)) errors.push(e.message); }
+    }
+  } finally {
+    leave(parent);
+  }
+  fs.rmdirSync(name);
+}
+try {
+  process.chdir(path.dirname(target));
+  remove(path.basename(target), fs.statSync("."));
+} catch (e) {
+  if (!gone(e)) errors.push(e.message);
+}
+if (errors.length > 0) { process.stderr.write(errors.slice(0, 5).join("; ")); process.exit(1); }
+`;
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

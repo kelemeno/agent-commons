@@ -286,7 +286,7 @@ function uniqueEscapes(state: CommonsState): { finding: FindingState; snapshotId
 // When each snapshot's content first reached main: the earliest promotion of
 // the snapshot itself or of a descendant, because a promotion ships the whole
 // ancestry. Snapshots that never reached main are absent.
-function firstShipped(state: CommonsState): Map<string, { seq: number; at: string }> {
+export function firstShipped(state: CommonsState): Map<string, { seq: number; at: string }> {
   const out = new Map<string, { seq: number; at: string }>();
   for (const snap of state.snapshots.values()) {
     if (!snap.promoted) continue;

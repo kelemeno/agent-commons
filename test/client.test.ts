@@ -40,6 +40,7 @@ import {
   stripInvisible,
 } from "../scripts/openrouter-review";
 import type { EntryBody, LedgerEntry, ReviewVerdict } from "../src/types";
+import { assignmentBody } from "../src/selection";
 
 // ---------------------------------------------------------------------------
 // A fake coordinator: in-memory ledger, real ledger validation (applyEntry),
@@ -86,7 +87,7 @@ class FakeCoordinator {
     const g = genesisEntry(
       {
         kind: "genesis",
-        project: "anthill",
+        project: "demo",
         admins: [this.admin.publicKey],
         coordinator: this.coord.publicKey,
         rules: defaultRules(),
@@ -137,6 +138,10 @@ class FakeCoordinator {
     if (req.method === "GET" && url.pathname === "/api/head") {
       this.headGets++;
       return send(200, this.head());
+    }
+    if (req.method === "GET" && url.pathname === "/api/entries") {
+      const since = Number(url.searchParams.get("since") ?? 0);
+      return send(200, { next: null, entries: this.entries.slice(since) });
     }
     if (req.method === "POST" && url.pathname === "/api/entries") {
       this.posts++;
@@ -216,7 +221,7 @@ class FakeCoordinator {
       this.bobAgent,
     );
     this.append(
-      { kind: "reviewAssignment", submissionId: "s-bob", beacon: "beacon", reviewers: [keyIdOf(this.aliceAgent.publicKey)] },
+      assignmentBody(this.state, "s-bob", [keyIdOf(this.aliceAgent.publicKey)], "e"),
       this.coord,
     );
   }
@@ -345,7 +350,7 @@ test("commitReview stores the salt 0600 under <dir>/<submissionId>.json; revealR
     assert.equal((await c.assignments()).length, 1);
     const { salt, commitment } = await c.commitReview("s-bob", verdict); // stake from the assignment
     assert.equal(salt, "11".repeat(32));
-    assert.equal(commitment, commitmentFor(verdict, salt));
+    assert.equal(commitment, commitmentFor(verdict, salt, keyIdOf(f.aliceAgent.publicKey), { submissionId: "s-bob" }));
     const file = path.join(dir, "s-bob.json");
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
@@ -373,6 +378,36 @@ test("commit: invalid verdicts are refused before anything is stored or posted",
     await assert.rejects(c.commitReview("s-bob", { ...verdict, defectProbability: 1.5 }, { stake: 5 }), /invalid verdict/);
     assert.equal(store.records.size, 0);
     assert.equal(f.posts, 0);
+  });
+});
+
+test("regression: commit refuses a verdict the ledger would never let it reveal (long summary, unknown or misdirected finding)", async () => {
+  await withFake(async (f) => {
+    f.seedReview();
+    f.append(
+      { kind: "finding", id: "f-1", target: { submissionId: "s-bob" }, severity: "low", testPath: "test/f.test.ts", testCommand: "npm test", stake: 5 },
+      f.aliceAgent,
+    );
+    f.append(
+      { kind: "submission", id: "s-bob2", taskId: null, baseCommit: "a".repeat(40), headCommit: "c".repeat(40), changedFiles: ["src/b.ts"], linesChanged: 1 },
+      f.bobAgent,
+    );
+    f.append(
+      { kind: "finding", id: "f-other", target: { submissionId: "s-bob2" }, severity: "low", testPath: "test/g.test.ts", testCommand: "npm test", stake: 5 },
+      f.aliceAgent,
+    );
+    const store = memorySaltStore();
+    const c = new CommonsClient({ baseUrl: f.baseUrl, agentKey: f.aliceAgent, clock: () => f.now(), saltStore: store });
+    f.posts = 0;
+    await assert.rejects(c.commitReview("s-bob", { ...verdict, summary: "x".repeat(4001) }, { stake: 5 }), /summary longer than 4000/);
+    await assert.rejects(c.commitReview("s-bob", { ...verdict, findingIds: ["f-not-filed-yet"] }, { stake: 5 }), /no finding f-not-filed-yet/);
+    await assert.rejects(c.commitReview("s-bob", { ...verdict, findingIds: ["f-other"] }, { stake: 5 }), /does not target/);
+    assert.equal(f.posts, 0);
+    assert.equal(store.records.size, 0);
+    // A verdict that cites a real finding on this submission commits and reveals.
+    await c.commitReview("s-bob", { ...verdict, findingIds: ["f-1"] }, { stake: 5 });
+    await c.revealReview("s-bob");
+    assert.deepEqual(f.state.submissions.get("s-bob")?.reviews[0]?.verdict?.findingIds, ["f-1"]);
   });
 });
 
@@ -425,7 +460,7 @@ test("reveal without a stored record fails clearly", async () => {
 
 test("fileSaltStore never overwrites a record and refuses unsafe ids", () => {
   const store = fileSaltStore(tmpDir());
-  const rec = { kind: "review" as const, subjectId: "s1", keyId: "k", verdict, salt: "x", commitment: commitmentFor(verdict, "x") };
+  const rec = { kind: "review" as const, subjectId: "s1", keyId: "k", verdict, salt: "x", commitment: commitmentFor(verdict, "x", "k", { submissionId: "s1" }) };
   store.save(rec);
   assert.throws(() => store.save({ ...rec, salt: "y" }), /already exists/);
   assert.equal(store.load("review", "s1")?.salt, "x");
@@ -443,6 +478,8 @@ test("attest commit/reveal round trip on a snapshot", async () => {
     f.append({ kind: "snapshot", id: "snap-1", commit: "d".repeat(40), previousSnapshotId: null, submissionIds: ["s-bob"] }, f.coord);
     const c = new CommonsClient({ baseUrl: f.baseUrl, agentKey: f.aliceAgent, clock: () => f.now(), saltStore: memorySaltStore() });
     await c.attestCommit("snap-1", verdict, f.state.rules.stake.review);
+    // Attestation reveals wait for the end of the snapshot's commit phase.
+    f.minute += f.state.rules.review.commitHours * 60;
     await c.attestReveal("snap-1");
     assert.deepEqual(f.state.snapshots.get("snap-1")?.attestations[0]?.verdict, verdict);
   });
@@ -649,13 +686,11 @@ test("commit: a 5xx keeps the salt record; a retry after an ambiguous landing re
 test("end to end against createCoordinatorServer", async (t) => {
   let serverMod: typeof import("../src/server");
   let ledgerMod: typeof import("../src/ledger");
-  let treeMod: typeof import("../src/tree");
   try {
     serverMod = await import("../src/server");
     ledgerMod = await import("../src/ledger");
-    treeMod = await import("../src/tree");
   } catch (e) {
-    t.skip(`server.ts or tree.ts does not load yet: ${String(e)}`);
+    t.skip(`server.ts does not load yet: ${String(e)}`);
     return;
   }
   const dir = tmpDir();
@@ -669,7 +704,7 @@ test("end to end against createCoordinatorServer", async (t) => {
   const clock = () => new Date(now).toISOString();
   const ledger = ledgerMod.Ledger.create(
     path.join(dir, "ledger.jsonl"),
-    { kind: "genesis", project: "anthill", admins: [admin.publicKey], coordinator: coord.publicKey, rules: defaultRules() },
+    { kind: "genesis", project: "demo", admins: [admin.publicKey], coordinator: coord.publicKey, rules: defaultRules() },
     clock(),
   );
   now += 1000;
@@ -680,7 +715,6 @@ test("end to end against createCoordinatorServer", async (t) => {
   const server = serverMod.createCoordinatorServer({
     store,
     coordinatorKey: coord,
-    tree: treeMod.treeFromParents({ alice: null, bob: "alice" }, { alice: 100, bob: 100 }),
     clock,
     patchesDir: path.join(dir, "patches"),
     policy: { submitCredits: () => 1, prSlots: () => 1, claimStake: () => 15 },
@@ -708,7 +742,7 @@ test("end to end against createCoordinatorServer", async (t) => {
     now += 1000;
     await new CommonsClient({ baseUrl, agentKey: bobOwner, clock, saltStore: memorySaltStore() }).registerAgent("bob", bobAgent.publicKey, "qwen", "openrouter-review");
     now += 1000;
-    await store.appendAsCoordinator({ kind: "reviewAssignment", submissionId: "s-1", beacon: "b", reviewers: [keyIdOf(bobAgent.publicKey)] });
+    await store.appendAsCoordinator((st) => assignmentBody(st, "s-1", [keyIdOf(bobAgent.publicKey)], "e"));
     const salts = memorySaltStore();
     const statuses: number[] = [];
     const counting: FetchLike = async (url, init) => {
@@ -736,6 +770,22 @@ test("end to end against createCoordinatorServer", async (t) => {
     now += 1000;
     const revealed = await bob.revealReview("s-1");
     assert.equal(revealed.seq, committed.seq + 1);
+    // Finding work: the task list on the API port, through the client and the CLI.
+    now += 1000;
+    await c.propose({ id: "p-1", title: "fix the vote count", evidence: [{ kind: "location", file: "src/a.ts", line: 1, note: "n" }] });
+    await store.appendAsCoordinator({ kind: "task", id: "t-1", proposalId: "p-1", ring: 1, acceptanceTestPaths: ["test/t1.test.ts"], sizeEstimate: 30, specAuthor: "alice" });
+    const open = await bob.tasks({ open: true });
+    assert.deepEqual(open.map((x) => [x.id, x.status, x.ring, x.claimStake]), [["t-1", "open", 1, 15]]);
+    assert.equal(open[0]?.untrusted.title, "fix the vote count");
+    assert.deepEqual((await bob.task("t-1")).acceptanceTestPaths, ["test/t1.test.ts"]);
+    const outs: string[] = [];
+    fs.writeFileSync(path.join(dir, "bob.json"), JSON.stringify(bobAgent));
+    const cliEnv = { COMMONS_URL: baseUrl, COMMONS_KEY_FILE: path.join(dir, "bob.json"), COMMONS_SALT_DIR: path.join(dir, "bob-salts") };
+    const cliIo = { out: (x: string) => void outs.push(x), err: () => {}, stdin: () => "" };
+    assert.equal(await agentMain(["tasks"], cliEnv, cliIo), 0);
+    assert.deepEqual((JSON.parse(outs.pop() ?? "[]") as { id: string }[]).map((x) => x.id), ["t-1"]);
+    assert.equal(await agentMain(["task", "t-1"], cliEnv, cliIo), 0);
+    assert.equal((JSON.parse(outs.pop() ?? "{}") as { status: string }).status, "open");
     // The file on disk replays.
     const replayedState = ledgerMod.Ledger.open(path.join(dir, "ledger.jsonl")).state();
     assert.equal(replayedState.submissions.get("s-1")?.linesChanged, 2);
@@ -941,6 +991,9 @@ test("openrouter-review CLI: usage errors exit 2 without a network call", async 
 
 test("commons-agent CLI: keygen writes 0600 and never prints the private key; review commit/reveal", async () => {
   await withFake(async (f) => {
+    // The CLI signs with the wall clock: start the fake's ledger a few minutes
+    // before it, so the commit lands inside the assignment's commit phase.
+    f.minute = Math.floor((Date.now() - T0) / 60_000) - 5;
     f.seedReview();
     const dir = tmpDir();
     const outs: string[] = [];
@@ -1015,6 +1068,26 @@ test("commons-agent CLI: submit derives the head, prints the id first; upload-pa
     // A reviewer reproduces the declared head without any key.
     assert.equal(await agentMain(["head-commit", id, "--base", a.base, "--patch", path.join(dir, "change.diff"), "--repo", a.dir], {}, io), 0);
     assert.equal((JSON.parse(outs.pop() ?? "{}") as { head?: string }).head, f.state.submissions.get(id)?.headCommit);
+  });
+});
+
+test("regression: commons-agent finding prints the id first, and a failed test upload is retried with upload-test, not refiled", async () => {
+  await withFake(async (f) => {
+    f.seedReview();
+    const dir = tmpDir();
+    fs.writeFileSync(path.join(dir, "alice.json"), JSON.stringify(f.aliceAgent));
+    fs.writeFileSync(path.join(dir, "t.test.js"), "process.exit(1)\n");
+    const errs: string[] = [];
+    const io = { out: () => {}, err: (s: string) => void errs.push(s), stdin: () => "" };
+    const env = { COMMONS_URL: f.baseUrl, COMMONS_KEY_FILE: path.join(dir, "alice.json"), COMMONS_SALT_DIR: path.join(dir, "salts") };
+    f.failUploads = 1;
+    const args = ["finding", "--target", "submission:s-bob", "--severity", "low", "--test-path", "test/t.test.js", "--command", "node test/t.test.js", "--stake", "5", "--test-file", path.join(dir, "t.test.js")];
+    assert.equal(await agentMain(args, env, io), 1);
+    const id = /finding id (\S+)/.exec(errs.join(""))?.[1] ?? "";
+    assert.ok(f.state.findings.has(id), "the finding landed");
+    assert.match(errs.join(""), new RegExp(`retry: commons-agent upload-test ${id} --test-file`));
+    assert.equal(await agentMain(["upload-test", id, "--test-file", path.join(dir, "t.test.js")], env, io), 0);
+    assert.equal(f.findingTests.get(id), "process.exit(1)\n");
   });
 });
 

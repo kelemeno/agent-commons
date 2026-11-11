@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import { canonical, generateKeyPair, keyIdOf, sha256hex, sign } from "../src/crypto";
 import {
   applyEntry,
@@ -10,6 +11,9 @@ import {
   entryHash,
   entryMessage,
   genesisEntry,
+  ID_RE,
+  isCanonicalPath,
+  LEDGER_LIMITS,
   Ledger,
   LedgerError,
   MAX_CLAIM_MS,
@@ -19,9 +23,14 @@ import {
   replay,
   signEntry,
   type Signer,
+  submissionDead,
+  withFileLock,
 } from "../src/ledger";
 import { defaultRules } from "../src/rules";
 import type { EntryBody, LedgerEntry, ReviewVerdict, Rules } from "../src/types";
+import { assignmentBeacon, type CommitSubject, commitmentFor } from "../src/review";
+import { assignmentBody } from "../src/selection";
+import { memberDigest } from "../src/members";
 
 // ---------------------------------------------------------------------------
 // Fixture: an in-memory ledger with a fake clock. Every append advances the
@@ -55,7 +64,7 @@ class World {
   }
 
   genesisBody(rules: Rules): GenesisBody {
-    return { kind: "genesis", project: "anthill", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules };
+    return { kind: "genesis", project: "demo", admins: [this.admin.publicKey], coordinator: this.coord.publicKey, rules };
   }
 
   now(): string {
@@ -137,12 +146,23 @@ class World {
     return this;
   }
 
-  // s1 passes a gate and merges
+  // s1 passes a gate, gets a reviewer (b1; the ledger merges nothing
+  // unassigned) and merges
   merged(): this {
     this.submitted();
     this.apply({ kind: "gateResult", submissionId: "s1", gate: "tsc", pass: true, details: "" }, this.coord);
+    this.assign("s1", ["b1"]);
     this.apply({ kind: "merge", submissionId: "s1", commit: "m1" }, this.coord);
     return this;
+  }
+
+  assign(sid: string, reviewers: string[]): void {
+    this.apply(assignmentBody(this.state, sid, reviewers.map((r) => this.id(r)), "e"), this.coord);
+  }
+
+  // Past the commit phase of everything assigned or snapshotted so far.
+  afterCommitPhase(): void {
+    this.minute += this.state.rules.review.commitHours * 60 + 1;
   }
 
   // snapshot r1 containing s1
@@ -181,14 +201,15 @@ function submissionBody(id: string, taskId: string | null, over: Record<string, 
     taskId,
     baseCommit: "base",
     headCommit: `head-${id}`,
-    changedFiles: ["anthill-backend/src/routes.ts"],
+    changedFiles: ["server/src/routes.ts"],
     linesChanged: 20,
     ...over,
   } as EntryBody;
 }
 
 const verdict = (p = 0.1, findingIds: string[] = []): ReviewVerdict => ({ defectProbability: p, summary: "ok", findingIds });
-const commitOf = (v: ReviewVerdict, salt: string) => sha256hex(canonical(v) + salt);
+// A commitment binds the reviewer and the subject (review.commitmentFor).
+const commitOf = (v: ReviewVerdict, salt: string, reviewer: string, subject: CommitSubject) => commitmentFor(v, salt, reviewer, subject);
 
 function findingBody(id: string, target: { submissionId: string } | { snapshotId: string }, stake = 5): EntryBody {
   return { kind: "finding", id, target, severity: "high", testPath: `test/${id}.test.ts`, testCommand: "npm test", stake };
@@ -210,7 +231,7 @@ test("genesis: admins and coordinator become known keys", () => {
   assert.equal(w.state.coordinatorKey, keyIdOf(w.coord.publicKey));
   assert.deepEqual(w.state.adminKeys, [keyIdOf(w.admin.publicKey)]);
   assert.equal(w.state.publicKeys.get(keyIdOf(w.admin.publicKey)), w.admin.publicKey);
-  assert.equal(w.state.project, "anthill");
+  assert.equal(w.state.project, "demo");
 });
 
 test("genesis: emptyState also accepts a bare body", () => {
@@ -344,13 +365,16 @@ test("shape: unknown kinds, extra fields and wrong types are malformed", () => {
 
 test("ownerKey: registers owner with inviter", () => {
   const w = new World().people();
-  assert.deepEqual(w.owner("bob"), { id: "bob", keyId: w.id("bob"), inviter: "alice", reputationDelta: 0, lockedStake: 0 });
+  const seq = w.entries.findIndex((e) => e.body.kind === "ownerKey" && e.body.owner === "bob");
+  assert.deepEqual(w.owner("bob"), { id: "bob", keyId: w.id("bob"), inviter: "alice", reputationDelta: 0, lockedStake: 0, registeredSeq: seq });
   assert.equal(w.state.ownerByKey.get(w.id("bob")), "bob");
 });
 
 test("ownerKey: owner ids and keys are unique; inviter must exist; key must be valid", () => {
   const w = new World().people();
   w.reject("duplicate-id", { kind: "ownerKey", owner: "alice", publicKey: w.key("x").publicKey, inviter: null }, w.admin);
+  // One member, two spellings: one owner (selection groups them by tree identity too).
+  w.reject("duplicate-id", { kind: "ownerKey", owner: "Alice", publicKey: w.key("x").publicKey, inviter: null }, w.admin);
   w.reject("duplicate-key", { kind: "ownerKey", owner: "eve", publicKey: w.key("alice").publicKey, inviter: null }, w.admin);
   w.reject("duplicate-key", { kind: "ownerKey", owner: "eve", publicKey: w.key("a1").publicKey, inviter: null }, w.admin);
   w.reject("duplicate-key", { kind: "ownerKey", owner: "eve", publicKey: w.coord.publicKey, inviter: null }, w.admin);
@@ -431,8 +455,23 @@ test("claim: another agent cannot take a live claim, but can after it expires", 
   // the holder may extend
   w.apply({ kind: "claim", taskId: "t1", until: iso(800), stake: 10 }, w.key("a1"));
   w.reject("claim-live", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 6 }, w.key("b1"), until);
-  w.apply({ kind: "claim", taskId: "t1", until: iso(10_000), stake: 6 }, w.key("b1"), iso(800));
+  // A claim is live through its `until` instant (as the submission rule has it), and lapsed after.
+  w.reject("claim-live", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 6 }, w.key("b1"), iso(800));
+  w.apply({ kind: "claim", taskId: "t1", until: iso(10_000), stake: 6 }, w.key("b1"), iso(801));
   assert.equal(w.state.claims.get("t1")?.agent, w.id("b1"));
+});
+
+test("regression: a task that merged takes no further submission or merge (one task, one reward)", () => {
+  const w = new World().submitted(); // a1 holds t1 and submitted s1
+  w.apply(submissionBody("s2", "t1"), w.key("a1")); // a second try while the claim is live
+  for (const sid of ["s1", "s2"]) {
+    w.apply({ kind: "gateResult", submissionId: sid, gate: "tsc", pass: true, details: "" }, w.coord);
+    w.assign(sid, ["b1"]);
+  }
+  w.apply({ kind: "merge", submissionId: "s1", commit: "m1" }, w.coord);
+  w.reject("task-done", { kind: "merge", submissionId: "s2", commit: "m2" }, w.coord);
+  w.reject("task-done", submissionBody("s3", "t1"), w.key("a1"));
+  assert.equal(submissionDead(w.state, "s2"), true, "s2 can never merge: its stakes and PR slot are released");
 });
 
 test("claim: a merged task cannot be claimed again", () => {
@@ -470,6 +509,18 @@ test("submission: unique id, task exists, live claim by this agent", () => {
   w.reject("claim-missing", submissionBody("s3", "t3"), w.key("a1"), iso(w.minute + 3)); // expired
 });
 
+test("regression: submission and finding ids are unique ignoring case and submission ids are git ref names", () => {
+  // Ids name upload files (and refs/commons/<id>): on a case-insensitive
+  // filesystem a twin would take over the victim's patch or finding test.
+  const w = new World().submitted();
+  const doc = { changedFiles: ["README.md"] };
+  w.reject("duplicate-id", submissionBody("S1", null, doc), w.key("b1"));
+  for (const bad of ["s1.lock", "s2.", "a..b", "a:b"]) w.reject("invalid-value", submissionBody(bad, null, doc), w.key("b1"));
+  w.apply(submissionBody("s2.x", null, doc), w.key("b1"));
+  w.apply(findingBody("f-a", { submissionId: "s1" }), w.key("b1"));
+  w.reject("duplicate-id", findingBody("F-A", { submissionId: "s1" }), w.key("c1"));
+});
+
 test("submission: lines, files and the planted flag", () => {
   const w = new World().task();
   w.reject("invalid-value", submissionBody("s1", "t1", { linesChanged: -1 }), w.key("a1"));
@@ -493,8 +544,8 @@ test("gateResult: submission must exist; results accumulate", () => {
 
 test("reviewAssignment: once, before merge, distinct active agents of distinct non-author owners", () => {
   const w = new World().submitted();
-  const assign = (reviewers: string[]): EntryBody => ({ kind: "reviewAssignment", submissionId: "s1", beacon: "b", reviewers });
-  w.reject("unknown-ref", { kind: "reviewAssignment", submissionId: "nope", beacon: "b", reviewers: [w.id("b1")] }, w.coord);
+  const assign = (reviewers: string[]): EntryBody => assignmentBody(w.state, "s1", reviewers, "e");
+  w.reject("unknown-ref", { ...assignmentBody(w.state, "s1", [w.id("b1")], "e"), submissionId: "nope" }, w.coord);
   w.reject("invalid-reviewers", assign([]), w.coord);
   w.reject("invalid-reviewers", assign([w.id("b1"), w.id("a2")]), w.coord); // author's owner
   w.reject("invalid-reviewers", assign([w.id("b1"), w.id("b1")]), w.coord); // same agent twice
@@ -507,12 +558,12 @@ test("reviewAssignment: once, before merge, distinct active agents of distinct n
   assert.deepEqual(w.state.submissions.get("s1")?.assignment?.reviewers, [w.id("b1"), w.id("c1")]);
   w.reject("assigned", assign([w.id("c1")]), w.coord);
   const m = new World().merged();
-  m.reject("merged", { kind: "reviewAssignment", submissionId: "s1", beacon: "b", reviewers: [m.id("b1")] }, m.coord);
+  m.reject("merged", assignmentBody(m.state, "s1", [m.id("b1")], "e"), m.coord);
 });
 
 test("reviewCommit: before merge, not by the author's owner, once per agent, enough stake", () => {
   const w = new World().submitted();
-  const c = (stake = 5): EntryBody => ({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s"), stake });
+  const c = (stake = 5): EntryBody => ({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s", w.id("b1"), { submissionId: "s1" }), stake });
   w.reject("unknown-ref", { kind: "reviewCommit", submissionId: "nope", commitment: "a".repeat(64), stake: 5 }, w.key("b1"));
   w.reject("same-owner", c(), w.key("a2"));
   w.reject("stake", c(4), w.key("b1"));
@@ -524,8 +575,9 @@ test("reviewCommit: before merge, not by the author's owner, once per agent, eno
 
 test("reviewReveal: must match the signer's own earlier commit exactly once", () => {
   const w = new World().submitted();
+  w.assign("s1", ["b1"]);
   const v = verdict(0.3);
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(v, "salt-b1"), stake: 5 }, w.key("b1"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(v, "salt-b1", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
   w.reject("no-commit", { kind: "reviewReveal", submissionId: "s1", verdict: v, salt: "salt-b1" }, w.key("c1"));
   w.reject("commitment-mismatch", { kind: "reviewReveal", submissionId: "s1", verdict: v, salt: "other" }, w.key("b1"));
   w.reject("commitment-mismatch", { kind: "reviewReveal", submissionId: "s1", verdict: verdict(0.9), salt: "salt-b1" }, w.key("b1"));
@@ -539,11 +591,12 @@ test("reviewReveal: must match the signer's own earlier commit exactly once", ()
 
 test("reviewReveal: verdict must be well-formed even when the commitment matches", () => {
   const w = new World().submitted();
+  w.assign("s1", ["b1"]);
   const bad = { defectProbability: 1.5, summary: "", findingIds: [] };
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(bad, "s"), stake: 5 }, w.key("b1"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(bad, "s", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
   w.reject("invalid-verdict", { kind: "reviewReveal", submissionId: "s1", verdict: bad, salt: "s" }, w.key("b1"));
   const extra = { ...verdict(), approve: true } as ReviewVerdict;
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(extra, "s"), stake: 5 }, w.key("c1"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(extra, "s", w.id("c1"), { submissionId: "s1" }), stake: 5 }, w.key("c1"));
   w.reject("invalid-verdict", { kind: "reviewReveal", submissionId: "s1", verdict: extra, salt: "s" }, w.key("c1"));
 });
 
@@ -552,14 +605,15 @@ test("reviewReveal: cited findings must exist and target this submission", () =>
   w.apply(submissionBody("s9", null), w.key("c1"));
   w.apply(findingBody("f-other", { submissionId: "s9" }), w.key("b1"));
   w.apply(findingBody("f1", { submissionId: "s1" }), w.key("b1"));
+  w.assign("s1", ["b1"]);
   const ghost = verdict(0.8, ["ghost"]);
   const elsewhere = verdict(0.8, ["f-other"]);
   const good = verdict(0.8, ["f1"]);
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(ghost, "x"), stake: 5 }, w.key("b1"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(ghost, "x", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
   w.reject("unknown-ref", { kind: "reviewReveal", submissionId: "s1", verdict: ghost, salt: "x" }, w.key("b1"));
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(elsewhere, "x"), stake: 5 }, w.key("c1"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(elsewhere, "x", w.id("c1"), { submissionId: "s1" }), stake: 5 }, w.key("c1"));
   w.reject("invalid-target", { kind: "reviewReveal", submissionId: "s1", verdict: elsewhere, salt: "x" }, w.key("c1"));
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(good, "x"), stake: 5 }, w.key("d1"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(good, "x", w.id("d1"), { submissionId: "s1" }), stake: 5 }, w.key("d1"));
   w.apply({ kind: "reviewReveal", submissionId: "s1", verdict: good, salt: "x" }, w.key("d1"));
 });
 
@@ -626,7 +680,12 @@ test("merge: needs at least one gate, all passing, no reproduced finding, once",
   v.apply({ kind: "findingResult", findingId: "f-false", reproduced: false, failsOnHead: false, passesOnParent: true, logDigest: "" }, v.coord);
   v.apply(findingBody("f1", { submissionId: "s1" }), v.key("b1"));
   v.apply({ kind: "findingResult", findingId: "f1", reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "" }, v.coord);
+  v.reject("not-assigned", merge, v.coord); // nothing merges unreviewed
+  v.assign("s1", ["d1"]);
   v.reject("reproduced-finding", merge, v.coord);
+  // An operator's dismissal (the test only pinned the intended change) clears it.
+  v.apply({ kind: "findingDecision", findingId: "f1", confirmed: false, reason: "tests the old text" }, v.admin);
+  v.apply(merge, v.coord);
 
   const m = new World().merged();
   assert.equal(m.state.submissions.get("s1")?.merged?.commit, "m1");
@@ -649,6 +708,7 @@ test("snapshot: unique id, existing previous, merged submissions not already shi
   w.reject("unknown-ref", snap("r2", ["nope"]), w.coord);
   w.reject("not-merged", snap("r2", ["s2"]), w.coord);
   w.apply({ kind: "gateResult", submissionId: "s2", gate: "tsc", pass: true, details: "" }, w.coord);
+  w.assign("s2", ["c1"]);
   w.apply({ kind: "merge", submissionId: "s2", commit: "m2" }, w.coord);
   w.reject("already-snapshotted", snap("r2", ["s1", "s2"]), w.coord);
   w.reject("invalid-value", snap("r2", ["s2", "s2"]), w.coord);
@@ -659,19 +719,24 @@ test("snapshot: unique id, existing previous, merged submissions not already shi
 test("attestCommit/attestReveal: any active non-author agent, once each, before promotion", () => {
   const w = new World().snapshotted();
   const v = verdict(0.05);
-  const commit = (stake = 5): EntryBody => ({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(v, "q"), stake });
-  w.reject("unknown-ref", { kind: "attestCommit", snapshotId: "nope", commitment: commitOf(v, "q"), stake: 5 }, w.key("b1"));
+  const commit = (stake = 5): EntryBody => ({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(v, "q", w.id("b1"), { snapshotId: "r1" }), stake });
+  w.reject("unknown-ref", { kind: "attestCommit", snapshotId: "nope", commitment: commitOf(v, "q", w.id("b1"), { snapshotId: "nope" }), stake: 5 }, w.key("b1"));
   w.reject("stake", commit(1), w.key("b1"));
   w.reject("unauthorised", commit(), w.key("bob"));
   w.reject("same-owner", commit(), w.key("a2")); // alice wrote s1, which r1 ships
   w.apply(commit(), w.key("b1"));
   w.reject("duplicate-commit", commit(), w.key("b1"));
-  w.reject("no-commit", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("d1"));
+  // Reveals wait for the end of the commit phase, so one early reveal cannot
+  // shut every other attester out.
+  w.reject("commit-phase", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("b1"));
 
   // cited findings must target the snapshot itself
   w.apply(findingBody("f-sub", { submissionId: "s1" }), w.key("c1"));
   const cites = verdict(0.5, ["f-sub"]);
-  w.apply({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(cites, "q"), stake: 5 }, w.key("c1"));
+  w.apply({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(cites, "q", w.id("c1"), { snapshotId: "r1" }), stake: 5 }, w.key("c1"));
+  w.afterCommitPhase();
+  w.reject("commit-closed", { kind: "attestCommit", snapshotId: "r1", commitment: commitOf(v, "q", w.id("d1"), { snapshotId: "r1" }), stake: 5 }, w.key("d1"));
+  w.reject("no-commit", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("d1"));
   w.reject("invalid-target", { kind: "attestReveal", snapshotId: "r1", verdict: cites, salt: "q" }, w.key("c1"));
 
   w.reject("commitment-mismatch", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "z" }, w.key("b1"));
@@ -719,8 +784,8 @@ test("plants: commitment before the submission, matching reveal, once", () => {
   w.reject("unknown-ref", reveal("nope", salt), w.admin);
   w.reject("plant-mismatch", reveal("s1", "wrong"), w.admin);
   w.reject("unauthorised", reveal("s1", salt), w.coord);
-  w.apply(reveal("s1", salt), w.admin);
-  assert.deepEqual(w.state.submissions.get("s1")?.planted, { severity: "medium", description: "off by one" });
+  const revealed = w.apply(reveal("s1", salt), w.admin);
+  assert.deepEqual(w.state.submissions.get("s1")?.planted, { severity: "medium", description: "off by one", seq: revealed.seq });
   w.reject("already-planted", reveal("s1", salt), w.admin);
 });
 
@@ -744,6 +809,8 @@ test("escape: reproduced finding against a promoted snapshot, once per finding",
   w.reject("unknown-ref", { kind: "escape", findingId: "nope", snapshotId: "r1" }, w.coord);
   w.reject("not-reproduced", esc, w.coord);
   w.apply({ kind: "findingResult", findingId: "f1", reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "" }, w.coord);
+  w.reject("not-decidable", esc, w.coord); // a reproduction alone is not a known defect
+  w.apply({ kind: "findingDecision", findingId: "f1", confirmed: true, reason: "real" }, w.admin);
   w.reject("not-promoted", esc, w.coord);
   w.reject("unknown-ref", { kind: "escape", findingId: "f1", snapshotId: "nope" }, w.coord);
   w.apply({ kind: "promotion", snapshotId: "r1", commit: "m1" }, w.coord);
@@ -782,7 +849,7 @@ test("rulesChange: new stakes apply to later entries", () => {
   const w = new World().submitted();
   const rules = { ...defaultRules(), version: 2, stake: { ...defaultRules().stake, review: 50 } };
   w.apply({ kind: "rulesChange", rules, pollId: "poll" }, w.admin);
-  w.reject("stake", { kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s"), stake: 5 }, w.key("b1"));
+  w.reject("stake", { kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
 });
 
 // ---------------------------------------------------------------------------
@@ -805,17 +872,18 @@ test("lockedStake: claims until expiry or merge", () => {
 test("lockedStake: review commits until merge, findings until result, attestations until promotion", () => {
   const w = new World().submitted();
   const aliceClaim = 10;
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s"), stake: 7 }, w.key("b1"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s", w.id("b1"), { submissionId: "s1" }), stake: 7 }, w.key("b1"));
   w.apply(findingBody("f1", { submissionId: "s1" }, 6), w.key("b1"));
   assert.equal(w.owner("bob").lockedStake, 13);
   w.apply({ kind: "findingResult", findingId: "f1", reproduced: false, failsOnHead: false, passesOnParent: true, logDigest: "" }, w.coord);
   assert.equal(w.owner("bob").lockedStake, 7);
   w.apply({ kind: "gateResult", submissionId: "s1", gate: "tsc", pass: true, details: "" }, w.coord);
+  w.assign("s1", ["b1"]);
   w.apply({ kind: "merge", submissionId: "s1", commit: "m1" }, w.coord);
   assert.equal(w.owner("bob").lockedStake, 0);
   assert.equal(w.owner("alice").lockedStake, 0, `claim of ${aliceClaim} released by merge`);
   w.apply({ kind: "snapshot", id: "r1", commit: "m1", previousSnapshotId: null, submissionIds: ["s1"] }, w.coord);
-  w.apply({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(), "s"), stake: 9 }, w.key("c1"));
+  w.apply({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(), "s", w.id("c1"), { snapshotId: "r1" }), stake: 9 }, w.key("c1"));
   assert.equal(w.owner("carol").lockedStake, 9);
   w.apply({ kind: "promotion", snapshotId: "r1", commit: "m1" }, w.coord);
   assert.equal(w.owner("carol").lockedStake, 0);
@@ -849,12 +917,12 @@ function lifecycle(ledger: Ledger, w: World): void {
   add(submissionBody("s1", "t1"), w.key("a1"));
   add(submissionBody("s-plant", null), w.key("d1")); // the custodian's plant, submitted through an agent
   add({ kind: "gateResult", submissionId: "s1", gate: "tsc", pass: true, details: "ok" }, w.coord);
-  add({ kind: "reviewAssignment", submissionId: "s1", beacon: "beacon", reviewers: [w.id("b1"), w.id("c1")] }, w.coord);
+  add(assignmentBody(ledger.state(), "s1", [w.id("b1"), w.id("c1")], "e"), w.coord);
   const vb = verdict(0.1);
   const vc = verdict(0.2, ["f1"]);
-  add({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(vb, "sb"), stake: 5 }, w.key("b1"));
+  add({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(vb, "sb", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
   add(findingBody("f1", { submissionId: "s1" }), w.key("c1"));
-  add({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(vc, "sc"), stake: 5 }, w.key("c1"));
+  add({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(vc, "sc", w.id("c1"), { submissionId: "s1" }), stake: 5 }, w.key("c1"));
   add({ kind: "reviewReveal", submissionId: "s1", verdict: vb, salt: "sb" }, w.key("b1"));
   add({ kind: "reviewReveal", submissionId: "s1", verdict: vc, salt: "sc" }, w.key("c1"));
   add({ kind: "findingResult", findingId: "f1", reproduced: false, failsOnHead: false, passesOnParent: true, logDigest: "d" }, w.coord);
@@ -864,13 +932,15 @@ function lifecycle(ledger: Ledger, w: World): void {
   add({ kind: "plantReveal", submissionId: "s-plant", salt: "pepper", description: "planted", severity: "high" }, w.admin);
   add({ kind: "snapshot", id: "r1", commit: "m1", previousSnapshotId: null, submissionIds: ["s1"] }, w.coord);
   const va = verdict(0.05);
-  add({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(va, "sa"), stake: 5 }, w.key("b1"));
+  add({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(va, "sa", w.id("b1"), { snapshotId: "r1" }), stake: 5 }, w.key("b1"));
+  w.afterCommitPhase();
   add({ kind: "attestReveal", snapshotId: "r1", verdict: va, salt: "sa" }, w.key("b1"));
   add({ kind: "signoff", snapshotId: "r1" }, w.key("carol"));
   add({ kind: "signoff", snapshotId: "r1" }, w.key("dave"));
   add({ kind: "promotion", snapshotId: "r1", commit: "m1" }, w.coord);
   add(findingBody("f2", { snapshotId: "r1" }), w.key("b1"));
   add({ kind: "findingResult", findingId: "f2", reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "d" }, w.coord);
+  add({ kind: "findingDecision", findingId: "f2", confirmed: true, reason: "a real defect on main" }, w.admin);
   add({ kind: "escape", findingId: "f2", snapshotId: "r1" }, w.coord);
   add({ kind: "honeytokenTriggered", agent: w.id("d1"), tokenId: "decoy-1" }, w.coord);
   add({ kind: "agentRevoked", agent: w.id("d1"), reason: "honeytoken" }, w.coord);
@@ -890,7 +960,8 @@ test("Ledger: full lifecycle survives a round trip through the file", () => {
   const s = ledger.state();
   assert.equal(s.submissions.get("s1")?.merged?.commit, "m1");
   assert.equal(s.submissions.get("s1")?.reviews.filter((r) => r.verdict).length, 2);
-  assert.deepEqual(s.submissions.get("s-plant")?.planted, { severity: "high", description: "planted" });
+  const planted = s.submissions.get("s-plant")?.planted;
+  assert.deepEqual([planted?.severity, planted?.description, typeof planted?.seq], ["high", "planted", "number"]);
   assert.ok(s.snapshots.get("r1")?.promoted);
   assert.deepEqual(s.snapshots.get("r1")?.signoffs, ["carol", "dave"]);
   assert.equal(s.escapes.length, 1);
@@ -958,6 +1029,41 @@ test("Ledger: a second writer makes the first one stale instead of forking the f
     isCode("stale"),
   );
   assert.equal(Ledger.open(file).entries().length, 2);
+});
+
+test("Ledger: two processes appending at once never fork the file (cross-process lock)", async () => {
+  const { file, w } = freshLedger();
+  const keyFile = path.join(path.dirname(file), "admin.json");
+  fs.writeFileSync(keyFile, JSON.stringify(w.admin));
+  const writer = path.join(__dirname, "ledger-writer.ts");
+  const run = (tag: string) =>
+    new Promise<number>((resolve) => {
+      const child = spawn(process.execPath, ["--import", "tsx", writer, file, keyFile, tag, "150"], { stdio: ["ignore", "ignore", "inherit"] });
+      child.on("exit", (code) => resolve(code ?? 1));
+    });
+  assert.deepEqual(await Promise.all([run("a"), run("b")]), [0, 0]);
+  const reopened = Ledger.open(file); // replays: one seq per line, one chain
+  assert.equal(reopened.entries().length, 301);
+  assert.equal(fs.existsSync(`${file}.lock`), false, "the lock is released");
+});
+
+test("Ledger: a lock left by a crashed process is broken; a live holder makes writers wait", () => {
+  const { file, ledger, w } = freshLedger();
+  fs.writeFileSync(`${file}.lock`, "999999999"); // no such pid
+  ledger.append({ kind: "plantCommit", commitment: sha256hex("x") }, w.admin, iso(1));
+  assert.equal(Ledger.open(file).entries().length, 2);
+  fs.writeFileSync(`${file}.lock`, String(process.ppid)); // a running process
+  assert.throws(() => withFileLock(file, () => 0, 3), isCode("locked"), "a lock held by a running pid is never broken");
+  fs.rmSync(`${file}.lock`);
+  // A reader that cannot create the lock (a read-only directory) still reads.
+  if (process.getuid?.() !== 0) {
+    fs.chmodSync(path.dirname(file), 0o555);
+    try {
+      assert.equal(Ledger.open(file).entries().length, 2);
+    } finally {
+      fs.chmodSync(path.dirname(file), 0o755);
+    }
+  }
 });
 
 function tamper(edit: (lines: string[]) => string[]): string {
@@ -1061,17 +1167,17 @@ const plantReveal = (submissionId: string, salt: string): EntryBody => ({
   description: "",
   severity: "high",
 });
+const confirm = (findingId: string, confirmed = true): EntryBody => ({ kind: "findingDecision", findingId, confirmed, reason: "judged" });
 
 test("regression: one plant commitment cannot label two submissions via ':' in ids or salts", () => {
   const w = new World().people();
   w.apply({ kind: "plantCommit", commitment: sha256hex("a:b:c") }, w.admin);
   w.apply(submissionBody("a", null), w.key("d1"));
-  w.apply(submissionBody("a:b", null), w.key("d1"));
-  // "a" + ":" + "b:c" hashes to the same preimage, but a salt with ':' is refused
+  // Submission ids cannot hold ':' (they name git refs), so "a:b" never exists...
+  w.reject("invalid-value", submissionBody("a:b", null), w.key("d1"));
+  // ...and "a" + ":" + "b:c" hashes to the same preimage, but a salt with ':' is refused.
   w.reject("invalid-value", plantReveal("a", "b:c"), w.admin);
-  w.apply(plantReveal("a:b", "c"), w.admin);
   assert.equal(w.state.submissions.get("a")?.planted, undefined);
-  w.reject("already-planted", plantReveal("a:b", "c"), w.admin);
 });
 
 test("regression: Object.prototype names are unknown fields at every level", () => {
@@ -1092,7 +1198,8 @@ test("regression: Object.prototype names are unknown fields at every level", () 
   w.reject("invalid-evidence", { kind: "proposal", id: "p9", title: "x", evidence: [ev] } as unknown as EntryBody, w.key("b1"));
   // verdict
   const v = { ...verdict(), constructor: "x" } as unknown as ReviewVerdict;
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(v, "s"), stake: 5 }, w.key("b1"));
+  w.assign("s1", ["b1"]);
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(v, "s", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
   w.reject("invalid-verdict", { kind: "reviewReveal", submissionId: "s1", verdict: v, salt: "s" }, w.key("b1"));
 });
 
@@ -1146,14 +1253,14 @@ test("regression: claims are capped in length, staked at the task's price, and d
 
 test("regression: a ring 0 change cannot skip the claim by omitting the task", () => {
   const w = new World().people();
-  w.reject("task-required", submissionBody("s1", null, { changedFiles: ["README.md", "anthill-backend/src/auth.ts"] }), w.key("a1"));
+  w.reject("task-required", submissionBody("s1", null, { changedFiles: ["README.md", "scripts/deploy.sh"] }), w.key("a1"));
   w.reject("task-required", submissionBody("s1", null, { changedFiles: [".github/workflows/ci.yml"] }), w.key("a1"));
   w.apply(submissionBody("s1", null, { changedFiles: ["README.md"] }), w.key("a1"));
 });
 
 test("regression: changed files, acceptance tests and finding tests must be canonical repo paths", () => {
   const w = new World().task();
-  const bad = ["./anthill-backend/src/auth.ts", "/etc/passwd", "anthill-backend//src/auth.ts", "anthill-backend/src/../src/auth.ts", "a/./b", "a\\b", "a\0b", "a/", ""];
+  const bad = ["./server/src/auth.ts", "/etc/passwd", "server//src/auth.ts", "server/src/../src/auth.ts", "a/./b", "a\\b", "a\0b", "a/", ""];
   for (const f of bad) {
     w.reject("invalid-value", submissionBody("s1", "t1", { changedFiles: [f] }), w.key("a1"));
     w.reject("invalid-value", taskBody("t9", { acceptanceTestPaths: [f] }), w.coord);
@@ -1164,12 +1271,19 @@ test("regression: changed files, acceptance tests and finding tests must be cano
 });
 
 test("regression: review commits close once the outcome is public", () => {
-  const commit = (salt: string): EntryBody => ({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(1), salt), stake: 5 });
-  // after a reveal
+  const commit = (salt: string): EntryBody => ({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(1), salt, w.id(salt), { submissionId: "s1" }), stake: 5 });
+  // after a reveal (which waits until every assigned reviewer committed)
   const w = new World().submitted();
+  w.assign("s1", ["b1"]);
   w.apply(commit("b1"), w.key("b1"));
   w.apply({ kind: "reviewReveal", submissionId: "s1", verdict: verdict(1), salt: "b1" }, w.key("b1"));
   w.reject("commit-closed", commit("c1"), w.key("c1"));
+
+  // after the commit phase, even with nothing revealed
+  const t = new World().submitted();
+  t.assign("s1", ["b1"]);
+  t.afterCommitPhase();
+  t.reject("commit-closed", commit("c1"), t.key("c1"));
 
   // after the plant is revealed
   const p = new World().people();
@@ -1189,9 +1303,10 @@ test("regression: review commits close once the outcome is public", () => {
 });
 
 test("regression: attestation commits close once the outcome is public", () => {
-  const attest = (agent: string): EntryBody => ({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(1), agent), stake: 5 });
+  const attest = (agent: string): EntryBody => ({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(1), agent, w.id(agent), { snapshotId: "r1" }), stake: 5 });
   const w = new World().snapshotted();
   w.apply(attest("b1"), w.key("b1"));
+  w.afterCommitPhase(); // reveals wait for the end of the commit phase, which also closes commits
   w.apply({ kind: "attestReveal", snapshotId: "r1", verdict: verdict(1), salt: "b1" }, w.key("b1"));
   w.reject("commit-closed", attest("c1"), w.key("c1"));
 
@@ -1204,45 +1319,49 @@ test("regression: attestation commits close once the outcome is public", () => {
 test("regression: one owner fills at most one review or attestation seat", () => {
   const w = new World().submitted();
   w.apply({ kind: "agentRegistered", owner: "bob", publicKey: w.key("b2").publicKey, modelFamily: "deepseek", harness: "cli" }, w.key("bob"));
-  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "x"), stake: 5 }, w.key("b1"));
-  w.reject("duplicate-commit", { kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "y"), stake: 5 }, w.key("b2"));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "x", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
+  w.reject("duplicate-commit", { kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "y", w.id("b2"), { submissionId: "s1" }), stake: 5 }, w.key("b2"));
   assert.equal(w.owner("bob").lockedStake, 5);
 
   w.apply(passGate("s1"), w.coord);
+  w.assign("s1", ["c1"]);
   w.apply({ kind: "merge", submissionId: "s1", commit: "m1" }, w.coord);
   w.apply({ kind: "snapshot", id: "r1", commit: "m1", previousSnapshotId: null, submissionIds: ["s1"] }, w.coord);
-  w.apply({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(), "x"), stake: 5 }, w.key("b2"));
-  w.reject("duplicate-commit", { kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(), "y"), stake: 5 }, w.key("b1"));
+  w.apply({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(), "x", w.id("b2"), { snapshotId: "r1" }), stake: 5 }, w.key("b2"));
+  w.reject("duplicate-commit", { kind: "attestCommit", snapshotId: "r1", commitment: commitOf(verdict(), "y", w.id("b1"), { snapshotId: "r1" }), stake: 5 }, w.key("b1"));
 });
 
-test("regression: authors' owners cannot attest, sign off or file findings on a snapshot of their work or its unpromoted ancestry", () => {
+test("regression: authors' owners cannot attest or file findings on a snapshot of their work or its unpromoted ancestry", () => {
   const w = new World().people();
   const ship = (sid: string, agent: string) => {
     w.apply(submissionBody(sid, null), w.key(agent));
     w.apply(passGate(sid), w.coord);
+    w.assign(sid, ["d1"]);
     w.apply({ kind: "merge", submissionId: sid, commit: `m-${sid}` }, w.coord);
   };
   ship("s1", "c1"); // carol, a kernel signer, wrote s1
   w.apply({ kind: "snapshot", id: "r1", commit: "m1", previousSnapshotId: null, submissionIds: ["s1"] }, w.coord);
   ship("s2", "b1");
   w.apply({ kind: "snapshot", id: "r2", commit: "m2", previousSnapshotId: "r1", submissionIds: ["s2"] }, w.coord);
-  const attest = (sid: string): EntryBody => ({ kind: "attestCommit", snapshotId: sid, commitment: commitOf(verdict(), "q"), stake: 5 });
+  const attest = (sid: string): EntryBody => ({ kind: "attestCommit", snapshotId: sid, commitment: commitOf(verdict(), "q", w.id("c1"), { snapshotId: sid }), stake: 5 });
   for (const snap of ["r1", "r2"]) {
-    w.reject("same-owner", { kind: "signoff", snapshotId: snap }, w.key("carol"));
     w.reject("same-owner", attest(snap), w.key("c1"));
     w.reject("same-owner", findingBody(`f-${snap}`, { snapshotId: snap }), w.key("c1"));
   }
   w.reject("same-owner", attest("r2"), w.key("b1"));
+  // Sign-offs exclude only authors of covered kernel changes; carol's s1 is
+  // ring 1, so it does not stop her (see the kernel sign-off test below).
+  w.apply({ kind: "signoff", snapshotId: "r1" }, w.key("carol"));
   w.apply({ kind: "signoff", snapshotId: "r1" }, w.key("dave"));
   // once r1 is promoted, r2 no longer covers carol's work
   w.apply({ kind: "promotion", snapshotId: "r1", commit: "m1" }, w.coord);
-  w.apply({ kind: "signoff", snapshotId: "r2" }, w.key("carol"));
   w.apply(attest("r2"), w.key("c1"));
 });
 
 test("regression: merge waits for every finding's result and refuses a revealed plant", () => {
   const w = new World().submitted();
   w.apply(passGate("s1"), w.coord);
+  w.assign("s1", ["c1"]);
   w.apply(findingBody("f1", { submissionId: "s1" }), w.key("b1"));
   w.reject("finding-pending", { kind: "merge", submissionId: "s1", commit: "m1" }, w.coord);
   w.apply(result("f1", false), w.coord);
@@ -1252,6 +1371,7 @@ test("regression: merge waits for every finding's result and refuses a revealed 
   p.apply({ kind: "plantCommit", commitment: sha256hex("s1:salt") }, p.admin);
   p.apply(submissionBody("s1", null), p.key("d1"));
   p.apply(passGate("s1"), p.coord);
+  p.assign("s1", ["c1"]);
   p.apply(plantReveal("s1", "salt"), p.admin);
   p.reject("planted", { kind: "merge", submissionId: "s1", commit: "m1" }, p.coord);
 });
@@ -1261,19 +1381,23 @@ test("regression: an escape must be a finding on something the snapshot shipped"
   w.apply(submissionBody("s-other", null), w.key("c1")); // never merged, never shipped
   w.apply(findingBody("f-other", { submissionId: "s-other" }), w.key("b1"));
   w.apply(result("f-other", true), w.coord);
+  w.apply(confirm("f-other"), w.admin);
   w.apply(findingBody("f-sub", { submissionId: "s1" }), w.key("b1"));
   w.apply(result("f-sub", true), w.coord);
+  w.apply(confirm("f-sub"), w.admin);
   w.apply({ kind: "promotion", snapshotId: "r1", commit: "m1" }, w.coord);
   w.reject("invalid-target", { kind: "escape", findingId: "f-other", snapshotId: "r1" }, w.coord);
   w.apply({ kind: "escape", findingId: "f-sub", snapshotId: "r1" }, w.coord);
   // a later snapshot ships its ancestors too
   w.apply(submissionBody("s2", null), w.key("c1"));
   w.apply(passGate("s2"), w.coord);
+  w.assign("s2", ["d1"]);
   w.apply({ kind: "merge", submissionId: "s2", commit: "m2" }, w.coord);
   w.apply({ kind: "snapshot", id: "r2", commit: "m2", previousSnapshotId: "r1", submissionIds: ["s2"] }, w.coord);
   w.apply({ kind: "promotion", snapshotId: "r2", commit: "m2" }, w.coord);
   w.apply(findingBody("f-r1", { snapshotId: "r1" }), w.key("d1"));
   w.apply(result("f-r1", true), w.coord);
+  w.apply(confirm("f-r1"), w.admin);
   w.apply({ kind: "escape", findingId: "f-r1", snapshotId: "r2" }, w.coord);
 });
 
@@ -1318,4 +1442,423 @@ test("regression: appendSigned bounds a foreign entry's time by the writer's clo
   // the coordinator's next entry at real time still fits
   ledger.append({ kind: "ownerKey", owner: "bob", publicKey: w.key("bob").publicKey, inviter: null }, w.admin, iso(64));
   assert.equal(Ledger.open(file).entries().length, 4);
+});
+
+// ---------------------------------------------------------------------------
+// Hardening: input limits, verifiable assignment, model families, harness errors
+// ---------------------------------------------------------------------------
+
+test("limits: ids are bounded and spelled [A-Za-z0-9][A-Za-z0-9._:-]*", () => {
+  const w = new World().people();
+  const proposal = (id: string): EntryBody => ({ kind: "proposal", id, title: "t", evidence: [EVIDENCE] });
+  const longest = `p${"x".repeat(LEDGER_LIMITS.id - 1)}`;
+  w.apply(proposal(longest), w.key("a1"));
+  w.reject("malformed", proposal(`${longest}x`), w.key("a1"));
+  for (const bad of ["", ".", "..", "...", ".hidden", "a/b", "a b", "a\nb", "-x", "é"]) {
+    w.reject("malformed", proposal(bad), w.key("a1"));
+  }
+  for (const good of ["a", "s-1", "v1.2", "snap:3", "A_b"]) w.apply(proposal(good), w.key("a1"));
+  assert.ok(ID_RE.test("0xAbC") && !ID_RE.test(".."));
+  // References are ids too: an over-long one is malformed before any lookup.
+  w.reject("malformed", { kind: "gateResult", submissionId: "s".repeat(LEDGER_LIMITS.id + 1), gate: "g", pass: true, details: "" }, w.coord);
+  w.reject("malformed", { kind: "ownerKey", owner: "a/b", publicKey: w.key("eve").publicKey, inviter: null }, w.admin);
+});
+
+test("limits: free-text fields are bounded", () => {
+  const L = LEDGER_LIMITS;
+  const w = new World().submitted();
+  const text = (n: number) => "x".repeat(n);
+  const cases: [EntryBody, EntryBody, Signer][] = [
+    [
+      { kind: "proposal", id: "pt1", title: text(L.title), evidence: [EVIDENCE] },
+      { kind: "proposal", id: "pt2", title: text(L.title + 1), evidence: [EVIDENCE] },
+      w.key("a1"),
+    ],
+    [
+      { kind: "gateResult", submissionId: "s1", gate: "g", pass: true, details: text(L.text) },
+      { kind: "gateResult", submissionId: "s1", gate: "g", pass: true, details: text(L.text + 1) },
+      w.coord,
+    ],
+    [
+      { kind: "settlement", owner: "alice", delta: 0, reason: "bounty", ref: text(L.ref) },
+      { kind: "settlement", owner: "alice", delta: 0, reason: "bounty", ref: text(L.ref + 1) },
+      w.coord,
+    ],
+    [
+      { kind: "finding", id: "fl1", target: { submissionId: "s1" }, severity: "low", testPath: "t/a.sh", testCommand: text(L.command), stake: 5 },
+      { kind: "finding", id: "fl2", target: { submissionId: "s1" }, severity: "low", testPath: "t/a.sh", testCommand: text(L.command + 1), stake: 5 },
+      w.key("b1"),
+    ],
+    [
+      { kind: "agentRegistered", owner: "bob", publicKey: w.key("b8").publicKey, modelFamily: "gpt", harness: text(L.name) },
+      { kind: "agentRegistered", owner: "bob", publicKey: w.key("b9").publicKey, modelFamily: "gpt", harness: text(L.name + 1) },
+      w.key("bob"),
+    ],
+    [
+      { kind: "agentRevoked", agent: w.id("b8"), reason: text(L.text) },
+      { kind: "agentRevoked", agent: w.id("b1"), reason: text(L.text + 1) },
+      w.key("bob"),
+    ],
+  ];
+  for (const [ok, tooLong, signer] of cases) {
+    w.reject("malformed", tooLong, signer);
+    w.apply(ok, signer);
+  }
+  // Evidence fields have their own limits, refused as invalid evidence.
+  const withEvidence = (e: object): EntryBody => ({ kind: "proposal", id: "pe", title: "t", evidence: [e as never] });
+  w.reject("invalid-evidence", withEvidence({ kind: "failingTest", testId: text(L.ref + 1), command: "c" }), w.key("a1"));
+  w.reject("invalid-evidence", withEvidence({ kind: "location", file: "a.ts", line: 1, note: text(L.text + 1) }), w.key("a1"));
+  w.reject("invalid-evidence", withEvidence({ kind: "location", file: "../a.ts", line: 1, note: "" }), w.key("a1"));
+  w.reject("invalid-evidence", withEvidence({ kind: "diagnostic", tool: "tsc", message: "m", file: `${text(L.path)}.ts`, line: 1 }), w.key("a1"));
+});
+
+test("limits: paths are canonical POSIX and at most LEDGER_LIMITS.path long", () => {
+  const w = new World().submitted();
+  const longest = `src/${"p".repeat(LEDGER_LIMITS.path - 4)}`;
+  assert.equal(isCanonicalPath(longest), true);
+  assert.equal(isCanonicalPath(`${longest}x`), false);
+  for (const bad of ["/etc/passwd", "a/../b", "../a", "./a", "a//b", "a\\b"]) assert.equal(isCanonicalPath(bad), false, bad);
+  w.reject("invalid-value", submissionBody("sp1", null, { changedFiles: [`${longest}x`] }), w.key("b1"));
+  w.apply(submissionBody("sp1", null, { changedFiles: [longest] }), w.key("b1"));
+  w.reject("invalid-value", { ...findingBody("fp1", { submissionId: "s1" }), testPath: `${longest}x` } as EntryBody, w.key("b1"));
+});
+
+test("limits: lists are bounded", () => {
+  const L = LEDGER_LIMITS;
+  const w = new World().submitted();
+  const files = (n: number) => Array.from({ length: n }, (_, i) => `src/f${i}.ts`);
+  w.reject("malformed", submissionBody("sl1", null, { changedFiles: files(L.changedFiles + 1) }), w.key("b1"));
+  w.apply(submissionBody("sl1", null, { changedFiles: files(L.changedFiles) }), w.key("b1"));
+  const evidence = (n: number): EntryBody => ({ kind: "proposal", id: `pl${n}`, title: "t", evidence: Array(n).fill(EVIDENCE) });
+  w.reject("malformed", evidence(L.evidence + 1), w.key("a1"));
+  w.apply(evidence(L.evidence), w.key("a1"));
+  const tests = (n: number) => taskBody(`tl${n}`, { acceptanceTestPaths: files(n).map((f) => `test/${f}`) });
+  w.reject("malformed", tests(L.acceptanceTestPaths + 1), w.coord);
+  w.apply(tests(L.acceptanceTestPaths), w.coord);
+  const reviewers = Array.from({ length: L.reviewers + 1 }, (_, i) => w.id(`r${i}`));
+  w.reject("malformed", assignmentBody(w.state, "s1", reviewers, "e"), w.coord);
+  // findingIds per verdict: refused at reveal.
+  w.assign("s1", ["b1"]);
+  const many = verdict(0.1, Array.from({ length: L.findingIds + 1 }, (_, i) => `f${i}`));
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(many, "salt1", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
+  w.reject("invalid-verdict", { kind: "reviewReveal", submissionId: "s1", verdict: many, salt: "salt1" }, w.key("b1"));
+  const long = { ...verdict(0.1), summary: "x".repeat(L.text + 1) };
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(long, "salt2", w.id("c1"), { submissionId: "s1" }), stake: 5 }, w.key("c1"));
+  w.reject("invalid-verdict", { kind: "reviewReveal", submissionId: "s1", verdict: long, salt: "salt2" }, w.key("c1"));
+  // submissionIds per snapshot
+  const snap = (n: number): EntryBody => ({ kind: "snapshot", id: "rl", commit: "m", previousSnapshotId: null, submissionIds: files(n).map((_, i) => `x${i}`) });
+  w.reject("malformed", snap(L.snapshotSubmissions + 1), w.coord);
+  w.reject("unknown-ref", snap(L.snapshotSubmissions), w.coord); // within the limit, judged by the rules
+});
+
+test("reviewAssignment: the tree digest is the member tree's; the beacon must follow from submission, head commit and entropy", () => {
+  const w = new World().submitted();
+  const digest = memberDigest(w.state);
+  const honest = assignmentBody(w.state, "s1", [w.id("b1")], "round-7");
+  assert.equal(honest.kind === "reviewAssignment" && honest.treeDigest, digest);
+  assert.equal(honest.kind === "reviewAssignment" && honest.beacon, assignmentBeacon("s1", "head-s1", "round-7"));
+  // A beacon the coordinator chose, or one for other entropy or another tree, is refused.
+  w.reject("invalid-value", { ...honest, beacon: sha256hex("chosen") }, w.coord);
+  w.reject("invalid-value", { ...honest, entropy: "round-8" }, w.coord);
+  w.reject("invalid-value", { ...honest, treeDigest: sha256hex("other tree") }, w.coord);
+  // Another tree's digest with the right beacon: the tree is not the coordinator's to choose.
+  w.reject("invalid-value", { ...honest, treeDigest: sha256hex("other tree"), beacon: assignmentBeacon("s1", "head-s1", "round-7") }, w.coord);
+  w.reject("malformed", { ...honest, beacon: "b" }, w.coord);
+  w.reject("malformed", { ...honest, treeDigest: "t" }, w.coord);
+  w.reject("malformed", { ...honest, entropy: "" }, w.coord);
+  const { entropy: _e, ...noEntropy } = honest as Extract<EntryBody, { kind: "reviewAssignment" }>;
+  w.reject("malformed", noEntropy as EntryBody, w.coord);
+  w.apply(honest, w.coord);
+  const a = w.state.submissions.get("s1")?.assignment;
+  assert.deepEqual(
+    { entropy: a?.entropy, treeDigest: a?.treeDigest, beacon: a?.beacon },
+    { entropy: "round-7", treeDigest: digest, beacon: (honest as { beacon: string }).beacon },
+  );
+});
+
+test("agentRegistered: the model family must be one of rules.modelFamilies", () => {
+  const w = new World().people();
+  const reg = (agent: string, modelFamily: string): EntryBody => ({
+    kind: "agentRegistered",
+    owner: "bob",
+    publicKey: w.key(agent).publicKey,
+    modelFamily,
+    harness: "cli",
+  });
+  for (const bad of ["Claude", "claude ", "anthropic", "GPT-4o"]) w.reject("invalid-value", reg(`x-${bad}`, bad), w.key("bob"));
+  for (const f of defaultRules().modelFamilies) w.apply(reg(`ok-${f}`, f), w.key("bob"));
+  // The list is the rules': a ratified change can add a family.
+  w.apply({ kind: "rulesChange", rules: { ...w.state.rules, version: 2, modelFamilies: [...w.state.rules.modelFamilies, "grok"] }, pollId: "p" }, w.admin);
+  w.apply(reg("ok-grok", "grok"), w.key("bob"));
+  assert.equal(w.state.agents.get(w.id("ok-grok"))?.registeredSeq, w.state.length - 1);
+});
+
+test("findingResult: a harness error is recorded, never as a reproduction", () => {
+  const w = new World().submitted();
+  w.apply(findingBody("f1", { submissionId: "s1" }), w.key("b1"));
+  const r = (over: Record<string, unknown>): EntryBody =>
+    ({ kind: "findingResult", findingId: "f1", reproduced: false, failsOnHead: false, passesOnParent: false, logDigest: "d", ...over }) as EntryBody;
+  w.reject("result-inconsistent", r({ reproduced: true, failsOnHead: true, passesOnParent: true, harnessError: "timeout" }), w.coord);
+  w.reject("malformed", r({ harnessError: "" }), w.coord);
+  w.reject("malformed", r({ harnessError: "x".repeat(LEDGER_LIMITS.text + 1) }), w.coord);
+  w.reject("malformed", r({ harnessError: 3 }), w.coord);
+  w.apply(r({ harnessError: "timed out 3 times" }), w.coord);
+  assert.equal(w.state.findings.get("f1")?.result?.harnessError, "timed out 3 times");
+  assert.equal(w.state.findings.get("f1")?.result?.reproduced, false);
+  // The finding is decided either way: the merge is no longer held for it.
+  w.apply({ kind: "gateResult", submissionId: "s1", gate: "tsc", pass: true, details: "" }, w.coord);
+  w.assign("s1", ["c1"]);
+  w.apply({ kind: "merge", submissionId: "s1", commit: "m1" }, w.coord);
+});
+
+// ---------------------------------------------------------------------------
+// Review findings fixed in the whole-system pass
+// ---------------------------------------------------------------------------
+
+test("commit phase: no reveal before the assignment, nor before every assigned reviewer committed or the phase ended", () => {
+  const w = new World().submitted();
+  const commit = (agent: string, p = 0.1, on: World = w): EntryBody => ({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(p), agent, on.id(agent), { submissionId: "s1" }), stake: 5 });
+  const reveal = (agent: string, p = 0.1): EntryBody => ({ kind: "reviewReveal", submissionId: "s1", verdict: verdict(p), salt: agent });
+  // A griefer commits as an open reviewer the moment the submission lands...
+  w.apply(commit("d1"), w.key("d1"));
+  w.reject("commit-phase", reveal("d1"), w.key("d1")); // ...but cannot reveal before the draw
+  w.assign("s1", ["b1", "c1"]);
+  w.reject("commit-phase", reveal("d1"), w.key("d1")); // nor before the assigned seats committed
+  w.apply(commit("b1"), w.key("b1"));
+  w.reject("commit-phase", reveal("b1"), w.key("b1"));
+  w.apply(commit("c1"), w.key("c1")); // so every assigned seat can still commit
+  w.apply(reveal("d1"), w.key("d1"));
+  w.apply(reveal("b1"), w.key("b1"));
+
+  // A seat that never commits holds reveals back only until the phase ends.
+  const v = new World().submitted();
+  v.assign("s1", ["b1", "c1"]);
+  v.apply({ ...commit("b1", 0.1, v) }, v.key("b1"));
+  v.reject("commit-phase", reveal("b1"), v.key("b1"));
+  v.afterCommitPhase();
+  v.reject("commit-closed", commit("c1", 0.1, v), v.key("c1"));
+  v.apply(reveal("b1"), v.key("b1"));
+});
+
+test("regression: a reviewer cannot copy another's sealed commitment and reveal it as its own", () => {
+  const w = new World().submitted();
+  w.assign("s1", ["b1", "c1"]);
+  const v = verdict(0.9);
+  const sealed = commitOf(v, "bsalt", w.id("b1"), { submissionId: "s1" });
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: sealed, stake: 5 }, w.key("b1"));
+  // The public commitment, reposted by an assigned seat and by an open reviewer.
+  w.reject("duplicate-commit", { kind: "reviewCommit", submissionId: "s1", commitment: sealed, stake: 5 }, w.key("c1"));
+  w.reject("duplicate-commit", { kind: "reviewCommit", submissionId: "s1", commitment: sealed, stake: 5 }, w.key("d1"));
+  // Even a commitment computed the old way (verdict and salt only) gives the copier nothing.
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: sha256hex(canonical(v) + "bsalt"), stake: 5 }, w.key("c1"));
+  w.apply({ kind: "reviewReveal", submissionId: "s1", verdict: v, salt: "bsalt" }, w.key("b1"));
+  w.reject("commitment-mismatch", { kind: "reviewReveal", submissionId: "s1", verdict: v, salt: "bsalt" }, w.key("c1"));
+
+  // Attestations are bound the same way.
+  const a = new World().snapshotted();
+  const att = commitOf(v, "asalt", a.id("b1"), { snapshotId: "r1" });
+  a.apply({ kind: "attestCommit", snapshotId: "r1", commitment: att, stake: 5 }, a.key("b1"));
+  a.reject("duplicate-commit", { kind: "attestCommit", snapshotId: "r1", commitment: att, stake: 5 }, a.key("d1"));
+});
+
+test("findingDecision: an admin or a kernel signer not involved decides a reproduced finding once", () => {
+  const w = new World().submitted(); // kernel signers carol and dave; alice wrote s1
+  w.apply(findingBody("f1", { submissionId: "s1" }), w.key("c1")); // carol's agent filed it
+  w.reject("not-decidable", confirm("f1"), w.admin); // no result yet
+  w.apply(result("f1", true), w.coord);
+  w.reject("unauthorised", confirm("f1"), w.key("bob")); // not a kernel signer
+  w.reject("unauthorised", confirm("f1"), w.key("b1")); // agents never decide
+  w.reject("unauthorised", confirm("f1"), w.coord); // nor the coordinator
+  w.reject("same-owner", confirm("f1"), w.key("carol")); // her own owner's finding
+  w.reject("unknown-ref", { kind: "findingDecision", findingId: "nope", confirmed: true, reason: "" }, w.admin);
+  w.apply(confirm("f1", false), w.key("dave"));
+  assert.equal(w.state.findings.get("f1")?.decision?.confirmed, false);
+  w.reject("decided", confirm("f1"), w.admin);
+
+  // A not-reproduced result has nothing to decide.
+  w.apply(findingBody("f2", { submissionId: "s1" }), w.key("d1"));
+  w.apply(result("f2", false), w.coord);
+  w.reject("not-decidable", confirm("f2"), w.admin);
+
+  // A kernel signer whose own work is the target does not decide either.
+  const k = new World().people();
+  k.apply(submissionBody("s1", null, { changedFiles: ["README.md"] }), k.key("d1")); // dave's
+  k.apply(findingBody("f1", { submissionId: "s1" }), k.key("b1"));
+  k.apply(result("f1", true), k.coord);
+  k.reject("same-owner", confirm("f1"), k.key("dave"));
+  k.apply(confirm("f1"), k.key("carol"));
+});
+
+test("mergeApproval: an operator other than the author's owner, once, before the merge", () => {
+  const w = new World().people();
+  w.apply(submissionBody("s1", null, { changedFiles: ["README.md"] }), w.key("c1")); // carol's
+  const approve: EntryBody = { kind: "mergeApproval", submissionId: "s1" };
+  w.reject("unauthorised", approve, w.key("bob"));
+  w.reject("same-owner", approve, w.key("carol"));
+  w.reject("unknown-ref", { kind: "mergeApproval", submissionId: "nope" }, w.admin);
+  w.apply(approve, w.key("dave"));
+  assert.equal(w.state.submissions.get("s1")?.approval?.by, w.id("dave"));
+  w.reject("approved", approve, w.admin);
+  const m = new World().merged();
+  m.reject("merged", approve, m.admin);
+});
+
+test("reviewWindowClosed: names exactly the unrevealed assigned reviewers, once, before the merge", () => {
+  const w = new World().submitted();
+  const close = (missing: string[]): EntryBody => ({ kind: "reviewWindowClosed", submissionId: "s1", missing: missing.map((m) => w.id(m)) });
+  w.reject("not-assigned", close([]), w.coord);
+  w.assign("s1", ["b1", "c1"]);
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "b", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
+  w.afterCommitPhase();
+  w.apply({ kind: "reviewReveal", submissionId: "s1", verdict: verdict(), salt: "b" }, w.key("b1"));
+  w.reject("invalid-reviewers", close(["b1", "c1"]), w.coord);
+  w.reject("unauthorised", close(["c1"]), w.admin);
+  w.apply(close(["c1"]), w.coord);
+  assert.deepEqual(w.state.submissions.get("s1")?.windowClosed?.missing, [w.id("c1")]);
+  w.reject("window-closed", close(["c1"]), w.coord);
+});
+
+test("findingAttempt: harness errors are counted on the ledger until the result", () => {
+  const w = new World().submitted();
+  w.apply(findingBody("f1", { submissionId: "s1" }), w.key("b1"));
+  const attempt: EntryBody = { kind: "findingAttempt", findingId: "f1", harnessError: "timed out" };
+  w.reject("unauthorised", attempt, w.key("b1"));
+  w.apply(attempt, w.coord);
+  w.apply(attempt, w.coord);
+  assert.equal(w.state.findings.get("f1")?.harnessErrors, 2);
+  assert.equal(replay(w.entries).findings.get("f1")?.harnessErrors, 2, "it survives replay, unlike an in-memory count");
+  w.apply(result("f1", false), w.coord);
+  w.reject("result-exists", attempt, w.coord);
+});
+
+test("claims: a holder's unbroken run of extensions is capped unless it delivered; every claim stays in the history", () => {
+  const w = new World().people();
+  w.apply({ kind: "proposal", id: "p1", title: "fix", evidence: [EVIDENCE] }, w.key("a1"));
+  w.apply(taskBody("t1"), w.coord);
+  const day = 24 * 60;
+  const claim = (until: number): EntryBody => ({ kind: "claim", taskId: "t1", until: iso(until), stake: 6 });
+  w.apply(claim(w.minute + 1 + 6 * day), w.key("c1"));
+  w.minute += 5 * day;
+  // 5 days in, extending to 7 days from now would run 12 days without a submission.
+  w.reject("claim-too-long", claim(w.minute + 1 + 7 * day), w.key("c1"));
+  w.apply(claim(w.minute + day), w.key("c1")); // within the run's cap
+  w.apply(submissionBody("s1", "t1"), w.key("c1"));
+  w.apply(claim(w.minute + 1 + 6 * day), w.key("c1")); // delivered since its previous claim: may go on
+  assert.equal(w.state.claimHistory?.length, 3);
+  assert.equal(w.state.claims.get("t1")?.since, w.state.claimHistory?.[0]?.at);
+});
+
+test("regression: a re-claim stamped exactly at `until` is an extension, so the run cap holds", () => {
+  const w = new World().people();
+  w.apply({ kind: "proposal", id: "p1", title: "fix", evidence: [EVIDENCE] }, w.key("a1"));
+  w.apply(taskBody("t1"), w.coord);
+  const day = 24 * 60;
+  const claim = (until: number): EntryBody => ({ kind: "claim", taskId: "t1", until: iso(until), stake: 6 });
+  let until = w.minute + 1 + 6 * day;
+  w.apply(claim(until), w.key("c1"));
+  w.minute = until - 1; // the next entry is stamped at exactly `until`
+  // Live at its own `until`: another agent still waits...
+  w.reject("claim-live", claim(until + day), w.key("d1"));
+  w.minute = until - 1;
+  // ...and the holder re-claiming then extends the same run, which may not pass 7 days.
+  w.reject("claim-too-long", claim(until + 6 * day), w.key("c1"));
+  until += 1;
+  w.minute = until - 1;
+  w.apply(claim(until + 6 * day), w.key("d1")); // a minute later it has lapsed: anyone may claim
+});
+
+test("promotion: main never moves backwards", () => {
+  const w = new World().snapshotted(); // r1 holds s1
+  w.apply(submissionBody("s2", null), w.key("c1"));
+  w.apply(passGate("s2"), w.coord);
+  w.assign("s2", ["d1"]);
+  w.apply({ kind: "merge", submissionId: "s2", commit: "m2" }, w.coord);
+  w.apply({ kind: "snapshot", id: "r2", commit: "m2", previousSnapshotId: "r1", submissionIds: ["s2"] }, w.coord);
+  w.apply({ kind: "promotion", snapshotId: "r2", commit: "m2" }, w.coord);
+  w.reject("promoted", { kind: "promotion", snapshotId: "r1", commit: "m1" }, w.coord); // r2 already shipped it
+
+  // A later snapshot that does not name r1 still holds its content (dev is linear).
+  const v = new World().snapshotted();
+  v.apply(submissionBody("s2", null), v.key("c1"));
+  v.apply(passGate("s2"), v.coord);
+  v.assign("s2", ["d1"]);
+  v.apply({ kind: "merge", submissionId: "s2", commit: "m2" }, v.coord);
+  v.apply({ kind: "snapshot", id: "r2", commit: "m2", previousSnapshotId: null, submissionIds: ["s2"] }, v.coord);
+  v.apply({ kind: "promotion", snapshotId: "r2", commit: "m2" }, v.coord);
+  v.reject("promoted", { kind: "promotion", snapshotId: "r1", commit: "m1" }, v.coord);
+});
+
+test("settlement: one (owner, reason, ref) is settled once, whoever appends it", () => {
+  const w = new World().people();
+  const body: EntryBody = { kind: "settlement", owner: "alice", delta: 5, reason: "bounty", ref: "finding:f1" };
+  w.apply(body, w.coord);
+  w.reject("duplicate-settlement", body, w.coord);
+  w.reject("duplicate-settlement", { ...body, delta: 7 } as EntryBody, w.coord);
+  w.apply({ ...body, owner: "bob" } as EntryBody, w.coord);
+  w.apply({ ...body, reason: "authorSlash", delta: -5 } as EntryBody, w.coord);
+  assert.equal(replay(w.entries).owners.get("alice")?.reputationDelta, 0);
+});
+
+test("lockedStake: a dead submission releases its reviewers' stakes", () => {
+  const w = new World().submitted();
+  w.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s", w.id("b1"), { submissionId: "s1" }), stake: 5 }, w.key("b1"));
+  w.apply(findingBody("f1", { submissionId: "s1" }), w.key("c1"));
+  w.apply(result("f1", true), w.coord);
+  assert.equal(w.owner("bob").lockedStake, 5, "an undecided reproduction might still be dismissed");
+  w.apply(confirm("f1"), w.admin);
+  assert.equal(w.owner("bob").lockedStake, 0, "a confirmed defect never merges");
+  const g = new World().submitted();
+  g.apply({ kind: "reviewCommit", submissionId: "s1", commitment: commitOf(verdict(), "s", g.id("b1"), { submissionId: "s1" }), stake: 5 }, g.key("b1"));
+  g.apply({ kind: "gateResult", submissionId: "s1", gate: "size", pass: false, details: "" }, g.coord);
+  assert.equal(g.owner("bob").lockedStake, 0, "a failed gate never merges");
+});
+
+test("Ledger.refresh catches up with another writer and refuses a rewritten file", () => {
+  const { file, ledger, w } = freshLedger();
+  const other = Ledger.open(file);
+  other.append({ kind: "ownerKey", owner: "alice", publicKey: w.key("alice").publicKey, inviter: null }, w.admin, iso(1));
+  assert.throws(
+    () => ledger.append({ kind: "ownerKey", owner: "bob", publicKey: w.key("bob").publicKey, inviter: null }, w.admin, iso(2)),
+    isCode("stale"),
+  );
+  assert.equal(ledger.refresh(), true);
+  assert.ok(ledger.state().owners.has("alice"));
+  ledger.append({ kind: "ownerKey", owner: "bob", publicKey: w.key("bob").publicKey, inviter: null }, w.admin, iso(2));
+  assert.equal(Ledger.open(file).entries().length, 3);
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").split("\n").slice(0, 1).join("\n") + "\n");
+  fs.appendFileSync(file, `${JSON.stringify(signEntry({ seq: 1, prev: Ledger.open(file).entries()[0]?.hash ?? "" }, { kind: "ownerKey", owner: "carol", publicKey: w.key("carol").publicKey, inviter: null }, w.admin, iso(1)))}\n`);
+  fs.appendFileSync(file, `${JSON.stringify(signEntry(Ledger.open(file).state(), { kind: "ownerKey", owner: "dave", publicKey: w.key("dave").publicKey, inviter: null }, w.admin, iso(1)))}\n`);
+  fs.appendFileSync(file, `${JSON.stringify(signEntry(Ledger.open(file).state(), { kind: "ownerKey", owner: "erin", publicKey: w.key("erin").publicKey, inviter: null }, w.admin, iso(1)))}\n`);
+  assert.throws(() => ledger.refresh(), isCode("stale"));
+});
+
+test("regression: an append that fails part way (a full disk) leaves no fragment, and `Ledger.repair` drops a torn line left by a crash", async () => {
+  const { syncBuiltinESMExports } = await import("node:module");
+  const nodeFs = (await import("node:fs")).default;
+  const { file, ledger, w } = freshLedger();
+  ledger.append({ kind: "ownerKey", owner: "alice", publicKey: w.key("alice").publicKey, inviter: null }, w.admin, iso(1));
+  const real = nodeFs.appendFileSync;
+  nodeFs.appendFileSync = ((p: fs.PathOrFileDescriptor, data: string | Uint8Array) => {
+    nodeFs.writeFileSync(p, String(data).slice(0, 40), { flag: "a" });
+    throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+  }) as typeof nodeFs.appendFileSync;
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => ledger.append({ kind: "ownerKey", owner: "bob", publicKey: w.key("bob").publicKey, inviter: null }, w.admin, iso(2)), /ENOSPC/);
+  } finally {
+    nodeFs.appendFileSync = real;
+    syncBuiltinESMExports();
+  }
+  // Space is back: the same instance appends, and the file reopens.
+  ledger.append({ kind: "ownerKey", owner: "bob", publicKey: w.key("bob").publicKey, inviter: null }, w.admin, iso(3));
+  assert.equal(Ledger.open(file).state().owners.size, 2);
+  // A crash mid-write leaves a torn line: open refuses it, repair drops it.
+  fs.appendFileSync(file, '{"seq":3,"prev":"a03593');
+  assert.throws(() => Ledger.open(file), isCode("torn"));
+  assert.equal(Ledger.repair(file), 23);
+  assert.equal(Ledger.open(file).entries().length, 3);
+  assert.equal(Ledger.repair(file), 0, "nothing to repair");
+  // A damaged complete line is never "repaired" away.
+  fs.appendFileSync(file, "not json\n{");
+  assert.throws(() => Ledger.repair(file));
 });
