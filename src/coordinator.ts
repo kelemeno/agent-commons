@@ -28,7 +28,6 @@ import type {
   KeyId,
   LedgerEntry,
   OwnerId,
-  Severity,
   SubmissionState,
   TreeView,
 } from "./types";
@@ -125,7 +124,6 @@ export type PlanOptions = {
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const BLOCKING: ReadonlySet<Severity> = new Set<Severity>(["high", "critical"]);
 
 export type MergeReadiness = { ready: boolean; missing: KeyId[]; waiting: string[] };
 
@@ -159,7 +157,11 @@ export function mergeReadiness(
     const f = state.findings.get(fid);
     if (!f) continue;
     if (f.result?.reproduced) waiting.push(`reproduced finding ${fid}`);
-    else if (!f.result && BLOCKING.has(f.severity)) waiting.push(`unresolved ${f.severity} finding ${fid}`);
+    // Stricter than "no unresolved finding >= high": the ledger refuses a merge
+    // while any finding on the submission is undecided (finding-pending), and
+    // the bridge merge happens before the ledger entry, so the planner must not
+    // plan a merge the ledger would refuse.
+    else if (!f.result) waiting.push(`unresolved ${f.severity} finding ${fid}`);
   }
   if ((opts.phase ?? 1) === 1 && opts.humanApproval?.(submissionId) !== true) waiting.push("awaiting human approval");
   return { ready: waiting.length === 0, missing, waiting };
@@ -403,11 +405,14 @@ export type GithubBridge = {
   fastForwardMain(commit: CommitSha): Promise<void>;
 };
 
+export type BodyFn = (state: CommonsState) => EntryBody | Promise<EntryBody>;
+
 export type ExecuteDeps = {
   state(): CommonsState; // live state, reflecting every append so far
   // Signed as the coordinator. A function body is evaluated against the state
-  // the entry is appended to, under the same lock (LedgerStore.appendAsCoordinator).
-  append(body: EntryBody | ((state: CommonsState) => EntryBody)): Promise<LedgerEntry> | LedgerEntry;
+  // the entry is appended to, under the store's lock, so nothing lands between
+  // what it read and what it appends (LedgerStore.appendAsCoordinator).
+  append(body: EntryBody | BodyFn): Promise<LedgerEntry> | LedgerEntry;
   tree: TreeView;
   // External entropy for the reviewer beacon (e.g. a public randomness round).
   entropy(submissionId: string): string | Promise<string>;
@@ -426,7 +431,7 @@ export async function executeActions(actions: readonly Action[], deps: ExecuteDe
   const log: LogLine[] = [];
   for (const action of actions) {
     const seqs: number[] = [];
-    const append = async (body: EntryBody | ((state: CommonsState) => EntryBody)) => {
+    const append = async (body: EntryBody | BodyFn) => {
       const e = await deps.append(body);
       seqs.push(e.seq);
       return e;
@@ -441,7 +446,7 @@ export async function executeActions(actions: readonly Action[], deps: ExecuteDe
   return log;
 }
 
-type Append = (body: EntryBody | ((state: CommonsState) => EntryBody)) => Promise<LedgerEntry>;
+type Append = (body: EntryBody | BodyFn) => Promise<LedgerEntry>;
 
 async function execute(action: Action, deps: ExecuteDeps, append: Append): Promise<string> {
   switch (action.kind) {
@@ -510,19 +515,23 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
       return `missing reviewers: ${action.missing.join(", ")}`;
     }
     case "merge": {
-      const state = deps.state();
-      const s = state.submissions.get(action.submissionId) ?? fail(`no submission ${action.submissionId}`);
-      if (s.merged) return "already merged";
-      // Re-checked against live state: a finding reproduced earlier in this
-      // pass must stop the bridge, not just the ledger entry after it.
-      for (const fid of s.findingIds) {
-        const f = state.findings.get(fid);
-        if (f?.result?.reproduced) fail(`finding ${fid} reproduced`);
-        if (f && !f.result && BLOCKING.has(f.severity)) fail(`finding ${fid} unresolved`);
-      }
-      const commit = await deps.bridge.merge(s);
-      await append({ kind: "merge", submissionId: s.id, commit });
-      return `merged at ${commit}`;
+      // Checked and merged under the store lock: a finding posted while the
+      // bridge merges would otherwise make the ledger refuse a merge GitHub
+      // already made. The bridge call therefore needs its own timeout.
+      let detail = "";
+      await append(async (state) => {
+        const s = state.submissions.get(action.submissionId) ?? fail(`no submission ${action.submissionId}`);
+        if (s.merged) fail("already merged");
+        for (const fid of s.findingIds) {
+          const f = state.findings.get(fid);
+          if (f?.result?.reproduced) fail(`finding ${fid} reproduced`);
+          if (f && !f.result) fail(`finding ${fid} unresolved`);
+        }
+        const commit = await deps.bridge.merge(s);
+        detail = `merged at ${commit}`;
+        return { kind: "merge", submissionId: s.id, commit };
+      });
+      return detail;
     }
     case "snapshot": {
       const { id, commit, previousSnapshotId, submissionIds } = action;

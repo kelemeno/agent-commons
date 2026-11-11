@@ -74,12 +74,13 @@ export class LedgerStore {
 
   // Coordinator entries are stamped no earlier than the head: an agent whose
   // clock runs ahead (within the allowed skew) must not make the loop's next
-  // write look like time going backwards.
-  // A function body is built from the state it will be appended to, under the
-  // lock (reviewer assignment needs the exact head its beacon covers).
-  appendAsCoordinator(body: EntryBody | ((state: CommonsState) => EntryBody)): Promise<LedgerEntry> {
-    return this.lock(() => {
-      const made = typeof body === "function" ? body(this.ledger.state()) : body;
+  // write look like time going backwards. A function body is built from the
+  // state it will be appended to, under the lock, so nothing lands between
+  // what it read and what it appends (a reviewer beacon covers the exact head;
+  // a merge is re-checked while the bridge merges). Agent posts wait meanwhile.
+  appendAsCoordinator(body: EntryBody | ((state: CommonsState) => EntryBody | Promise<EntryBody>)): Promise<LedgerEntry> {
+    return this.lock(async () => {
+      const made = typeof body === "function" ? await body(this.ledger.state()) : body;
       const now = this.clock();
       const headAt = this.head().at;
       const at = Date.parse(now) >= Date.parse(headAt) ? now : headAt;

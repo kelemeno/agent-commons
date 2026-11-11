@@ -199,7 +199,7 @@ class World {
   deps(): ExecuteDeps {
     return {
       state: () => this.state,
-      append: (body) => this.apply(typeof body === "function" ? body(this.state) : body, this.coord),
+      append: async (body) => this.apply(typeof body === "function" ? await body(this.state) : body, this.coord),
       tree,
       entropy: (sid) => `round-${sid}`,
       runGates: async (s, gates) =>
@@ -340,32 +340,41 @@ test("never merges with a reproduced finding, even when approved", async () => {
   await w.settle();
   w.approved.add("s1");
   w.advance(25 * 60);
+  const merge = w.plan();
+  assert.deepEqual(kinds(merge), ["revealPhaseClose", "merge"]);
   w.finding("f1", { submissionId: "s1" }, "low");
-  // An unresolved low finding does not block; it is reproduced in the same pass, first.
-  assert.deepEqual(kinds(w.plan()), ["reproduceFinding", "revealPhaseClose", "merge"]);
-  const repro = w.plan()[0];
-  assert.deepEqual(repro, {
-    kind: "reproduceFinding",
-    findingId: "f1",
-    baseCommit: "base-s1",
-    headCommit: "head-s1",
-    testPath: "test/f1.test.ts",
-    testCommand: "npm test",
-  });
+  // Any undecided finding blocks (the ledger refuses finding-pending merges).
+  assert.deepEqual(w.plan(), [
+    {
+      kind: "reproduceFinding",
+      findingId: "f1",
+      baseCommit: "base-s1",
+      headCommit: "head-s1",
+      testPath: "test/f1.test.ts",
+      testCommand: "npm test",
+    },
+  ]);
+  // A merge planned before the finding arrived is re-checked against live
+  // state before the bridge is called.
+  const stale = await executeActions(merge, w.deps());
+  assert.equal(stale[1]?.ok, false);
+  assert.match(stale[1]?.detail ?? "", /unresolved/);
   w.reproductions.set("f1", { reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "d" });
-  const log = await executeActions(w.plan(), w.deps());
+  const log = await executeActions([...w.plan(), ...merge], w.deps());
   assert.equal(log[0]?.ok, true);
-  // The executor re-checks live state: the bridge is never called.
   assert.equal(log[2]?.ok, false);
   assert.match(log[2]?.detail ?? "", /reproduced/);
   assert.deepEqual(w.bridgeCalls, []);
   assert.equal(w.state.submissions.get("s1")?.merged, undefined);
-  const next = w.plan();
-  assert.ok(!kinds(next).includes("merge"));
-  assert.deepEqual(kinds(next), ["settle"]);
+  for (let i = 0; i < 3; i++) {
+    const next = w.plan();
+    assert.ok(!kinds(next).includes("merge"));
+    await executeActions(next, w.deps());
+  }
+  assert.ok(w.state.settlements.some((s) => s.reason === "bounty" && s.ref === "f1@dev"));
 });
 
-test("an unresolved high finding blocks the merge until it is resolved", async () => {
+test("an unresolved finding blocks the merge until it is resolved", async () => {
   const w = new World();
   w.submit("s1");
   await w.settle();
