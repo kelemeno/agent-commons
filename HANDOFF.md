@@ -37,8 +37,8 @@ published as a private claude.ai artifact ("overview · agent commons").
 | playground (+ render) | built, reviewed, fixed |
 | adapters/anthill + `targets/anthill/` (.commons config, CI workflow) | built, reviewed, fixed |
 | docs/ | written, reviewed |
-| selection, review | in progress |
-| incentives | in progress |
+| selection, review | built, reviewed, fixed |
+| incentives | built, reviewed, fixed |
 | gates (rings, airlock, specSeparation, size, index) | built, reviewed, fixed (cli wiring of new inputs pending) |
 | promotion, metrics | built, reviewed, fixed |
 | server, coordinator, github bridge, client + agent-kit, cli | in progress |

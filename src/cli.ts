@@ -7,10 +7,16 @@
 // - takes --ledger (default ./commons-ledger.jsonl), --key (the signing key
 //   file, {publicKey, privateKey} JSON) and --at (ISO time; default the wall
 //   clock, never earlier than the ledger head, since the ledger refuses time
-//   that goes backwards);
+//   that goes backwards). --at must lie within DEFAULT_MAX_SKEW_MS of the
+//   clock unless --force-time is given (tests only): a far-future stamp would
+//   freeze the ledger and expire every claim, and settle/promote judge "now"
+//   by it;
 // - exits 0 on success, 1 when the ledger refuses an entry or a check fails,
 //   2 on a usage or harness error (bad flags, unreadable files, git failed,
-//   a module that is not available). Nothing that could not run reads as a pass.
+//   a module that is not available). Nothing that could not run reads as a pass;
+// - prints attacker-controlled strings (paths, ids, gate details) with control
+//   and bidi characters escaped, so a file name cannot forge log lines or
+//   GitHub workflow commands.
 //
 // Two ways to write an entry:
 // - local (default): open the ledger file, validate, append. This is the
@@ -20,13 +26,22 @@
 // - remote (--url): sign for the coordinator's head and POST it (client.ts),
 //   for the kinds a participant may post. Patches and finding tests upload too.
 //
-// Modules still being written (gates/rings, gates/airlock, gates/size,
-// gates/specSeparation, selection, incentives, promotion, metrics, review via
-// playground) are loaded lazily through `Io.load`, typed here from
-// ARCHITECTURE.md, so the commands that do not need them work today and
-// tests can inject them.
+// What the gates judge. Code is never read from a working tree: the head is
+// materialised from git objects into a private temporary directory (raw blob
+// bytes; no checkout, so no hooks, filters, LFS or attributes), submodules
+// included, and the ring gate reads that. In ledger mode the head is the
+// commit built from baseCommit plus the stored patch (the patch binding), not
+// the author's declared headCommit, because the patch is what gets merged.
+//
+// Strangers' code (finding tests) runs only under an explicit --sandbox,
+// which a preflight checks cannot read the signing key or write the ledger,
+// the patches or the repository's .git.
+//
+// The gate, selection, incentives, promotion, metrics and playground modules
+// are loaded through `Io.load`, typed here from ARCHITECTURE.md, so tests can
+// inject stand-ins.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import type * as http from "node:http";
@@ -36,18 +51,23 @@ import { CommonsClient, commitmentOf, fileSaltStore, newId, verdictProblems, typ
 import {
   type GithubBridge,
   type IncentivesApi,
+  BINDING_GATE,
+  bindingDetails,
   localReproducer,
+  type PatchBinding,
+  patchBinding,
   planActions,
   type PromotionApi,
   runOnce,
   type SelectionApi,
 } from "./coordinator";
-import { canonical, generateKeyPair, isValidPublicKey, keyIdOf, randomSalt } from "./crypto";
-import { reproduceFinding } from "./findings";
-import { isCanonicalPath, Ledger, LedgerError, type LedgerState, type Signer } from "./ledger";
+import { canonical, generateKeyPair, isValidPublicKey, keyIdOf, randomSalt, sha256hex } from "./crypto";
+import { minimalEnv, reproduceFinding } from "./findings";
+import { applyUnifiedDiff, parsePatch } from "./github";
+import { DEFAULT_MAX_SKEW_MS, isCanonicalPath, Ledger, LedgerError, type LedgerState, type Signer } from "./ledger";
 import { plantCommitment } from "./plants";
 import { claimStake, defaultRules, ringOf, validateRules } from "./rules";
-import { createCoordinatorServer, findingTestFile, LedgerStore, type SubmitPolicy, summarisePatch } from "./server";
+import { createCoordinatorServer, findingTestFile, LedgerStore, patchFile, type SubmitPolicy, summarisePatch } from "./server";
 import { treeFromParents, treeFromSnapshot } from "./tree";
 import type {
   CommonsState,
@@ -69,11 +89,14 @@ import type {
 
 export type RingsApi = {
   submissionRing(files: string[], rules: Rules): Ring;
-  checkRingImports(repoDir: string, files: string[], rules: Rules): GateReport;
+  // `deleted`: the changed files the diff removes; any other absent file fails.
+  checkRingImports(repoDir: string, files: string[], rules: Rules, opts?: { deleted?: Iterable<string> }): GateReport;
 };
 export type AirlockApi = { checkAirlock(files: string[], rules: Rules, opts: { dependencyTrack: boolean }): GateReport };
-export type SizeApi = { checkSize(linesChanged: number, rules: Rules): GateReport };
-export type SpecSeparationApi = { checkSpecSeparation(state: CommonsState, submissionId: string): GateReport };
+export type SizeChange = { linesChanged: number; files?: readonly string[]; binary?: readonly string[]; bytesAdded?: number };
+export type SizeApi = { checkSize(change: number | SizeChange, rules: Rules): GateReport };
+export type SpecSeparationApi = { checkSpecSeparation(state: CommonsState, submissionId: string, repoDir?: string): GateReport };
+export type GatesIndexApi = { checkTaskRing(state: CommonsState, submissionId: string): GateReport | null };
 export type MetricsApi = {
   computeMetrics(
     state: CommonsState,
@@ -86,6 +109,7 @@ export type PlaygroundApi = {
 };
 
 export type ModuleName =
+  | "gates"
   | "gates/rings"
   | "gates/airlock"
   | "gates/size"
@@ -217,7 +241,9 @@ function num(f: Flags, name: string): number | undefined {
 // Commands table
 // ---------------------------------------------------------------------------
 
-type Ctx = { io: Io; out: (line: string) => void; flags: Flags; name: string };
+// out: one line, every control/bidi character escaped (newlines included).
+// block: multi-line text we built (JSON), escaped except its own newlines.
+type Ctx = { io: Io; out: (line: string) => void; block: (text: string) => void; flags: Flags; name: string };
 type Command = {
   summary: string;
   flags: Record<string, FlagSpec>;
@@ -227,7 +253,8 @@ type Command = {
 const COMMON: Record<string, FlagSpec> = {
   ledger: { type: "string", help: "ledger file (default ./commons-ledger.jsonl)" },
   key: { type: "string", help: "signing key file ({publicKey, privateKey} JSON)" },
-  at: { type: "string", help: "ISO time to stamp (default: now, never before the ledger head)" },
+  at: { type: "string", help: "ISO time to stamp, within 5 minutes of the clock (default: now, never before the ledger head)" },
+  "force-time": { type: "boolean", help: "accept any --at (tests and replays only: it can freeze the ledger)" },
   help: { type: "boolean", help: "show this help" },
 };
 const REMOTE: Record<string, FlagSpec> = {
@@ -306,11 +333,29 @@ function isoArg(value: string, flag: string): string {
 }
 
 // --at, or the clock; never before `headAt`, which the ledger would refuse.
+// The time also drives evaluation (claim expiry, vesting, soak), so --at is
+// bounded by the clock like the server bounds agents' entries.
 function stamp(ctx: Ctx, headAt?: string): string {
   const at = str(ctx.flags, "at");
-  if (at !== undefined) return isoArg(at, "at");
-  const now = ctx.io.now().toISOString();
-  return headAt !== undefined && Date.parse(headAt) > Date.parse(now) ? headAt : now;
+  const now = ctx.io.now();
+  if (at !== undefined) {
+    const iso = isoArg(at, "at");
+    if (!bool(ctx.flags, "force-time") && Math.abs(Date.parse(iso) - now.getTime()) > DEFAULT_MAX_SKEW_MS) {
+      usage(`--at ${iso} is more than ${DEFAULT_MAX_SKEW_MS / 60_000} minutes from the clock (${now.toISOString()}); --force-time accepts it (tests only)`);
+    }
+    return iso;
+  }
+  const nowIso = now.toISOString();
+  return headAt !== undefined && Date.parse(headAt) > Date.parse(nowIso) ? headAt : nowIso;
+}
+
+// Escapes C0/C1 controls, DEL, line separators and bidi overrides as \uXXXX,
+// the way core.quotePath protects a terminal. `keepNewlines` is for text whose
+// line breaks we wrote ourselves.
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+const UNPRINTABLE_BUT_NL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+export function printable(text: string, keepNewlines = false): string {
+  return text.replace(keepNewlines ? UNPRINTABLE_BUT_NL : UNPRINTABLE, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 const ledgerPath = (ctx: Ctx): string => resolvePath(ctx, str(ctx.flags, "ledger") ?? "commons-ledger.jsonl");
@@ -344,7 +389,7 @@ function client(ctx: Ctx, signer: Signer, saltDir?: string): CommonsClient {
   return new CommonsClient({
     baseUrl: req(ctx.flags, "url"),
     agentKey: signer,
-    clock: () => (at === undefined ? ctx.io.now() : isoArg(at, "at")),
+    clock: () => (at === undefined ? ctx.io.now() : stamp(ctx)),
     ...(ctx.io.fetch ? { fetch: ctx.io.fetch as never } : {}),
     ...(saltDir === undefined ? {} : { saltStore: fileSaltStore(saltDir) }),
   });
@@ -415,35 +460,57 @@ async function loadTree(ctx: Ctx): Promise<TreeView> {
 
 export type GitRunner = (cwd: string, args: string[], input?: string) => string;
 
-const defaultGit: GitRunner = (cwd, args, input) => {
+// Every git the CLI runs works on repositories that hold strangers' commits.
+// None of these commands checks anything out, but config and environment make
+// sure no hook, fsmonitor or LFS filter of anyone's could run if one did.
+const GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "filter.lfs.process=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.required=false"];
+
+// Caps on what materialising a head may write. Blobs are deduplicated, so a
+// tiny pack can expand into a huge tree and fill the disk the ledger lives on.
+export const MAX_HEAD_FILES = 200_000;
+export const MAX_HEAD_BYTES = 256 * 1024 * 1024;
+
+function rawGit(cwd: string, args: string[], opts: { input?: string; env?: Record<string, string> } = {}): Buffer {
   try {
-    return execFileSync("git", args, {
+    return execFileSync("git", [...GIT_SAFE, ...args], {
       cwd,
-      encoding: "utf8",
-      input,
-      maxBuffer: 256 * 1024 * 1024,
+      input: opts.input,
+      maxBuffer: MAX_HEAD_BYTES + 64 * 1024 * 1024,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_LFS_SKIP_SMUDGE: "1", ...opts.env },
     });
   } catch (e) {
-    const err = e as { stderr?: string; message: string };
-    throw new CliError(2, `git ${args.join(" ")} (in ${cwd}) failed: ${(err.stderr || err.message).trim()}`);
+    const err = e as { stderr?: Buffer | string; message: string };
+    throw new CliError(2, `git ${args.join(" ")} (in ${cwd}) failed: ${(err.stderr?.toString() || err.message).trim()}`);
   }
-};
+}
+
+const defaultGit: GitRunner = (cwd, args, input) => rawGit(cwd, args, input === undefined ? {} : { input }).toString("utf8");
 
 export type Change = {
   files: string[]; // sorted, unique, repo-relative POSIX; submodule files carry the submodule path
-  linesChanged: number; // added + deleted over all files, submodule files included
+  linesChanged: number; // added + deleted over all files, submodule files included; binary files by their newlines
+  deleted: string[]; // changed files that are absent at head
   binary: string[]; // files git counts no lines for
+  bytesAdded: number; // the added side: `+` lines of text files, the whole new blob of binary ones
   unexpanded: { path: string; reason: string }[]; // gitlinks reported bare
   submodules: { path: string; sha: string }[]; // expanded gitlinks and the commit their new side is at
 };
 
 const GITLINK = "160000";
+const NO_MODE = "000000";
 const MAX_SUBMODULE_DEPTH = 8;
+export const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 function revArg(value: string, flag: string): string {
   if (!/^[0-9A-Za-z][0-9A-Za-z._/^~@{}-]*$/.test(value)) usage(`--${flag} ${JSON.stringify(value)} is not a commit`);
+  return value;
+}
+
+// A commit name the ledger may record: a full sha, never a ref or an
+// expression whose meaning can move between gating and merging.
+function shaArg(value: string, flag: string): string {
+  if (!FULL_SHA.test(value)) usage(`--${flag} ${JSON.stringify(value)} must be a full commit sha (40 or 64 hex digits)`);
   return value;
 }
 
@@ -451,23 +518,40 @@ function resolveCommit(git: GitRunner, repo: string, rev: string): string {
   return git(repo, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${rev}^{commit}`]).trim();
 }
 
+// Why `sha` cannot be gated in `repo`, or null: it must be a full sha naming
+// a commit there, not a tag or anything else that peels to one.
+function pinProblem(git: GitRunner, repo: string, what: string, sha: string): string | null {
+  if (!FULL_SHA.test(sha)) return `${what} ${JSON.stringify(sha)} is not a full commit sha`;
+  try {
+    return resolveCommit(git, repo, sha) === sha ? null : `${what} ${sha} is not a commit`;
+  } catch {
+    return `${what} ${sha} is not in ${repo}`;
+  }
+}
+
 // The change base..head (git diff base head), every path on both sides of a
 // rename, with each differing gitlink expanded into the submodule's own
 // change. A gitlink that cannot be expanded is reported as its bare path and
-// keeps its pointer line count; the rules classify a bare pointer as kernel.
+// keeps its pointer line count; the gates classify a bare pointer as ring 0.
 export function gitChanges(git: GitRunner, repo: string, base: string, head: string): Change {
   return diffTrees(git, repo, resolveCommit(git, repo, base), resolveCommit(git, repo, head), 0);
 }
 
 function diffTrees(git: GitRunner, repo: string, a: string, b: string, depth: number): Change {
-  const common = ["--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z"];
-  const raw = git(repo, ["diff", "--raw", "--no-abbrev", ...common, a, b, "--"]).split("\0");
+  const common = ["--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"];
+  const raw = git(repo, ["diff", "--raw", "--no-abbrev", "-z", ...common, a, b, "--"]).split("\0");
   const gitlinks = new Map<string, { old: string | null; new: string | null; typechange: boolean }>();
+  const blobs = new Map<string, { old: string | null; new: string | null }>();
+  const deleted: string[] = [];
   for (let i = 0; i + 1 < raw.length; i += 2) {
     const [oldMode, newMode, oldSha, newSha] = (raw[i] as string).replace(/^:/, "").split(" ");
     const p = raw[i + 1] as string;
-    if (oldMode !== GITLINK && newMode !== GITLINK) continue;
-    const typechange = (oldMode !== GITLINK && oldMode !== "000000") || (newMode !== GITLINK && newMode !== "000000");
+    if (oldMode !== GITLINK && newMode !== GITLINK) {
+      blobs.set(p, { old: oldMode === NO_MODE ? null : (oldSha as string), new: newMode === NO_MODE ? null : (newSha as string) });
+      if (newMode === NO_MODE) deleted.push(p);
+      continue;
+    }
+    const typechange = (oldMode !== GITLINK && oldMode !== NO_MODE) || (newMode !== GITLINK && newMode !== NO_MODE);
     gitlinks.set(p, {
       old: oldMode === GITLINK ? (oldSha as string) : null,
       new: newMode === GITLINK ? (newSha as string) : null,
@@ -480,19 +564,28 @@ function diffTrees(git: GitRunner, repo: string, a: string, b: string, depth: nu
   const unexpanded: Change["unexpanded"] = [];
   const submodules: Change["submodules"] = [];
   let lines = 0;
-  const numstat = git(repo, ["diff", "--numstat", ...common, a, b, "--"]).split("\0");
+  let bytesAdded = addedTextBytes(git, repo, a, b, common);
+  const numstat = git(repo, ["diff", "--numstat", "-z", ...common, a, b, "--"]).split("\0");
   const pointerLines = new Map<string, number>();
   for (const rec of numstat) {
     if (rec === "") continue;
     const m = /^(-|\d+)\t(-|\d+)\t([\s\S]*)$/.exec(rec);
     if (!m) throw new CliError(2, `unexpected git numstat record ${JSON.stringify(rec)}`);
     const p = m[3] as string;
-    const n = m[1] === "-" ? 0 : Number(m[1]) + Number(m[2]);
+    let n = m[1] === "-" ? 0 : Number(m[1]) + Number(m[2]);
     if (gitlinks.has(p)) {
       pointerLines.set(p, (pointerLines.get(p) ?? 0) + n);
       continue;
     }
-    if (m[1] === "-") binary.push(p);
+    if (m[1] === "-") {
+      // git counts nothing for a file it calls binary (one NUL byte, or a
+      // `-diff` attribute the change itself can add). Count its lines and
+      // bytes from the blobs, so it cannot hide from the size gate.
+      binary.push(p);
+      const blob = blobs.get(p);
+      n = blobLines(git, repo, blob?.old ?? null) + blobLines(git, repo, blob?.new ?? null);
+      bytesAdded += blob?.new ? Number(git(repo, ["cat-file", "-s", blob.new]).trim()) : 0;
+    }
     files.add(p);
     lines += n;
   }
@@ -509,12 +602,48 @@ function diffTrees(git: GitRunner, repo: string, a: string, b: string, depth: nu
     }
     for (const f of sub.files) files.add(`${p}/${f}`);
     lines += sub.linesChanged;
+    bytesAdded += sub.bytesAdded;
+    deleted.push(...sub.deleted.map((f) => `${p}/${f}`));
     binary.push(...sub.binary.map((f) => `${p}/${f}`));
     unexpanded.push(...sub.unexpanded.map((u) => ({ ...u, path: `${p}/${u.path}` })));
     if (link.new !== null) submodules.push({ path: p, sha: link.new });
     submodules.push(...sub.submodules.map((s) => ({ ...s, path: `${p}/${s.path}` })));
   }
-  return { files: [...files].sort(), linesChanged: lines, binary: binary.sort(), unexpanded, submodules };
+  return { files: [...files].sort(), linesChanged: lines, deleted: deleted.sort(), binary: binary.sort(), bytesAdded, unexpanded, submodules };
+}
+
+// Bytes on the `+` lines of the text diff (each `+` stands in for its line's
+// newline). Binary files print no hunks here; diffTrees adds their blobs.
+function addedTextBytes(git: GitRunner, repo: string, a: string, b: string, common: string[]): number {
+  let n = 0;
+  let inHunk = false;
+  for (const line of git(repo, ["diff", "-U0", "--no-color", ...common, a, b, "--"]).split("\n")) {
+    if (line.startsWith("diff --git ")) inHunk = false;
+    else if (line.startsWith("@@")) inHunk = true;
+    else if (inHunk && line.startsWith("+")) n += Buffer.byteLength(line, "utf8");
+  }
+  return n;
+}
+
+// Lines in a blob as a line count would see them; 0 for an absent side.
+// UTF-8 decoding never creates or removes a 0x0a byte, so the count is exact.
+function blobLines(git: GitRunner, repo: string, sha: string | null): number {
+  if (sha === null) return 0;
+  const text = git(repo, ["cat-file", "blob", sha]);
+  let n = 0;
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) n++;
+  return text.length > 0 && !text.endsWith("\n") ? n + 1 : n;
+}
+
+// An initialised submodule checkout at `dir`. An uninitialised one is an
+// empty directory, where git would find the superproject instead.
+function isCheckoutRoot(git: GitRunner, dir: string): boolean {
+  if (!fs.existsSync(path.join(dir, ".git"))) return false;
+  try {
+    return fs.realpathSync(git(dir, ["rev-parse", "--show-toplevel"]).trim()) === fs.realpathSync(dir);
+  } catch {
+    return false;
+  }
 }
 
 // The submodule's own change, or why it could not be computed.
@@ -528,12 +657,8 @@ function expandSubmodule(
 ): Change | string {
   if (depth >= MAX_SUBMODULE_DEPTH) return "submodules nested too deep";
   const dir = path.join(repo, p);
-  // An uninitialised submodule is an empty directory, where git would find
-  // the superproject instead; only a checkout whose top level is `dir` counts.
-  if (!fs.existsSync(path.join(dir, ".git"))) return "submodule not initialised";
+  if (!isCheckoutRoot(git, dir)) return "submodule not initialised";
   try {
-    const top = git(dir, ["rev-parse", "--show-toplevel"]).trim();
-    if (fs.realpathSync(top) !== fs.realpathSync(dir)) return "submodule not initialised";
     for (const sha of [oldSha, newSha]) {
       if (sha === null || hasCommit(git, dir, sha)) continue;
       try {
@@ -560,42 +685,182 @@ function hasCommit(git: GitRunner, dir: string, sha: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Static gates
+// Materialising a head
 // ---------------------------------------------------------------------------
 
-type GateRun = { ring: Ring | null; reports: GateReport[]; harness: string[] };
+type Budget = { files: number; bytes: number };
 
-function runGate(run: GateRun, gate: string, fn: () => GateReport): void {
-  try {
-    run.reports.push(fn());
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    run.harness.push(`${gate}: ${message}`);
-    run.reports.push({ gate, pass: false, details: `could not run: ${message}` });
+// Writes the tree of `commit` into the empty directory `dest` from git
+// objects alone: regular files and symlinks with their raw bytes, and each
+// gitlink whose commit the submodule checkout at that path has, recursively.
+// Nothing is checked out and `dest` is not linked to any repository, so no
+// hook, filter, LFS smudge or attribute runs, and nothing the gates later do
+// in `dest` can reach the repository. A gitlink in `required` (a submodule the
+// change moves, by top-level path) that cannot be written is an error, never
+// an empty directory: the ring gate would read its files as absent. Other
+// gitlinks stay empty, as in a checkout without that submodule.
+export function materialiseCommit(
+  repo: string,
+  commit: string,
+  dest: string,
+  required: ReadonlySet<string>,
+  prefix = "",
+  depth = 0,
+  budget: Budget = { files: 0, bytes: 0 },
+): void {
+  if (depth >= MAX_SUBMODULE_DEPTH) throw new Error("submodules nested too deep");
+  const root = fs.realpathSync(dest);
+  type Item = { mode: string; sha: string; size: number; path: string };
+  const items: Item[] = [];
+  const links: Item[] = [];
+  for (const rec of rawGit(repo, ["ls-tree", "-r", "-z", "-l", "--full-tree", commit]).toString("utf8").split("\0")) {
+    if (rec === "") continue;
+    const m = /^(\d{6}) (\w+) ([0-9a-f]+) +(-|\d+)\t([\s\S]+)$/.exec(rec);
+    if (!m) throw new Error(`unexpected git ls-tree record ${JSON.stringify(rec)}`);
+    const item = { mode: m[1] as string, sha: m[3] as string, size: m[4] === "-" ? 0 : Number(m[4]), path: m[5] as string };
+    const segments = item.path.split("/");
+    if (segments.some((x) => x === "" || x === "." || x === ".." || x.toLowerCase() === ".git")) {
+      throw new Error(`commit ${commit} has an unsafe path ${JSON.stringify(item.path)}`);
+    }
+    if (item.mode === GITLINK) links.push(item);
+    else if (["100644", "100755", "120000"].includes(item.mode)) items.push(item);
+    else throw new Error(`commit ${commit}: unsupported mode ${item.mode} at ${JSON.stringify(item.path)}`);
+    budget.files += 1;
+    budget.bytes += item.size;
+  }
+  if (budget.files > MAX_HEAD_FILES || budget.bytes > MAX_HEAD_BYTES) {
+    throw new Error(`the head is too large to check (${budget.files} files, ${budget.bytes} bytes; limits ${MAX_HEAD_FILES}, ${MAX_HEAD_BYTES})`);
+  }
+
+  const shas = [...new Set(items.map((i) => i.sha))];
+  const blobs = new Map<string, Buffer>();
+  if (shas.length > 0) {
+    const out = rawGit(repo, ["cat-file", "--batch"], { input: `${shas.join("\n")}\n` });
+    let at = 0;
+    while (at < out.length) {
+      const nl = out.indexOf(0x0a, at);
+      const header = out.subarray(at, nl).toString("utf8");
+      const m = /^([0-9a-f]+) blob (\d+)$/.exec(header);
+      if (!m) throw new Error(`git cat-file: ${header}`);
+      const size = Number(m[2]);
+      blobs.set(m[1] as string, out.subarray(nl + 1, nl + 1 + size));
+      at = nl + 1 + size + 1;
+    }
+  }
+  for (const item of items) {
+    const abs = path.join(root, item.path);
+    const parent = path.dirname(abs);
+    fs.mkdirSync(parent, { recursive: true });
+    // Paths are unique in a well-formed tree; a crafted one could put a file
+    // under a symlink written earlier, so every parent must still be ours.
+    const real = fs.realpathSync(parent);
+    if (real !== root && !real.startsWith(`${root}${path.sep}`)) throw new Error(`${JSON.stringify(item.path)} escapes the checkout`);
+    const content = blobs.get(item.sha) ?? Buffer.alloc(0);
+    if (item.mode === "120000") fs.symlinkSync(content.toString("utf8"), abs);
+    else fs.writeFileSync(abs, content, { flag: "wx", mode: item.mode === "100755" ? 0o755 : 0o644 });
+  }
+  for (const link of links) {
+    const full = prefix === "" ? link.path : `${prefix}/${link.path}`;
+    const sub = path.join(repo, link.path);
+    const target = path.join(root, link.path);
+    fs.mkdirSync(target, { recursive: true });
+    if (isCheckoutRoot(defaultGit, sub) && hasCommit(defaultGit, sub, link.sha)) {
+      materialiseCommit(sub, link.sha, target, required, full, depth + 1, budget);
+    } else if (required.has(full)) {
+      throw new Error(`submodule ${full} at ${link.sha} is not available in ${sub}; its files cannot be checked`);
+    }
   }
 }
 
-// rings (imports), airlock and size over a computed change. checkRingImports
-// reads the changed files from `repoDir`, which must be checked out at head.
-function staticGates(io: Io, repoDir: string, change: Change, rules: Rules, dependencyTrack: boolean): GateRun {
-  const run: GateRun = { ring: null, reports: [], harness: [] };
+// Runs fn on a private directory holding `head`, then removes it. With
+// need=false the directory stays empty (nothing will be read from it).
+function withHead<T>(repo: string, head: string, change: Change, need: boolean, fn: (dir: string) => T): T {
+  const tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "commons-head-"));
+  try {
+    const dir = path.join(tmp, "head");
+    fs.mkdirSync(dir);
+    if (need) materialiseCommit(repo, head, dir, new Set(change.submodules.map((s) => s.path)));
+    return fn(dir);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Static gates
+// ---------------------------------------------------------------------------
+
+type GateRun = { ring: Ring | null; reports: GateReport[]; harness: string[]; notes: string[] };
+
+function attempt(run: GateRun, gate: string, fn: () => GateReport): GateReport {
+  try {
+    return fn();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    run.harness.push(`${gate}: ${message}`);
+    return { gate, pass: false, details: `could not run: ${message}` };
+  }
+}
+
+// rings, airlock and size over a computed change, in that order. The ring
+// gate reads `head` materialised from git (never a working tree), and only
+// when the size gate passed: an oversized change is not written to disk.
+// `inHead` runs more gates on that directory (ledger mode).
+function staticGates(
+  io: Io,
+  repo: string,
+  head: string,
+  change: Change,
+  rules: Rules,
+  dependencyTrack: boolean,
+  inHead?: (dir: string, run: GateRun) => void,
+): GateRun {
+  const run: GateRun = { ring: null, reports: [], harness: [], notes: [] };
   let rings: RingsApi | null = null;
   try {
     rings = io.load("gates/rings") as RingsApi;
     run.ring = rings.submissionRing(change.files, rules);
   } catch (e) {
     run.harness.push(`rings: ${(e as Error).message}`);
-    run.reports.push({ gate: "rings", pass: false, details: `could not run: ${(e as Error).message}` });
   }
-  if (rings) runGate(run, "rings", () => (rings as RingsApi).checkRingImports(repoDir, change.files, rules));
-  runGate(run, "airlock", () => (io.load("gates/airlock") as AirlockApi).checkAirlock(change.files, rules, { dependencyTrack }));
-  runGate(run, "size", () => (io.load("gates/size") as SizeApi).checkSize(change.linesChanged, rules));
+  if (change.unexpanded.length > 0) {
+    run.ring = 0;
+    run.notes.push(`ring 0 whatever the rules say: ${change.unexpanded.length} submodule pointer(s) could not be expanded, so their content is not inspected`);
+  }
+  const airlock = attempt(run, "airlock", () => (io.load("gates/airlock") as AirlockApi).checkAirlock(change.files, rules, { dependencyTrack }));
+  const size = attempt(run, "size", () =>
+    (io.load("gates/size") as SizeApi).checkSize(
+      { linesChanged: change.linesChanged, files: change.files, binary: change.binary, bytesAdded: change.bytesAdded },
+      rules,
+    ),
+  );
+  let ringReport: GateReport;
+  if (rings === null) ringReport = { gate: "rings", pass: false, details: "could not run: gates/rings is not available" };
+  else if (!size.pass) ringReport = { gate: "rings", pass: false, details: "not run: the change fails the size gate, so its head is not materialised" };
+  else {
+    const r = rings;
+    const need = inHead !== undefined || change.files.some((f) => ringOf(f, rules) === 2);
+    ringReport = attempt(run, "rings", () =>
+      withHead(repo, head, change, need, (dir) => {
+        const report = r.checkRingImports(dir, change.files, rules, { deleted: change.deleted });
+        inHead?.(dir, run);
+        return report;
+      }),
+    );
+  }
+  run.reports.unshift(ringReport, airlock, size);
   return run;
 }
 
 function printChange(ctx: Ctx, change: Change, rules: Rules): void {
-  ctx.out(`changed files: ${change.files.length}, lines changed: ${change.linesChanged}`);
-  for (const f of change.files) ctx.out(`  [ring ${ringOf(f, rules)}] ${f}${change.binary.includes(f) ? " (binary)" : ""}`);
+  ctx.out(`changed files: ${change.files.length}, lines changed: ${change.linesChanged}, bytes added: ${change.bytesAdded}`);
+  const bare = new Set(change.unexpanded.map((u) => u.path));
+  const deleted = new Set(change.deleted);
+  const binary = new Set(change.binary);
+  for (const f of change.files) {
+    const ring = bare.has(f) ? 0 : ringOf(f, rules);
+    ctx.out(`  [ring ${ring}] ${f}${deleted.has(f) ? " (deleted)" : ""}${binary.has(f) ? " (binary)" : ""}`);
+  }
   for (const u of change.unexpanded) ctx.out(`  submodule ${u.path} not expanded: ${u.reason}`);
 }
 
@@ -610,81 +875,208 @@ function readRules(ctx: Ctx, p: string): Rules {
   return rules;
 }
 
-// CI mode: no ledger; base..head of a checkout already at head.
+// CI mode: no ledger. The working tree is not read: in CI it is the base, and
+// the head was only fetched (see .commons/README.md).
 async function gatesCi(ctx: Ctx): Promise<number> {
   const f = ctx.flags;
   const repo = resolvePath(ctx, req(f, "repo"));
   const rules = readRules(ctx, req(f, "rules"));
   const git = ctx.io.git;
-  const base = revArg(req(f, "base"), "base");
-  const head = revArg(req(f, "head"), "head");
-  const headSha = resolveCommit(git, repo, head);
-  const checkedOut = git(repo, ["rev-parse", "HEAD"]).trim();
-  if (checkedOut !== headSha) {
-    usage(`${repo} is checked out at ${checkedOut}, not --head ${headSha}; the import gate reads files from the working tree`);
-  }
-  const change = gitChanges(git, repo, base, head);
-  for (const s of change.submodules) {
-    const at = git(path.join(repo, s.path), ["rev-parse", "HEAD"]).trim();
-    if (at !== s.sha) usage(`submodule ${s.path} is checked out at ${at}, not ${s.sha}; run git submodule update`);
-  }
-  if (change.files.length === 0) usage(`no changes between ${base} and ${head}`);
-  const run = staticGates(ctx.io, repo, change, rules, bool(f, "dependency-track"));
+  const base = resolveCommit(git, repo, revArg(req(f, "base"), "base"));
+  const head = resolveCommit(git, repo, revArg(req(f, "head"), "head"));
+  const change = diffTrees(git, repo, base, head, 0);
+  const run = staticGates(ctx.io, repo, head, change, rules, bool(f, "dependency-track"));
+  if (change.files.length === 0) run.notes.push(`no changes between ${base} and ${head}`);
   return finishGates(ctx, change, rules, run);
 }
 
-function finishGates(ctx: Ctx, change: Change, rules: Rules, run: GateRun, recorded = ""): number {
+function finishGates(ctx: Ctx, change: Change | null, rules: Rules, run: GateRun, recorded = ""): number {
   const pass = run.harness.length === 0 && run.reports.length > 0 && run.reports.every((r) => r.pass);
   if (bool(ctx.flags, "json")) {
-    ctx.out(JSON.stringify({ pass, ring: run.ring, files: change.files, linesChanged: change.linesChanged, unexpanded: change.unexpanded, reports: run.reports }, null, 2));
+    ctx.block(
+      JSON.stringify(
+        {
+          pass,
+          ring: run.ring,
+          files: change?.files ?? [],
+          linesChanged: change?.linesChanged ?? 0,
+          deleted: change?.deleted ?? [],
+          binary: change?.binary ?? [],
+          bytesAdded: change?.bytesAdded ?? 0,
+          unexpanded: change?.unexpanded ?? [],
+          notes: run.notes,
+          reports: run.reports,
+        },
+        null,
+        2,
+      ),
+    );
   } else {
-    printChange(ctx, change, rules);
+    if (change) printChange(ctx, change, rules);
     ctx.out(`submission ring: ${run.ring ?? "unknown"}`);
+    for (const n of run.notes) ctx.out(`note: ${n}`);
     printReports(ctx, run.reports);
     if (recorded) ctx.out(recorded);
     ctx.out(pass ? "gates: PASS" : "gates: FAIL");
   }
   if (run.harness.length > 0) {
-    ctx.io.stderr(`commons gates: could not run every gate:\n  ${run.harness.join("\n  ")}\n`);
+    ctx.io.stderr(`commons gates: could not run every gate:\n  ${run.harness.map((h) => printable(h)).join("\n  ")}\n`);
     return 2;
   }
   return pass ? 0 : 1;
 }
 
-// The gates for a ledger submission, run in a temporary worktree at its head.
-// The declared changedFiles/linesChanged are what the ledger and the other
-// gates trust, so they are checked against git first (ledger.ts leaves that
-// to the coordinator): a submission that misstates its change fails.
-export function submissionGates(io: Io, st: CommonsState, submissionId: string, repo: string, dependencyTrack = false): GateRun & { change: Change } {
-  const s = st.submissions.get(submissionId) ?? usage(`no submission ${submissionId}`);
-  const change = gitChanges(io.git, repo, s.baseCommit, s.headCommit);
-  const tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "commons-gates-"));
-  const work = path.join(tmp, "head");
+// ---------------------------------------------------------------------------
+// Patch binding: the commit that gets merged
+// ---------------------------------------------------------------------------
+
+// Builds, in `repo`, the commit the GitHub bridge would build for a stored
+// patch: parent baseCommit, tree = baseCommit's tree with the patch applied by
+// the bridge's own strict parser and applier, and the bridge's refusals
+// (binary, symlink, mode, .github/, a missing or existing path). The commit is
+// kept alive by refs/commons/<id>. If the declared headCommit is in `repo`,
+// its tree must be the patch's tree. null = no patch stored yet.
+export function bindPatchLocal(repo: string, patchesDir: string, s: SubmissionState): PatchBinding | { error: string } | null {
+  let file: string;
   try {
-    io.git(repo, ["worktree", "add", "--detach", "--quiet", work, s.headCommit]);
-    const run = staticGates(io, work, change, st.rules, dependencyTrack);
-    const declared = [...new Set(s.changedFiles)].sort();
-    const same = declared.join("\n") === change.files.join("\n") && s.linesChanged === change.linesChanged;
-    run.reports.unshift({
-      gate: "declaredChange",
-      pass: same,
-      details: same
-        ? `changedFiles and linesChanged match git diff ${s.baseCommit}..${s.headCommit}`
-        : `declared ${declared.length} files / ${s.linesChanged} lines, git diff has ${change.files.length} files / ${change.linesChanged} lines` +
-          ` (${diffList(declared, change.files)})`,
-    });
-    runGate(run, "specSeparation", () =>
-      (io.load("gates/specSeparation") as SpecSeparationApi).checkSpecSeparation(st, submissionId),
-    );
-    return { ...run, change };
-  } finally {
+    file = patchFile(patchesDir, s.id);
+  } catch {
+    return { error: `submission id ${JSON.stringify(s.id)} cannot have a patch file` };
+  }
+  if (!fs.existsSync(file)) return null;
+  const bytes = fs.readFileSync(file);
+  const patchSha256 = sha256hex(bytes);
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(bytes)) return { error: "the patch is not valid UTF-8" };
+  const base = pinProblem(defaultGit, repo, "baseCommit", s.baseCommit);
+  if (base !== null) return { error: base };
+  let patches;
+  try {
+    patches = parsePatch(text);
+  } catch (e) {
+    return { error: `the patch does not parse: ${(e as Error).message}` };
+  }
+  const tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "commons-bind-"));
+  const env = { GIT_INDEX_FILE: path.join(tmp, "index") };
+  const g = (args: string[], input?: string) => rawGit(repo, args, { env, ...(input === undefined ? {} : { input }) }).toString("utf8");
+  try {
+    g(["read-tree", s.baseCommit]);
+    const at = (p: string): { mode: string; type: string; sha: string } | null => {
+      const out = g(["ls-tree", "-z", "--full-tree", s.baseCommit, "--", p]).split("\0")[0] ?? "";
+      const m = /^(\d{6}) (\w+) ([0-9a-f]+)\t/.exec(out);
+      return m ? { mode: m[1] as string, type: m[2] as string, sha: m[3] as string } : null;
+    };
+    const textAt = (p: string, expectMode?: string): { mode: string; sha: string; text: string } => {
+      const e = at(p);
+      if (e === null) throw new Error(`${p}: does not exist at the base commit`);
+      if (e.type !== "blob" || e.mode === "120000" || !["100644", "100755"].includes(e.mode)) throw new Error(`${p}: is not a regular file at the base commit`);
+      if (expectMode !== undefined && expectMode !== e.mode) throw new Error(`${p}: mode is ${e.mode}, the patch says ${expectMode}`);
+      const raw = rawGit(repo, ["cat-file", "blob", e.sha]);
+      if (raw.includes(0)) throw new Error(`${p}: is a binary file`);
+      const t = raw.toString("utf8");
+      if (!Buffer.from(t, "utf8").equals(raw)) throw new Error(`${p}: is not valid UTF-8`);
+      return { mode: e.mode, sha: e.sha, text: t };
+    };
+    const absent = (p: string) => {
+      if (at(p) !== null) throw new Error(`${p}: already exists at the base commit`);
+    };
+    const apply = (original: string, hunks: string[]) => (hunks.length === 0 ? original : applyUnifiedDiff(original, `${hunks.join("\n")}\n`));
+    const put = (mode: string, p: string, content: string) => {
+      const sha = g(["hash-object", "-w", "--stdin"], content).trim();
+      g(["update-index", "--add", "--cacheinfo", `${mode},${sha},${p}`]);
+    };
+    const remove = (p: string) => g(["update-index", "--force-remove", "--", p]);
     try {
-      io.git(repo, ["worktree", "remove", "--force", work]);
-    } catch {
-      // the directory is removed below; `git worktree prune` cleans the record
+      for (const p of patches) {
+        for (const touched of p.kind === "add" ? [p.newPath] : p.kind === "delete" ? [p.oldPath] : [p.oldPath, p.newPath]) {
+          if (/^\.github(\/|$)/i.test(touched)) throw new Error(`${touched}: changes under .github/ need explicit approval`);
+        }
+        if (p.kind === "add") {
+          absent(p.newPath);
+          put(p.newMode, p.newPath, apply("", p.hunks));
+        } else if (p.kind === "delete") {
+          const old = textAt(p.oldPath, p.oldMode);
+          if (apply(old.text, p.hunks) !== "") throw new Error(`${p.oldPath}: deletion does not remove the whole file`);
+          remove(p.oldPath);
+        } else {
+          const old = textAt(p.oldPath, p.oldMode);
+          if (p.kind !== "modify") absent(p.newPath);
+          if (p.kind === "rename") remove(p.oldPath);
+          put(p.newMode ?? old.mode, p.newPath, apply(old.text, p.hunks));
+        }
+      }
+    } catch (e) {
+      return { error: `the patch does not apply to ${s.baseCommit}: ${(e as Error).message}` };
     }
+    const tree = g(["write-tree"]).trim();
+    if (tree === g(["rev-parse", `${s.baseCommit}^{tree}`]).trim()) return { error: "the patch changes nothing" };
+    if (pinProblem(defaultGit, repo, "headCommit", s.headCommit) === null) {
+      const declared = g(["rev-parse", `${s.headCommit}^{tree}`]).trim();
+      if (declared !== tree) return { error: `the patch produces tree ${tree}, but the declared headCommit ${s.headCommit} has tree ${declared}` };
+    }
+    // Deterministic, so binding the same patch twice gives the same commit.
+    const id = { GIT_AUTHOR_NAME: "commons", GIT_AUTHOR_EMAIL: "commons@invalid", GIT_COMMITTER_NAME: "commons", GIT_COMMITTER_EMAIL: "commons@invalid" };
+    const date = `${Math.floor(Date.parse(s.submittedAt) / 1000)} +0000`;
+    const head = rawGit(repo, ["commit-tree", tree, "-p", s.baseCommit], {
+      env: { ...id, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
+      input: `commons submission ${s.id}\n\nCommons-Submission: ${s.id}\nCommons-Patch-Sha256: ${patchSha256}\n`,
+    })
+      .toString("utf8")
+      .trim();
+    rawGit(repo, ["update-ref", `refs/commons/${s.id}`, head]);
+    return { head, patchSha256 };
+  } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Ledger-mode gates
+// ---------------------------------------------------------------------------
+
+// The gates for a ledger submission at `s.headCommit` (the caller passes the
+// bound head, see bindPatchLocal). The declared changedFiles/linesChanged are
+// what the ledger and the other gates trust, so they are checked against git
+// first (ledger.ts leaves that to the coordinator): a submission that
+// misstates its change, or moves a submodule pointer that cannot be expanded,
+// fails declaredChange.
+export function submissionGates(io: Io, st: CommonsState, s: SubmissionState, repo: string, dependencyTrack = false): GateRun & { change: Change | null } {
+  const pins = [pinProblem(io.git, repo, "baseCommit", s.baseCommit), pinProblem(io.git, repo, "headCommit", s.headCommit)].filter((x) => x !== null);
+  if (pins.length > 0) {
+    return { ring: null, reports: [{ gate: "declaredChange", pass: false, details: pins.join("; ") }], harness: [], notes: [], change: null };
+  }
+  const change = diffTrees(io.git, repo, s.baseCommit, s.headCommit, 0);
+  const run = staticGates(io, repo, s.headCommit, change, st.rules, dependencyTrack, (dir, r) => {
+    r.reports.push(attempt(r, "specSeparation", () => (io.load("gates/specSeparation") as SpecSeparationApi).checkSpecSeparation(st, s.id, dir)));
+  });
+  // A submission must not touch a lower ring than its task was priced at.
+  const task = attempt(run, "rings", () => (io.load("gates") as GatesIndexApi).checkTaskRing(st, s.id) ?? { gate: "rings", pass: true, details: "" });
+  const rings = run.reports.find((r) => r.gate === "rings");
+  if (rings && !task.pass) {
+    rings.pass = false;
+    rings.details = rings.details === "" ? task.details : `${task.details}; ${rings.details}`;
+  }
+  const declared = [...new Set(s.changedFiles)].sort();
+  const why: string[] = [];
+  if (declared.join("\n") !== change.files.join("\n") || s.linesChanged !== change.linesChanged) {
+    why.push(
+      `declared ${declared.length} files / ${s.linesChanged} lines, git diff has ${change.files.length} files / ${change.linesChanged} lines` +
+        ` (${diffList(declared, change.files)})`,
+    );
+  }
+  if (change.unexpanded.length > 0) {
+    why.push(`submodule pointers that cannot be expanded, so their content cannot be gated: ${change.unexpanded.map((u) => `${u.path} (${u.reason})`).join(", ")}`);
+  }
+  run.reports.unshift({
+    gate: "declaredChange",
+    pass: why.length === 0,
+    details: why.length === 0 ? `changedFiles and linesChanged match git diff ${s.baseCommit}..${s.headCommit}` : why.join("; "),
+  });
+  if (!run.reports.some((r) => r.gate === "specSeparation")) {
+    // the head was not materialised (size failed or rings could not run)
+    run.reports.push(attempt(run, "specSeparation", () => (io.load("gates/specSeparation") as SpecSeparationApi).checkSpecSeparation(st, s.id)));
+  }
+  return { ...run, change };
 }
 
 function diffList(declared: string[], actual: string[]): string {
@@ -695,21 +1087,52 @@ function diffList(declared: string[], actual: string[]): string {
   return [...extra, ...missing].slice(0, 10).join(", ") || "line count differs";
 }
 
+// The head the gates judge for a ledger submission: its recorded binding, or
+// one computed now from the stored patch. Without a patch, the declared head
+// (a dry run that may not be recorded: nothing ties it to what gets merged).
+function gatedHead(
+  ctx: Ctx,
+  st: CommonsState,
+  s: SubmissionState,
+  repo: string,
+): { head: string; bind: GateReport | null; note: string } | { failed: GateReport } {
+  const recorded = s.gates.find((g) => g.gate === BINDING_GATE);
+  if (recorded && !recorded.pass) return { failed: { gate: BINDING_GATE, pass: false, details: recorded.details } };
+  const bound = patchBinding(s);
+  if (bound) return { head: bound.head, bind: null, note: `gating the bound head ${bound.head} (patch ${bound.patchSha256.slice(0, 16)})` };
+  void st;
+  const b = bindPatchLocal(repo, patchesDir(ctx), s);
+  if (b === null) return { head: s.headCommit, bind: null, note: `no stored patch: gating the declared headCommit ${s.headCommit}, which is not what would be merged` };
+  if ("error" in b) return { failed: { gate: BINDING_GATE, pass: false, details: b.error } };
+  return { head: b.head, bind: { gate: BINDING_GATE, pass: true, details: bindingDetails(b) }, note: `gating ${b.head}, built from the stored patch (${b.patchSha256.slice(0, 16)})` };
+}
+
 async function gatesSubmission(ctx: Ctx): Promise<number> {
   const f = ctx.flags;
   const sid = req(f, "submission");
   const repo = resolvePath(ctx, req(f, "repo"));
   const st = state(ctx);
-  const run = submissionGates(ctx.io, st, sid, repo, bool(f, "dependency-track"));
+  const s = st.submissions.get(sid) ?? usage(`no submission ${sid}`);
+  const g = gatedHead(ctx, st, s, repo);
+  let run: GateRun & { change: Change | null };
+  if ("failed" in g) run = { ring: null, reports: [g.failed], harness: [], notes: [], change: null };
+  else {
+    run = submissionGates(ctx.io, st, { ...s, headCommit: g.head }, repo, bool(f, "dependency-track"));
+    run.notes.unshift(g.note);
+    if (g.bind) run.reports.unshift(g.bind);
+  }
   let recorded = "";
   if (bool(f, "record")) {
     if (run.harness.length > 0) usage("not recording: some gates could not run");
+    if (!("failed" in g) && g.bind === null && patchBinding(s) === null) {
+      usage("not recording: there is no stored patch, so the gates did not judge what would be merged");
+    }
     const signer = signerKey(ctx);
-    const done = new Set(st.submissions.get(sid)?.gates.map((g) => g.gate));
+    const done = new Set(s.gates.map((x) => x.gate));
     let n = 0;
     for (const r of run.reports) {
       if (done.has(r.gate)) continue;
-      appendLocal(ctx, { kind: "gateResult", submissionId: sid, gate: r.gate, pass: r.pass, details: r.details }, signer);
+      appendLocal(ctx, { kind: "gateResult", submissionId: sid, gate: r.gate, pass: r.pass, details: printable(r.details) }, signer);
       n++;
     }
     recorded = `recorded ${n} gate results`;

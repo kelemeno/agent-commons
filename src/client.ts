@@ -400,7 +400,7 @@ export class CommonsClient {
   // `stake` must be at least the server's claimStake for the task (it says
   // which on a 400 "stake"). `until` is normalised to the toISOString() form,
   // the only one the ledger accepts.
-  claim(taskId: string, c: { until: string | Date; stake: number }): Promise<Posted> {
+  async claim(taskId: string, c: { until: string | Date; stake: number }): Promise<Posted> {
     const d = typeof c.until === "string" ? new Date(c.until) : c.until;
     if (Number.isNaN(d.getTime())) throw new TypeError(`claim: until ${JSON.stringify(String(c.until))} is not a date`);
     this.checkStake(c.stake, "claim");

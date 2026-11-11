@@ -5,6 +5,7 @@ import { applyEntry, emptyState, genesisEntry, signEntry, type LedgerState, type
 import { claimStake as rulesClaimStake, defaultRules } from "../src/rules";
 import { treeFromParents } from "../src/tree";
 import {
+  apportion,
   claimStake,
   duplicateShares,
   prSlots,
@@ -131,12 +132,16 @@ class World {
 
   // Commits close once any verdict is revealed, so commit everyone first.
   reviews(sid: string, ps: Record<string, number>): void {
-    for (const [agent, p] of Object.entries(ps)) {
-      this.apply({ kind: "reviewCommit", submissionId: sid, commitment: sha256hex(canonical(verdictOf(p)) + `salt-${agent}`), stake: 5 }, this.key(agent));
-    }
-    for (const [agent, p] of Object.entries(ps)) {
-      this.apply({ kind: "reviewReveal", submissionId: sid, verdict: verdictOf(p), salt: `salt-${agent}` }, this.key(agent));
-    }
+    for (const [agent, p] of Object.entries(ps)) this.commit(sid, agent, p);
+    for (const [agent, p] of Object.entries(ps)) this.reveal(sid, agent, p);
+  }
+
+  commit(sid: string, agent: string, p: number): void {
+    this.apply({ kind: "reviewCommit", submissionId: sid, commitment: sha256hex(canonical(verdictOf(p)) + `salt-${agent}`), stake: 5 }, this.key(agent));
+  }
+
+  reveal(sid: string, agent: string, p: number): void {
+    this.apply({ kind: "reviewReveal", submissionId: sid, verdict: verdictOf(p), salt: `salt-${agent}` }, this.key(agent));
   }
 
   attest(snapshotId: string, ps: Record<string, number>): void {
@@ -216,6 +221,11 @@ function reviewedSubmission(ps: Record<string, number> = { b1: 0.1, c1: 0.2, d1:
   return w;
 }
 
+const get = (bodies: SettlementBody[], owner: string, reason: string) =>
+  bodies.find((b) => b.owner === owner && b.reason === reason)?.delta;
+const total = (bodies: SettlementBody[], reason: string) =>
+  bodies.filter((b) => b.reason === reason).reduce((a, b) => a + b.delta, 0);
+
 // ---------------------------------------------------------------------------
 // Volume limits and shares
 // ---------------------------------------------------------------------------
@@ -256,6 +266,23 @@ test("duplicateShares: normalised decaying weights in filing order", () => {
   assert.throws(() => duplicateShares(2, 1.1), RangeError);
 });
 
+test("apportion: integer parts that sum exactly to the total (rounding each share can overpay)", () => {
+  assert.deepEqual(apportion(15, duplicateShares(2, 1)), [8, 7]); // not 8 + 8
+  assert.deepEqual(apportion(10, [1, 1, 1]), [4, 3, 3]);
+  assert.deepEqual(apportion(0, [1, 2]), [0, 0]);
+  assert.deepEqual(apportion(5, []), []);
+  assert.deepEqual(apportion(5, [0, 0]), [0, 0]);
+  for (const decay of [1, 0.9]) {
+    for (const t of [1, 5, 15, 40, 100]) {
+      for (let n = 1; n <= 7; n++) {
+        const parts = apportion(t, duplicateShares(n, decay));
+        assert.equal(parts.reduce((a, b) => a + b, 0), t, `t=${t} n=${n} decay=${decay}`);
+        assert.ok(parts.every((x, i) => Number.isInteger(x) && x >= 0 && (i === 0 || x <= (parts[i - 1] as number))));
+      }
+    }
+  }
+});
+
 test("submitCredits: one starter credit, one per two revealed reviews, minus submissions, across an owner's agents", () => {
   const w = new World();
   assert.equal(submitCredits(w.state, "alice"), 1);
@@ -268,37 +295,76 @@ test("submitCredits: one starter credit, one per two revealed reviews, minus sub
   w.reviews("s1", { b1: 0.1 });
   assert.equal(submitCredits(w.state, "bob"), 1); // one review is half a credit
   // An unrevealed commit earns nothing.
-  w.apply({ kind: "reviewCommit", submissionId: "s2", commitment: sha256hex(canonical(verdictOf(0.3)) + "x"), stake: 5 }, w.key("b1"));
+  w.commit("s2", "b1", 0.3);
   assert.equal(submitCredits(w.state, "bob"), 1);
-  w.apply({ kind: "reviewReveal", submissionId: "s2", verdict: verdictOf(0.3), salt: "x" }, w.key("b1"));
+  w.reveal("s2", "b1", 0.3);
   assert.equal(submitCredits(w.state, "bob"), 2);
   assert.equal(submitCredits(w.state, "nobody"), 1);
+});
+
+test("submitCredits: a reveal held back until after the merge earns no credit", () => {
+  const w = new World();
+  w.submit("s1");
+  w.submit("s2");
+  w.reviews("s1", { b1: 0.1 });
+  w.commit("s2", "b1", 0.1);
+  w.merge("s2");
+  w.reveal("s2", "b1", 0.1);
+  assert.equal(submitCredits(w.state, "bob"), 1, "only the in-time reveal on s1 counts: half a credit");
+  w.submit("s3");
+  w.reviews("s3", { b1: 0.1 });
+  assert.equal(submitCredits(w.state, "bob"), 2);
 });
 
 // ---------------------------------------------------------------------------
 // Findings
 // ---------------------------------------------------------------------------
 
-test("reproduced finding: stranger paid, author and approvers slashed by confidence, inviter charged", () => {
+test("reproduced finding: stranger paid, author and approvers slashed by confidence, inviter charged per invitee", () => {
   const w = reviewedSubmission({ b1: 0.1, c1: 0.2, d1: 1 });
-  w.file("f1", { submissionId: "s1" }, "medium", "e1");
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), [], "no result yet");
+  w.file("f1", { submissionId: "s1" }, "critical", "e1");
+  assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), [], "no result yet");
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "dev");
+  const bodies = settleFinding(w.state, tree, "f1", "main");
   assertWellFormed(bodies);
-  assert.ok(bodies.every((b) => b.ref === "finding:f1"));
+  // Settled at bounty.low (5) whatever severity was declared; main stage: 5 x 4 = 20.
   assert.deepEqual(
     summary(bodies),
     [
-      "alice authorSlash -15",
-      "bob approverSlash -14", // round(15 * 0.9) = 13.5 -> 14
-      "carol approverSlash -12", // round(15 * 0.8)
-      "eve bounty 15",
+      "alice authorSlash -20",
+      "bob approverSlash -18", // 20 - 20 * .1
+      "carol approverSlash -16",
+      "eve bounty 5",
       // dave said p = 1: nothing.
-      // ivy invited alice and carol: round(15 * .25) + round(12 * .25) = 4 + 3, one body.
-      "ivy inviterSlash -7",
+      "ivy inviterSlash -5", // for alice: round(20 * .25)
+      "ivy inviterSlash -4", // for carol: round(16 * .25)
     ].sort(),
   );
+  assert.deepEqual(
+    bodies.filter((b) => b.owner === "ivy").map((b) => b.ref).sort(),
+    ["finding:f1:approverSlash:carol", "finding:f1:authorSlash:alice"],
+  );
+  assert.ok(bodies.filter((b) => b.owner !== "ivy").every((b) => b.ref === "finding:f1"));
+  w.settle(bodies);
+  assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), []);
+});
+
+test("severity is the finder's claim: one bug filed at four severities pays one low bounty and slashes once", () => {
+  const w = reviewedSubmission({ b1: 0 });
+  const sev: Severity[] = ["low", "medium", "high", "critical"];
+  sev.forEach((s, i) => w.file(`f${i}`, { submissionId: "s1" }, s, "e1"));
+  sev.forEach((_, i) => w.result(`f${i}`, true));
+  const all = sev.flatMap((_, i) => settleFinding(w.state, tree, `f${i}`, "dev"));
+  assertWellFormed(all);
+  assert.equal(total(all, "bounty"), 5, "one bounty.low, split by rank");
+  assert.deepEqual(
+    all.filter((b) => b.reason !== "bounty").map((b) => `${b.owner} ${b.reason} ${b.delta} ${b.ref}`).sort(),
+    ["alice authorSlash -5 finding:f0", "bob approverSlash -5 finding:f0", "ivy inviterSlash -1 finding:f0:authorSlash:alice"],
+  );
+  w.settle(all);
+  assert.equal(w.rep("eve"), 5);
+  assert.equal(w.rep("alice"), -5);
+  assert.equal(w.rep("bob"), -5);
 });
 
 test("farming: the author's friend within minTreeDistance earns 0, the author still pays, the pair nets negative", () => {
@@ -308,10 +374,9 @@ test("farming: the author's friend within minTreeDistance earns 0, the author st
   const bodies = settleFinding(w.state, tree, "f1", "dev");
   assert.equal(tree.distance("amy", "alice"), 2);
   assert.ok(!bodies.some((b) => b.owner === "amy"), "no bounty body for amy");
-  assert.deepEqual(summary(bodies).filter((s) => s.startsWith("alice")), ["alice authorSlash -40"]);
+  assert.deepEqual(summary(bodies).filter((s) => s.startsWith("alice")), ["alice authorSlash -5"]);
   w.settle(bodies);
-  assert.ok(w.rep("alice") + w.rep("amy") < 0);
-  assert.equal(w.rep("alice") + w.rep("amy"), -40);
+  assert.equal(w.rep("alice") + w.rep("amy"), -5);
 });
 
 test("a finder who is not in the tree earns nothing: unknown distance is not distance", () => {
@@ -320,90 +385,126 @@ test("a finder who is not in the tree earns nothing: unknown distance is not dis
   w.result("f1", true);
   const bodies = settleFinding(w.state, tree, "f1", "dev");
   assert.ok(!bodies.some((b) => b.owner === "ghost"));
-  assert.ok(bodies.some((b) => b.owner === "alice" && b.reason === "authorSlash" && b.delta === -5));
+  assert.equal(get(bodies, "alice", "authorSlash"), -5);
 });
 
 test("stage multipliers raise the author and approver slash, never the bounty", () => {
   const cases: ["dev" | "release" | "main", number, number][] = [
-    ["dev", -15, -12],
-    ["release", -30, -24],
-    ["main", -60, -48],
+    ["dev", -5, -4],
+    ["release", -10, -8],
+    ["main", -20, -16],
   ];
   for (const [stage, author, approver] of cases) {
     const w = reviewedSubmission({ c1: 0.2 });
     w.file("f1", { submissionId: "s1" }, "medium", "b1");
     w.result("f1", true);
     const bodies = settleFinding(w.state, tree, "f1", stage);
-    const get = (o: string, r: string) => bodies.find((b) => b.owner === o && b.reason === r)?.delta;
-    assert.equal(get("bob", "bounty"), 15, stage);
-    assert.equal(get("alice", "authorSlash"), author, stage);
-    assert.equal(get("carol", "approverSlash"), approver, stage);
-    assert.ok(-author >= 15, "author pays at least the bounty");
+    assert.equal(get(bodies, "bob", "bounty"), 5, stage);
+    assert.equal(get(bodies, "alice", "authorSlash"), author, stage);
+    assert.equal(get(bodies, "carol", "approverSlash"), approver, stage);
   }
 });
 
-test("author slash is never less than the bounty, even with a multiplier rounded below it", () => {
-  // validateRules forbids multipliers < 1, so the floor matters only for
-  // rounding; check it holds for the smallest bounty at every stage.
+test("author slash floor: with a multiplier that rounds below the bounty, the author still pays the bounty paid", () => {
+  // validateRules forbids multipliers < 1; set one on the state directly so the floor is the deciding term.
   const w = reviewedSubmission({ b1: 0 });
+  w.state.rules.rewards.stageMultiplier.dev = 0.5; // round(5 * .5) = 3 < 5
   w.file("f1", { submissionId: "s1" }, "low", "e1");
   w.result("f1", true);
-  for (const stage of ["dev", "release", "main"] as const) {
-    const bodies = settleFinding(w.state, tree, "f1", stage);
-    const slash = -(bodies.find((b) => b.reason === "authorSlash")?.delta ?? 0);
-    const paid = bodies.filter((b) => b.reason === "bounty").reduce((a, b) => a + b.delta, 0);
-    assert.ok(slash >= paid && slash >= 5, `${stage}: ${slash} vs ${paid}`);
-  }
+  const bodies = settleFinding(w.state, tree, "f1", "dev");
+  const slash = -(get(bodies, "alice", "authorSlash") ?? 0);
+  assert.equal(total(bodies, "bounty"), 5);
+  assert.equal(slash, 5, "max(round(bounty x stage), bounty)");
+  assert.ok(slash > Math.round(5 * 0.5));
+  assert.equal(get(bodies, "bob", "approverSlash"), -3, "approvers have no floor: round(2.5)");
 });
 
-test("duplicates filed before the first result split one bounty in filing order; author slashed once", () => {
+test("duplicates filed before the first result share one bounty by rank; slashes go out with the first result", () => {
   const w = reviewedSubmission({ c1: 0.4 });
   w.file("f1", { submissionId: "s1" }, "medium", "b1");
-  w.file("f2", { submissionId: "s1" }, "medium", "e1");
+  w.file("f2", { submissionId: "s1" }, "high", "e1"); // a different declared severity is still the same class
   w.result("f1", true);
-  // f2 is still pending: the group might still grow, so nothing settles.
-  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), []);
-  w.result("f2", true);
+  // f2 has no result yet. f1's share and the slashes do not wait for it.
   const b1 = settleFinding(w.state, tree, "f1", "dev");
-  const b2 = settleFinding(w.state, tree, "f2", "dev");
-  assertWellFormed([...b1, ...b2]);
-  // shares 1/1.9 and 0.9/1.9 of 15: 7.89 -> 8, 7.11 -> 7
+  assertWellFormed(b1);
+  // shares of 5 by apportion([1, .9] / 1.9): 3 and 2.
   assert.deepEqual(
     summary(b1),
-    ["alice authorSlash -15", "bob bounty 8", "carol approverSlash -9", "ivy inviterSlash -6"].sort(),
+    ["alice authorSlash -5", "bob bounty 3", "carol approverSlash -3", "ivy inviterSlash -1", "ivy inviterSlash -1"].sort(),
   );
-  assert.deepEqual(summary(b2), ["eve bounty 7"], "only the first finding carries the slashes");
+  assert.deepEqual(settleFinding(w.state, tree, "f2", "dev"), [], "no result yet");
+  w.settle(b1);
+  w.result("f2", true);
+  const b2 = settleFinding(w.state, tree, "f2", "dev");
+  assert.deepEqual(summary(b2), ["eve bounty 2"], "only the leader carries the slashes");
   assert.ok(b2.every((b) => b.ref === "finding:f2"));
+  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), [], "the leader's bodies are final");
 
   // Filed after the first result: the reproduction was public. Not paid, slashes nobody.
-  w.file("f3", { submissionId: "s1" }, "medium", "d1");
+  w.file("f3", { submissionId: "s1" }, "low", "d1");
   w.result("f3", true);
   assert.deepEqual(settleFinding(w.state, tree, "f3", "dev"), []);
 
-  // A different severity is a different bug, settled on its own.
-  w.file("f4", { submissionId: "s1" }, "low", "d1");
-  w.result("f4", true);
-  const b4 = settleFinding(w.state, tree, "f4", "dev");
-  assert.ok(b4.some((b) => b.owner === "dave" && b.reason === "bounty" && b.delta === 5));
-  assert.ok(b4.some((b) => b.owner === "alice" && b.reason === "authorSlash" && b.delta === -5));
-
-  w.settle([...b1, ...b2, ...b4]);
-  for (const f of ["f1", "f2", "f3", "f4"]) assert.deepEqual(settleFinding(w.state, tree, f, "dev"), [], f);
+  w.settle(b2);
+  for (const f of ["f1", "f2", "f3"]) assert.deepEqual(settleFinding(w.state, tree, f, "dev"), [], f);
+  assert.equal(w.rep("bob") + w.rep("eve"), 5);
 });
 
-test("a not-reproduced earlier finding does not join or block the group", () => {
+test("a duplicate that never gets a result does not freeze the settlement; the author is still slashed", () => {
+  // amy (alice's friend) files first on the merged s1 and never uploads her test.
+  const w = reviewedSubmission({ b1: 0.1 });
+  w.merge("s1");
+  w.file("f1", { submissionId: "s1" }, "critical", "m1");
+  w.file("f2", { submissionId: "s1" }, "critical", "e1");
+  w.result("f2", true);
+  const bodies = settleFinding(w.state, tree, "f2", "dev");
+  assertWellFormed(bodies);
+  assert.equal(get(bodies, "alice", "authorSlash"), -5);
+  assert.equal(get(bodies, "bob", "approverSlash"), -5); // round(4.5)
+  // amy's pending filing holds rank 0 and dilutes eve's share; it never earns.
+  assert.equal(get(bodies, "eve", "bounty"), 2);
+  assert.ok(!bodies.some((b) => b.owner === "amy"));
+});
+
+test("an earlier finding already resolved false is not a duplicate; one resolved later keeps its unpaid rank", () => {
   const w = reviewedSubmission({ c1: 0.4 });
   w.file("f0", { submissionId: "s1" }, "medium", "d1");
   w.file("f1", { submissionId: "s1" }, "medium", "b1");
   w.result("f0", false);
   w.result("f1", true);
-  const bodies = settleFinding(w.state, tree, "f1", "dev");
-  assert.equal(bodies.find((b) => b.owner === "bob")?.delta, 15);
+  assert.equal(get(settleFinding(w.state, tree, "f1", "dev"), "bob", "bounty"), 5);
   assert.deepEqual(summary(settleFalseFinding(w.state, "f0")), ["dave falseFinding -5"]);
+
+  const v = reviewedSubmission({ c1: 0.4 });
+  v.file("f0", { submissionId: "s1" }, "medium", "d1");
+  v.file("f1", { submissionId: "s1" }, "medium", "b1");
+  v.result("f1", true);
+  v.result("f0", false); // known only after the class formed: its share stays unpaid
+  assert.equal(get(settleFinding(v.state, tree, "f1", "dev"), "bob", "bounty"), 2);
+});
+
+test("duplicate shares never sum past the bounty, at decay 1 and 0.9, for 2 to 5 finders", () => {
+  const finders = ["b1", "c1", "d1", "e1", "e2"];
+  for (const decay of [1, 0.9]) {
+    for (let n = 2; n <= 5; n++) {
+      const rules = defaultRules();
+      rules.rewards.duplicateDecay = decay;
+      rules.rewards.bounty.low = 15; // odd, so equal halves would round up
+      const w = new World(rules);
+      w.apply({ kind: "agentRegistered", owner: "eve", publicKey: w.key("e2").publicKey, modelFamily: "glm", harness: "cli" }, w.key("eve"));
+      w.submit("s1");
+      for (let i = 0; i < n; i++) w.file(`f${i}`, { submissionId: "s1" }, "low", finders[i] as string);
+      for (let i = 0; i < n; i++) w.result(`f${i}`, true);
+      const all = Array.from({ length: n }, (_, i) => settleFinding(w.state, tree, `f${i}`, "dev")).flat();
+      assertWellFormed(all);
+      assert.equal(total(all, "bounty"), 15, `decay ${decay} n ${n}`);
+      assert.equal(get(all, "alice", "authorSlash"), -15);
+      w.settle(all);
+    }
+  }
 });
 
 test("same-owner duplicates cannot farm: two agents' shares sum to one bounty", () => {
-  // eve's single finding would earn 15. Two from her own agents earn 8 + 7.
   const w = new World();
   w.apply({ kind: "agentRegistered", owner: "eve", publicKey: w.key("e2").publicKey, modelFamily: "glm", harness: "cli" }, w.key("eve"));
   w.submit("s1");
@@ -413,10 +514,46 @@ test("same-owner duplicates cannot farm: two agents' shares sum to one bounty", 
   w.result("f2", true);
   const all = [...settleFinding(w.state, tree, "f1", "dev"), ...settleFinding(w.state, tree, "f2", "dev")];
   w.settle(all);
-  assert.equal(w.rep("eve"), 15);
+  assert.equal(w.rep("eve"), 5);
 });
 
-test("snapshot finding: author slash split across covered submissions, remainder first; attesters are approvers", () => {
+test("unrevealed or late reviews count as p = 0 once the submission merged", () => {
+  const w = new World();
+  w.submit("s1");
+  w.assign("s1", ["b1", "c1", "d1"]);
+  w.commit("s1", "b1", 0.5);
+  w.commit("s1", "c1", 0); // never revealed
+  w.commit("s1", "d1", 0.9); // revealed only after the merge
+  w.reveal("s1", "b1", 0.5);
+  w.merge("s1");
+  w.reveal("s1", "d1", 0.9);
+  w.file("f1", { submissionId: "s1" }, "low", "e1");
+  w.result("f1", true);
+  const bodies = settleFinding(w.state, tree, "f1", "dev");
+  assertWellFormed(bodies);
+  assert.equal(get(bodies, "bob", "approverSlash"), -3); // round(5 - 2.5)
+  assert.equal(get(bodies, "carol", "approverSlash"), -5, "withheld reveal");
+  assert.equal(get(bodies, "dave", "approverSlash"), -5, "a reveal after the merge could have seen the outcome");
+});
+
+test("before merge, an unrevealed approver is settled when it reveals", () => {
+  const w = new World();
+  w.submit("s1");
+  w.assign("s1", ["b1", "c1"]);
+  w.commit("s1", "b1", 0.2);
+  w.commit("s1", "c1", 0.6);
+  w.reveal("s1", "b1", 0.2);
+  w.file("f1", { submissionId: "s1" }, "low", "e1");
+  w.result("f1", true);
+  const first = settleFinding(w.state, tree, "f1", "dev");
+  assert.equal(get(first, "bob", "approverSlash"), -4);
+  assert.equal(get(first, "carol", "approverSlash"), undefined);
+  w.settle(first);
+  w.reveal("s1", "c1", 0.6);
+  assert.deepEqual(summary(settleFinding(w.state, tree, "f1", "dev")), ["carol approverSlash -2", "ivy inviterSlash -1"].sort());
+});
+
+test("snapshot finding: author slash split across covered submissions, bounty capped at the smallest part; attesters are approvers", () => {
   const w = new World();
   w.submit("s1", "a1");
   w.submit("s2", "a2");
@@ -430,19 +567,43 @@ test("snapshot finding: author slash split across covered submissions, remainder
   const bodies = settleFinding(w.state, tree, "f1", "release");
   assertWellFormed(bodies);
   // slash = 5 * 2 = 10 over [s2, s3, s1] -> 4, 3, 3: alice (s2, s1) 7, bob (s3) 3.
-  // dave attested p = .5: round(10 * .5) = 5; eve p = 0: 10.
-  // ivy: round(7 * .25) = 2 for alice.
+  // pool = min(5, 3) = 3. dave attested p = .5: 10 - 5; eve p = 0: 10.
   assert.deepEqual(
     summary(bodies),
     [
       "alice authorSlash -7",
       "bob authorSlash -3",
-      "carol bounty 5",
+      "carol bounty 3",
       "dave approverSlash -5",
       "eve approverSlash -10",
-      "ivy inviterSlash -2",
+      "ivy inviterSlash -2", // round(7 * .25)
     ].sort(),
   );
+});
+
+test("snapshot finding: a buggy author and a distant friend cannot net positive, whatever the split order", () => {
+  // alice's bug ships in x1 with bob's and dave's work; eve files it against the
+  // snapshot at every severity instead of naming alice's submission.
+  for (const order of [
+    ["s1", "s2", "s3"],
+    ["s2", "s3", "s1"],
+  ]) {
+    const w = new World();
+    w.submit("s1", "a1");
+    w.submit("s2", "b1");
+    w.submit("s3", "d1");
+    for (const s of ["s1", "s2", "s3"]) w.merge(s);
+    w.snapshot("x1", order);
+    const sev: Severity[] = ["low", "medium", "high", "critical"];
+    sev.forEach((s, i) => w.file(`f${i}`, { snapshotId: "x1" }, s, "e1"));
+    sev.forEach((_, i) => w.result(`f${i}`, true));
+    const all = sev.flatMap((_, i) => settleFinding(w.state, tree, `f${i}`, "release"));
+    assertWellFormed(all);
+    w.settle(all);
+    assert.ok(w.rep("alice") + w.rep("eve") <= 0, `pair ${w.rep("alice") + w.rep("eve")} (${order.join(",")})`);
+    assert.ok(w.rep("alice") + w.rep("eve") + w.rep("ivy") < 0);
+    assert.equal(w.rep("eve"), 3, "capped at the smallest author part, floor(10 / 3)");
+  }
 });
 
 test("a snapshot finder within distance of any covered author earns nothing", () => {
@@ -456,18 +617,70 @@ test("a snapshot finder within distance of any covered author earns nothing", ()
   w.result("f1", true);
   const bodies = settleFinding(w.state, tree, "f1", "release");
   assert.ok(!bodies.some((b) => b.reason === "bounty"));
-  assert.equal(bodies.filter((b) => b.reason === "authorSlash").reduce((a, b) => a + b.delta, 0), -30);
+  assert.equal(total(bodies, "authorSlash"), -10);
 });
 
-test("findings on a revealed plant settle nothing: no bounty after the reveal, no custodian slash", () => {
+test("one bug filed against a submission and the snapshot that ships it is paid and slashed once", () => {
+  const w = new World();
+  w.submit("s1");
+  w.merge("s1");
+  w.snapshot("x1", ["s1"]);
+  w.file("f1", { submissionId: "s1" }, "high", "e1");
+  w.file("f2", { snapshotId: "x1" }, "high", "e1");
+  w.result("f2", true);
+  w.result("f1", true);
+  const all = [...settleFinding(w.state, tree, "f1", "release"), ...settleFinding(w.state, tree, "f2", "release")];
+  assertWellFormed(all);
+  assert.deepEqual(settleFinding(w.state, tree, "f2", "release"), [], "the submission finding names the culprit and wins");
+  w.settle(all);
+  assert.equal(w.rep("eve"), 5);
+  assert.equal(w.rep("alice"), -10);
+
+  // Overlapping snapshots: the earlier filing wins.
+  const v = new World();
+  v.submit("s1");
+  v.submit("s2", "b1");
+  v.merge("s1");
+  v.merge("s2");
+  v.snapshot("x1", ["s1"]);
+  v.snapshot("x2", ["s2"], "x1"); // covers s1 too
+  v.file("g1", { snapshotId: "x1" }, "low", "e1");
+  v.file("g2", { snapshotId: "x2" }, "low", "c1");
+  v.result("g1", true);
+  v.result("g2", true);
+  assert.ok(settleFinding(v.state, tree, "g1", "release").length > 0);
+  assert.deepEqual(settleFinding(v.state, tree, "g2", "release"), []);
+});
+
+test("plant: a finding filed after the review window closed settles nothing", () => {
   const w = new World();
   w.plantCommit("p1");
   w.submit("p1");
-  w.reviews("p1", { b1: 0.1 });
+  w.assign("p1", ["b1", "c1"]);
+  w.reviews("p1", { b1: 0.1, c1: 0.2 }); // the last assigned reveal closes the window
   w.plantReveal("p1");
   w.file("f1", { submissionId: "p1" }, "medium", "e1"); // written from the published description
   w.result("f1", true);
   assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), []);
+});
+
+test("plant: a blind finding settles as real work, custodian included, the same before and after the reveal", () => {
+  const w = new World();
+  w.plantCommit("p1");
+  w.submit("p1"); // alice's agent is the custodian
+  w.assign("p1", ["b1", "c1"]);
+  w.commit("p1", "b1", 0.1);
+  w.commit("p1", "c1", 0.2);
+  w.file("f1", { submissionId: "p1" }, "medium", "e1"); // before the window closes
+  w.reveal("p1", "b1", 0.1);
+  w.reveal("p1", "c1", 0.2);
+  w.result("f1", true);
+  const before = settleFinding(w.state, tree, "f1", "dev");
+  assertWellFormed(before);
+  assert.equal(get(before, "eve", "bounty"), 5);
+  assert.equal(get(before, "alice", "authorSlash"), -5, "the custodian pays, or it could feed its plants to a friend");
+  w.plantReveal("p1");
+  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), before);
 });
 
 test("false finding: finder pays the penalty, inviter pays a share; reproduced findings are not false", () => {
@@ -477,6 +690,7 @@ test("false finding: finder pays the penalty, inviter pays a share; reproduced f
   w.result("f1", false);
   const bodies = settleFalseFinding(w.state, "f1");
   assert.deepEqual(summary(bodies), ["carol falseFinding -5", "ivy inviterSlash -1"].sort());
+  assert.equal(bodies.find((b) => b.owner === "ivy")?.ref, "finding:f1:falseFinding:carol");
   assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), []);
   w.settle(bodies);
   assert.deepEqual(settleFalseFinding(w.state, "f1"), []);
@@ -492,7 +706,7 @@ test("idempotency: once applied to the ledger, every settlement returns []", () 
   w.file("f1", { submissionId: "s1" }, "critical", "e1");
   w.result("f1", true);
   const first = settleFinding(w.state, tree, "f1", "main");
-  assert.ok(first.length > 0);
+  assert.ok(first.length > 2);
   assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), first, "pure: same answer before applying");
   // Partial application (a crash mid-batch) leaves only the rest outstanding.
   w.settle(first.slice(0, 2));
@@ -501,8 +715,8 @@ test("idempotency: once applied to the ledger, every settlement returns []", () 
   assert.deepEqual(settleFinding(w.state, tree, "f1", "main"), []);
   // A different stage asked later does not re-slash: the key is owner + reason + ref.
   assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), []);
-  assert.equal(w.rep("eve"), 100);
-  assert.equal(w.rep("alice"), -400);
+  assert.equal(w.rep("eve"), 5);
+  assert.equal(w.rep("alice"), -20);
 });
 
 // ---------------------------------------------------------------------------
@@ -524,50 +738,50 @@ function taskWorld(proposer: string): World {
 
 test("merge tranche 1: author vests round(merge/3) minus the proposer's cut", () => {
   const w = taskWorld("b1");
-  assert.deepEqual(settleMerge(w.state, "s1", 1), [], "not merged");
+  assert.deepEqual(settleMerge(w.state, "s1", 1, w.now()), [], "not merged");
   w.merge("s1");
-  const bodies = settleMerge(w.state, "s1", 1);
+  const bodies = settleMerge(w.state, "s1", 1, w.now());
   assert.deepEqual(summary(bodies), ["alice mergeVest 9", "bob proposerCut 1"].sort());
   assert.ok(bodies.every((b) => b.ref === "merge:s1:1"));
   w.settle(bodies);
-  assert.deepEqual(settleMerge(w.state, "s1", 1), []);
+  assert.deepEqual(settleMerge(w.state, "s1", 1, w.now()), []);
 });
 
 test("proposer cut goes to an owner who signed the proposal with the owner key; none to yourself", () => {
   const byOwner = taskWorld("carol");
   byOwner.merge("s1");
-  assert.deepEqual(summary(settleMerge(byOwner.state, "s1", 1)), ["alice mergeVest 9", "carol proposerCut 1"].sort());
+  assert.deepEqual(summary(settleMerge(byOwner.state, "s1", 1, byOwner.now())), ["alice mergeVest 9", "carol proposerCut 1"].sort());
 
   const self = taskWorld("a2");
   self.merge("s1");
-  assert.deepEqual(summary(settleMerge(self.state, "s1", 1)), ["alice mergeVest 10"]);
+  assert.deepEqual(summary(settleMerge(self.state, "s1", 1, self.now())), ["alice mergeVest 10"]);
 
   const none = new World();
   none.submit("s1");
   none.merge("s1");
-  assert.deepEqual(summary(settleMerge(none.state, "s1", 1)), ["alice mergeVest 10"]);
+  assert.deepEqual(summary(settleMerge(none.state, "s1", 1, none.now())), ["alice mergeVest 10"]);
 });
 
-test("merge tranches 2 and 3 wait for promotion and the tail; nowIso or the ledger head decides tranche 3", () => {
+test("merge tranches 2 and 3 wait for promotion and the tail; tranche 3 needs a valid nowIso", () => {
   const w = taskWorld("b1");
   w.merge("s1");
-  assert.deepEqual(settleMerge(w.state, "s1", 2), []);
+  assert.deepEqual(settleMerge(w.state, "s1", 2, w.now()), []);
   w.snapshot("snap", ["s1"]);
-  assert.deepEqual(settleMerge(w.state, "s1", 2), [], "snapshotted but not promoted");
+  assert.deepEqual(settleMerge(w.state, "s1", 2, w.now()), [], "snapshotted but not promoted");
   w.promote("snap");
   const promotedAt = w.now();
-  assert.deepEqual(summary(settleMerge(w.state, "s1", 2)), ["alice mergeVest 9", "bob proposerCut 1"].sort());
-  assert.ok(settleMerge(w.state, "s1", 2).every((b) => b.ref === "merge:s1:2"));
+  assert.deepEqual(summary(settleMerge(w.state, "s1", 2, w.now())), ["alice mergeVest 9", "bob proposerCut 1"].sort());
+  assert.ok(settleMerge(w.state, "s1", 2, w.now()).every((b) => b.ref === "merge:s1:2"));
 
   const tailEnd = new Date(Date.parse(promotedAt) + 30 * 86_400_000);
   assert.deepEqual(settleMerge(w.state, "s1", 3, new Date(tailEnd.getTime() - 1).toISOString()), []);
-  assert.equal(settleMerge(w.state, "s1", 3, tailEnd.toISOString()).length, 2);
-  // Without nowIso the ledger's own latest time is used: still inside the tail.
-  assert.deepEqual(settleMerge(w.state, "s1", 3), []);
-  w.advanceDays(31);
-  w.apply({ kind: "gateResult", submissionId: "s1", gate: "tick", pass: true, details: "" }, w.coord);
-  assert.equal(settleMerge(w.state, "s1", 3).length, 2);
-  assert.throws(() => settleMerge(w.state, "s1", 4 as 3), RangeError);
+  const t3 = settleMerge(w.state, "s1", 3, tailEnd.toISOString());
+  assert.equal(t3.length, 2);
+  assert.ok(t3.every((b) => b.ref === "merge:s1:3"));
+  // No silent fallback to the ledger head: a missing or zone-less time is an error.
+  assert.throws(() => settleMerge(w.state, "s1", 3, undefined as unknown as string), RangeError);
+  assert.throws(() => settleMerge(w.state, "s1", 3, "2026-03-01T00:00:00"), RangeError);
+  assert.throws(() => settleMerge(w.state, "s1", 4 as 3, w.now()), RangeError);
 });
 
 test("a snapshot shipped by a later promotion vests tranche 2", () => {
@@ -579,30 +793,54 @@ test("a snapshot shipped by a later promotion vests tranche 2", () => {
   w.snapshot("A", ["s1"]);
   w.snapshot("B", ["s2"], "A");
   w.promote("B");
-  assert.deepEqual(summary(settleMerge(w.state, "s1", 2)), ["alice mergeVest 10"]);
+  assert.deepEqual(summary(settleMerge(w.state, "s1", 2, w.now())), ["alice mergeVest 10"]);
 });
 
 test("a reproduced finding on a merged submission forfeits its unpaid tranches 2 and 3", () => {
   const w = new World();
   w.submit("s1");
   w.merge("s1");
-  w.settle(settleMerge(w.state, "s1", 1));
+  w.settle(settleMerge(w.state, "s1", 1, w.now()));
   w.snapshot("snap", ["s1"]);
   w.promote("snap");
   w.file("f1", { submissionId: "s1" }, "medium", "b1");
   w.result("f1", true);
-  assert.deepEqual(settleMerge(w.state, "s1", 2), []);
+  assert.deepEqual(settleMerge(w.state, "s1", 2, w.now()), []);
   assert.deepEqual(settleMerge(w.state, "s1", 3, iso(w.minute + 60 * DAY_MIN)), []);
   assert.equal(w.rep("alice"), 10, "tranche 1 is never clawed back");
 });
 
-test("clean reviews: after the tail, every revealed reviewer of a clean shipped submission earns cleanReview", () => {
+test("a snapshot finding names no culprit and voids no tranche (documented choice)", () => {
+  const w = new World();
+  w.submit("s1");
+  w.merge("s1");
+  w.snapshot("snap", ["s1"]);
+  w.promote("snap");
+  w.file("f1", { snapshotId: "snap" }, "critical", "e1");
+  w.result("f1", true);
+  assert.deepEqual(summary(settleMerge(w.state, "s1", 2, w.now())), ["alice mergeVest 10"]);
+  assert.equal(settleMerge(w.state, "s1", 3, iso(w.minute + 31 * DAY_MIN)).length, 1);
+});
+
+test("a plant vests nothing, even one merged before its reveal", () => {
+  const w = new World();
+  w.plantCommit("p1");
+  w.submit("p1");
+  w.merge("p1");
+  assert.equal(settleMerge(w.state, "p1", 1, w.now()).length, 1, "before the reveal it looks like real work");
+  w.plantReveal("p1");
+  w.snapshot("snap", ["p1"]);
+  w.promote("snap");
+  for (const t of [1, 2, 3] as const) assert.deepEqual(settleMerge(w.state, "p1", t, iso(w.minute + 31 * DAY_MIN)), [], `${t}`);
+});
+
+test("clean reviews: after the tail, reviewers of a clean shipped submission earn cleanReview x (1 - p^2)", () => {
   const w = new World();
   w.submit("s1");
   w.submit("s2");
-  w.reviews("s1", { b1: 0.1, c1: 0.9 });
+  w.reviews("s1", { b1: 0.1, c1: 0.6, d1: 0.9, e1: 1 });
   // s2: bob reveals, dave commits and never reveals, a finding reproduces after merge.
-  w.apply({ kind: "reviewCommit", submissionId: "s2", commitment: sha256hex(canonical(verdictOf(0.2)) + "d"), stake: 5 }, w.key("d1"));
+  w.commit("s2", "d1", 0.2);
   w.reviews("s2", { b1: 0.1 });
   w.merge("s1");
   w.merge("s2");
@@ -614,11 +852,44 @@ test("clean reviews: after the tail, every revealed reviewer of a clean shipped 
   const promoted = w.minute;
   assert.deepEqual(settleCleanReviews(w.state, "snap", iso(promoted + 29 * DAY_MIN)), [], "tail not over");
   const bodies = settleCleanReviews(w.state, "snap", iso(promoted + 30 * DAY_MIN));
-  assert.deepEqual(summary(bodies), ["bob cleanReview 2", "carol cleanReview 2"].sort());
+  // b1 .1: round(1.98) = 2; c1 .6: round(1.28) = 1; d1 .9: round(.38) = 0; e1 1: 0.
+  assert.deepEqual(summary(bodies), ["bob cleanReview 2", "carol cleanReview 1"].sort());
   assert.ok(bodies.every((b) => b.ref === "review:s1"));
   w.settle(bodies);
   assert.deepEqual(settleCleanReviews(w.state, "snap", iso(promoted + 31 * DAY_MIN)), []);
   assert.deepEqual(settleCleanReviews(w.state, "nope", iso(promoted + 31 * DAY_MIN)), []);
+  assert.throws(() => settleCleanReviews(w.state, "snap", undefined as unknown as string), RangeError);
+});
+
+test("clean reviews: a reveal held back until after the merge earns nothing", () => {
+  const w = new World();
+  w.submit("s1");
+  w.commit("s1", "b1", 0);
+  w.commit("s1", "c1", 0);
+  w.reveal("s1", "b1", 0);
+  w.merge("s1");
+  w.reveal("s1", "c1", 0); // waited to see the change ship
+  w.snapshot("snap", ["s1"]);
+  w.promote("snap");
+  assert.deepEqual(summary(settleCleanReviews(w.state, "snap", iso(w.minute + 31 * DAY_MIN))), ["bob cleanReview 2"]);
+});
+
+test("clean reviews: a reproduced finding on the shipping snapshot during the tail blocks them", () => {
+  const w = new World();
+  w.submit("s1");
+  w.submit("s2", "d1");
+  w.reviews("s1", { b1: 0.1 });
+  w.reviews("s2", { b1: 0.1 });
+  w.merge("s1");
+  w.merge("s2");
+  w.snapshot("A", ["s1"]);
+  w.snapshot("B", ["s2"], "A");
+  w.promote("B");
+  w.file("f1", { snapshotId: "A" }, "low", "e1"); // an escape on A: covers s1 only
+  w.result("f1", true);
+  w.apply({ kind: "escape", findingId: "f1", snapshotId: "B" }, w.coord);
+  const bodies = settleCleanReviews(w.state, "B", iso(w.minute + 31 * DAY_MIN));
+  assert.deepEqual(bodies.map((b) => b.ref), ["review:s2"]);
 });
 
 test("clean reviews of a promoted snapshot cover its unpromoted ancestors once", () => {
@@ -646,42 +917,85 @@ test("clean reviews of a promoted snapshot cover its unpromoted ancestors once",
 // Penalties
 // ---------------------------------------------------------------------------
 
-test("missed plant: every owner who saw it and neither flagged nor found it pays; the custodian never does", () => {
+test("missed plant: who pays, who waits, and each invitee's inviter charge has its own key", () => {
   const w = new World();
   w.plantCommit("p1");
-  w.submit("p1"); // alice's agent is the custodian here
-  w.assign("p1", ["b1", "c1", "d1"]);
-  // dave holds a seat and never commits; eve reviews openly and waves it through,
-  // amy reviews openly too but has a finding on it that has no result yet.
-  w.reviews("p1", { b1: 0.1, c1: 0.9, e1: 0.49, m1: 0.2 });
-  w.file("f1", { submissionId: "p1" }, "medium", "m1");
+  w.submit("p1", "d1"); // dave is the custodian
+  w.assign("p1", ["b1", "c1", "e1"]); // eve holds a seat and never commits
+  w.commit("p1", "b1", 0.9);
+  w.commit("p1", "c1", 0.1);
+  w.commit("p1", "a1", 0.3); // alice reviews openly
+  w.commit("p1", "m1", 0.2); // amy reviews openly
+  for (const [a, p] of [["b1", 0.9], ["c1", 0.1], ["a1", 0.3], ["m1", 0.2]] as const) w.reveal("p1", a, p);
+  w.file("fA", { submissionId: "p1" }, "medium", "a1"); // blind, no result yet: alice waits
+  w.file("fB", { submissionId: "p1" }, "medium", "b1");
+  w.result("fB", true); // closes the window
   assert.deepEqual(settleMissedPlant(w.state, "p1"), [], "not revealed yet");
   w.plantReveal("p1");
-  const bodies = settleMissedPlant(w.state, "p1");
-  assertWellFormed(bodies);
-  assert.deepEqual(summary(bodies), ["bob missedPlant -6", "dave missedPlant -6", "eve missedPlant -6"].sort());
-  assert.ok(bodies.every((b) => b.ref === "plant:p1"));
-  w.settle(bodies);
+  w.file("fM", { submissionId: "p1" }, "medium", "m1"); // after the reveal: does not defer amy's charge
+
+  const first = settleMissedPlant(w.state, "p1");
+  assertWellFormed(first);
+  assert.deepEqual(
+    summary(first),
+    ["amy missedPlant -6", "carol missedPlant -6", "eve missedPlant -6", "ivy inviterSlash -2"].sort(),
+  );
+  w.settle(first);
   assert.deepEqual(settleMissedPlant(w.state, "p1"), []);
-  // amy's finding comes back false: she did not catch it after all.
-  w.result("f1", false);
-  assert.deepEqual(summary(settleMissedPlant(w.state, "p1")), ["amy missedPlant -6"]);
+
+  w.result("fA", false); // alice did not catch it after all
+  const second = settleMissedPlant(w.state, "p1");
+  assert.deepEqual(summary(second), ["alice missedPlant -6", "ivy inviterSlash -2"].sort());
+  assert.deepEqual(
+    [...first, ...second].filter((b) => b.owner === "ivy").map((b) => b.ref).sort(),
+    ["plant:p1:missedPlant:alice", "plant:p1:missedPlant:carol"],
+  );
+  w.settle(second);
+  assert.equal(w.rep("ivy"), -4, "one charge per invitee, across calls");
 });
 
-test("missed plant: a reviewer whose own finding reproduced caught it", () => {
+test("missed plant: a finding filed after the reveal is no catch, even once it reproduces", () => {
   const w = new World();
   w.plantCommit("p1");
   w.submit("p1");
   w.assign("p1", ["b1", "c1"]);
-  w.reviews("p1", { b1: 0.1, c1: 0.1 });
-  w.file("f1", { submissionId: "p1" }, "medium", "b1");
-  w.result("f1", true);
+  w.reviews("p1", { b1: 0, c1: 0.9 }); // the last assigned reveal closes the window
   w.plantReveal("p1");
+  w.file("f1", { submissionId: "p1" }, "medium", "b1"); // built from the published description
+  assert.deepEqual(summary(settleMissedPlant(w.state, "p1")), ["bob missedPlant -6"]);
+  w.result("f1", true);
+  assert.deepEqual(summary(settleMissedPlant(w.state, "p1")), ["bob missedPlant -6"]);
+  assert.deepEqual(settleFinding(w.state, tree, "f1", "dev"), [], "and it earns nothing");
+});
+
+test("missed plant: a reviewer whose blind finding reproduced caught it; a late reveal does not", () => {
+  const w = new World();
+  w.plantCommit("p1");
+  w.submit("p1");
+  w.assign("p1", ["b1", "c1"]);
+  w.commit("p1", "b1", 0.1);
+  w.commit("p1", "c1", 0.9);
+  w.file("f1", { submissionId: "p1" }, "medium", "b1");
+  w.result("f1", true); // closes the window before anyone revealed
+  w.plantReveal("p1");
+  w.reveal("p1", "c1", 0.9); // after the close: no longer a catch
   assert.deepEqual(summary(settleMissedPlant(w.state, "p1")), ["carol missedPlant -6", "ivy inviterSlash -2"].sort());
   assert.deepEqual(settleMissedPlant(w.state, "missing"), []);
 });
 
-test("expired claims forfeit their stake when the claimer never submitted", () => {
+test("missed plant: a plant revealed while its window is open charges nobody", () => {
+  const w = new World();
+  w.plantCommit("p1");
+  w.submit("p1");
+  w.assign("p1", ["b1", "c1"]);
+  w.commit("p1", "b1", 0);
+  w.commit("p1", "c1", 0);
+  w.reveal("p1", "b1", 0); // c1 never reveals, so the window stays open
+  w.plantReveal("p1");
+  assert.deepEqual(settleMissedPlant(w.state, "p1"), []);
+});
+
+function claimWorld(): World {
   const w = new World();
   w.apply({ kind: "proposal", id: "p1", title: "t", evidence: [{ kind: "location", file: "src/x.ts", line: 1, note: "n" }] }, w.key("b1"));
   for (const t of ["t1", "t2"]) {
@@ -690,6 +1004,11 @@ test("expired claims forfeit their stake when the claimer never submitted", () =
       w.coord,
     );
   }
+  return w;
+}
+
+test("expired claims forfeit their stake when the claimer never submitted", () => {
+  const w = claimWorld();
   const until = iso(w.minute + 120);
   w.apply({ kind: "claim", taskId: "t1", until, stake: 20 }, w.key("c1"));
   w.apply({ kind: "claim", taskId: "t2", until, stake: 15 }, w.key("a1"));
@@ -700,10 +1019,29 @@ test("expired claims forfeit their stake when the claimer never submitted", () =
   const after = iso(w.minute + 200);
   const bodies = settleExpiredClaims(w.state, after);
   assert.deepEqual(summary(bodies), ["carol claimExpired -20", "ivy inviterSlash -5"].sort());
-  assert.ok(bodies.every((b) => b.ref === `claim:t1:${seq}`));
+  assert.ok(bodies.every((b) => b.ref.startsWith(`claim:t1:${seq}`)));
   w.settle(bodies);
   assert.deepEqual(settleExpiredClaims(w.state, after), []);
   assert.throws(() => settleExpiredClaims(w.state, "not a date"), RangeError);
+});
+
+test("expired claims: a submission under an earlier claim does not cover an extension", () => {
+  const w = claimWorld();
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 60), stake: 15 }, w.key("a1"));
+  w.submit("junk", "a1", "t1");
+  const until = iso(w.minute + 600);
+  w.apply({ kind: "claim", taskId: "t1", until, stake: 15 }, w.key("a1")); // the holder extends
+  assert.deepEqual(summary(settleExpiredClaims(w.state, iso(w.minute + 700))), ["alice claimExpired -15", "ivy inviterSlash -4"].sort());
+});
+
+test("expired claims: a task that merged before until releases the claim", () => {
+  const w = claimWorld();
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 30), stake: 15 }, w.key("a1"));
+  w.submit("s1", "a1", "t1");
+  w.minute += 60; // a1's claim lapses with its submission still in review
+  w.apply({ kind: "claim", taskId: "t1", until: iso(w.minute + 120), stake: 15 }, w.key("c1"));
+  w.merge("s1");
+  assert.deepEqual(settleExpiredClaims(w.state, iso(w.minute + 600)), []);
 });
 
 test("honeytoken: owner pays per distinct token, inviter pays a share, repeats are idempotent", () => {
@@ -737,43 +1075,16 @@ test("inviter share rounds per slash and never produces a -0 or zero body", () =
 });
 
 // ---------------------------------------------------------------------------
-// Payoffs: rubber-stamping against honest review
+// Payoffs: rubber-stamping and flag-everything against honest review
 // ---------------------------------------------------------------------------
 
-// Per-review expected value, from the rules alone, of a reviewer who reports p
-// on a submission that is a plant with probability plantRate and otherwise
-// organically defective with probability d (found at dev stage, severity
-// medium, by a stranger). Plants never ship; clean work ships and pays
-// cleanReview whatever p was.
-function expectedValue(rules: Rules, d: number, pOnClean: number, pOnDefect: number): number {
-  const plant = rules.plantRate;
-  const { cleanReview, missedPlantPenalty, bounty, stageMultiplier } = rules.rewards;
-  const flagged = pOnDefect >= 0.5;
-  const onPlant = flagged ? 0 : -missedPlantPenalty;
-  const onDefect = -Math.round(bounty.medium * stageMultiplier.dev * (1 - pOnDefect));
-  void pOnClean; // the clean-review reward does not depend on p (protocol §6.2 gap)
-  return plant * onPlant + (1 - plant) * ((1 - d) * cleanReview + d * onDefect);
-}
-
-test("EV: at plantRate 0.15 rubber-stamping loses once organic bugs exist; honest review gains", () => {
-  const r = defaultRules();
-  assert.equal(r.plantRate, 0.15);
-  // Plants alone do not do it with the default numbers (+0.8 per review): the
-  // missed-plant penalty needs approver slashes on real bugs to bite.
-  assert.ok(Math.abs(expectedValue(r, 0, 0, 0) - 0.8) < 1e-9);
-  for (const d of [0.1, 0.15, 0.25]) {
-    const rubber = expectedValue(r, d, 0, 0);
-    const honest = expectedValue(r, d, 0.1, 0.9);
-    assert.ok(rubber < 0, `rubber-stamp EV ${rubber} at d=${d}`);
-    assert.ok(honest > 0, `honest EV ${honest} at d=${d}`);
-    assert.ok(honest > rubber);
-  }
-});
-
-test("EV on a real ledger: 20 submissions, 3 plants (15%), 2 organic bugs; rubber stamp nets negative, honest positive", () => {
+test("EV on a real ledger: 20 submissions, 3 plants (15%), 4 organic bugs; honest review beats p = 0 and p = 1", () => {
+  // Per review, always p = 0 earns 0.85 x (1 - d) x 2 - 0.15 x 6 - 0.85 x d x 5
+  // with bounties at bounty.low on dev: negative once organic defects d exceed
+  // about 13%. Here d = 4 / 17.
   const w = new World();
   const plants = new Set(["s03", "s09", "s15"]);
-  const bugs = new Set(["s06", "s12"]);
+  const bugs = new Set(["s04", "s08", "s12", "s18"]);
   const ids = Array.from({ length: 20 }, (_, i) => `s${String(i + 1).padStart(2, "0")}`);
   const all: SettlementBody[] = [];
   for (const sid of ids) {
@@ -801,16 +1112,14 @@ test("EV on a real ledger: 20 submissions, 3 plants (15%), 2 organic bugs; rubbe
   assertWellFormed(all);
   w.settle(all);
 
-  // bob: 15 clean x 2 - 3 plants x 6 - 2 bugs x 15 = -18
-  // carol: 30 - 2 x round(15 x .1) = 26 (ivy's inviter charges fall on ivy)
-  assert.equal(w.rep("bob"), -18);
-  assert.equal(w.rep("carol"), 26);
-  assert.ok(w.rep("bob") < 0 && w.rep("carol") > 0);
-  // Known gap (protocol §6.2), pinned so a fix updates this test: flagging
-  // everything pays at least as well as honest review.
-  assert.equal(w.rep("eve"), 30);
-  assert.ok(w.rep("eve") >= w.rep("carol"));
-  // The stranger who found both organic bugs was paid both bounties; the author paid both slashes.
-  assert.equal(w.rep("dave"), 30);
-  assert.equal(w.rep("alice"), -30);
+  // bob: 13 clean x 2 - 3 plants x 6 - 4 bugs x 5 = -12
+  // carol: 13 x round(2 - .02) - 4 x round(5 - 4.5) = 22
+  // eve: 13 x round(2 - 2) = 0; she risks nothing and earns nothing.
+  assert.equal(w.rep("bob"), -12);
+  assert.equal(w.rep("carol"), 22);
+  assert.equal(w.rep("eve"), 0);
+  assert.ok(w.rep("carol") > w.rep("bob") && w.rep("carol") > w.rep("eve"));
+  // The stranger who found the organic bugs was paid; the author paid every slash.
+  assert.equal(w.rep("dave"), 20);
+  assert.equal(w.rep("alice"), -20);
 });
