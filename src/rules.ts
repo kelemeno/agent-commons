@@ -1,33 +1,56 @@
 // Rules: the versioned thresholds every other module reads. Changed only by a
 // rulesChange ledger entry, and only to something validateRules accepts.
 
-import type { Rules } from "./types";
+import type { Ring, Rules } from "./types";
 
 export function defaultRules(): Rules {
   return {
     version: 1,
     // First match wins, so the specific kernel paths come before the broad UI
-    // glob. Build, CI and deploy configuration is kernel: it decides what runs.
+    // glob. Kernel is whatever decides who may act or what runs: reputation
+    // maths, auth (auth.ts, and http.ts, whose requireAdmin guards the admin
+    // endpoints), the composition root that wires routes, CORS and env
+    // (App.ts), the log, the contracts and what compiles into them, the commons
+    // and its config, and every build, CI, deploy and shell-script file.
     rings: [
       { glob: "anthill-backend/src/engine.ts", ring: 0 },
       { glob: "anthill-backend/src/auth.ts", ring: 0 },
+      { glob: "anthill-backend/src/http.ts", ring: 0 },
+      { glob: "anthill-backend/src/App.ts", ring: 0 },
       { glob: "anthill-backend/src/store.ts", ring: 0 },
       { glob: "anthill-backend/src/offchain*.ts", ring: 0 },
       { glob: "anthill-contracts/src/**", ring: 0 },
+      { glob: "anthill-contracts/lib/**", ring: 0 },
+      { glob: "anthill-contracts/remappings.txt", ring: 0 },
+      // A bare submodule pointer could hide any change inside the submodule.
+      { glob: "anthill-backend", ring: 0 },
+      { glob: "anthill-contracts", ring: 0 },
+      { glob: "anthill-frontend", ring: 0 },
       { glob: "anthill-commons/**", ring: 0 },
+      { glob: ".commons/**", ring: 0 },
       { glob: ".github/**", ring: 0 },
-      { glob: "**/Dockerfile", ring: 0 },
-      { glob: "**/render.yaml", ring: 0 },
-      { glob: "*.yml", ring: 0 },
-      { glob: "*.yaml", ring: 0 },
+      { glob: "**/Dockerfile*", ring: 0 },
+      { glob: "**/Procfile", ring: 0 },
+      { glob: "**/*.yml", ring: 0 },
+      { glob: "**/*.yaml", ring: 0 },
+      { glob: "**/tsconfig*.json", ring: 0 },
+      { glob: "**/*.sh", ring: 0 },
+      { glob: "anthill-frontend/vite.config.*", ring: 0 },
+      { glob: "anthill-frontend/index.html", ring: 0 },
       { glob: "anthill-frontend/**", ring: 2 },
     ],
+    // Registry and toolchain overrides (.npmrc, .yarnrc, .nvmrc) change what
+    // gets installed as surely as a lockfile does.
     lockedPaths: [
       "**/package.json",
       "**/package-lock.json",
       "**/yarn.lock",
       "**/pnpm-lock.yaml",
       "**/foundry.toml",
+      "**/.npmrc",
+      "**/.yarnrc",
+      "**/.yarnrc.yml",
+      "**/.nvmrc",
       ".gitmodules",
     ],
     maxLinesPerSubmission: 400,
@@ -62,6 +85,20 @@ export function defaultRules(): Rules {
     },
     kernelSigners: [],
   };
+}
+
+// Ring of one repo-relative path: the first matching glob wins, unmatched is 1.
+export function ringOf(path: string, rules: Rules): Ring {
+  return rules.rings.find((r) => globToRegExp(r.glob).test(path))?.ring ?? 1;
+}
+
+// The stake a claim must lock (docs/protocol.md §5.3): superlinear in the
+// task's size estimate, scaled by its ring. Lives here, beside the numbers it
+// reads, so the ledger (which enforces it as a floor) and the coordinator's
+// policy compute the same value.
+export function claimStake(lines: number, ring: Ring, rules: Rules): number {
+  const { base, exponent, ringMultiplier } = rules.stake;
+  return Math.ceil(base * Math.pow(Math.max(lines, 1) / 100, exponent) * ringMultiplier[ring]);
 }
 
 // Returns every problem found; empty means valid. Rules arrive from ledger
@@ -166,13 +203,15 @@ function checkShape(value: unknown, template: unknown, path: string, problems: s
     problems.push(`${path} must be an object`);
     return;
   }
+  // Own properties only: `key in tmpl` would also find Object.prototype names
+  // (constructor, valueOf, ...) and let them through as known fields.
   const tmpl = template as Record<string, unknown>;
   for (const key of Object.keys(tmpl)) {
-    if (value[key] === undefined) problems.push(`${path}.${key} is missing`);
+    if (!Object.hasOwn(value, key) || value[key] === undefined) problems.push(`${path}.${key} is missing`);
     else checkShape(value[key], tmpl[key], `${path}.${key}`, problems);
   }
   for (const key of Object.keys(value)) {
-    if (!(key in tmpl) && value[key] !== undefined) problems.push(`${path}.${key} is not a known field`);
+    if (!Object.hasOwn(tmpl, key) && value[key] !== undefined) problems.push(`${path}.${key} is not a known field`);
   }
 }
 

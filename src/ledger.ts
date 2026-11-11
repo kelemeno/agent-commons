@@ -11,16 +11,23 @@
 //   may sign that kind (roles are documented on EntryBody in types.ts);
 // - every reference resolves, ids are unique, and the per-kind rules hold.
 // applyEntry checks everything before it mutates anything, so a rejected entry
-// leaves the state exactly as it was.
+// leaves the state exactly as it was, and every rejection is a LedgerError.
+//
+// What replay cannot know: real time, and what a submission really changed.
+// The writer bounds `at` against its own clock (appendSigned's `now`), and the
+// coordinator must check a submission's declared changedFiles and linesChanged
+// against `git diff baseCommit..headCommit` (server.ts does, on patch upload)
+// before any gate trusts them. Replay only checks that the paths are canonical.
 
 import * as fs from "node:fs";
 import { canonical, isValidPublicKey, keyIdOf, sha256hex, sign, verify } from "./crypto";
-import { validateRules } from "./rules";
+import { claimStake, ringOf, validateRules } from "./rules";
 import type {
   CommonsState,
   EntryBody,
   EntryKind,
   Evidence,
+  FindingState,
   KeyId,
   LedgerEntry,
   OwnerId,
@@ -29,6 +36,7 @@ import type {
   Rules,
   SettlementReason,
   Severity,
+  SnapshotState,
 } from "./types";
 
 export type LedgerErrorCode =
@@ -39,6 +47,7 @@ export type LedgerErrorCode =
   | "prev"
   | "hash"
   | "time"
+  | "clock-skew"
   // signer
   | "signer-unknown"
   | "signature"
@@ -56,6 +65,8 @@ export type LedgerErrorCode =
   | "inactive-agent"
   | "claim-live"
   | "claim-missing"
+  | "claim-too-long"
+  | "task-required"
   | "task-done"
   | "planted-by-author"
   | "merged"
@@ -63,6 +74,7 @@ export type LedgerErrorCode =
   | "invalid-reviewers"
   | "same-owner"
   | "duplicate-commit"
+  | "commit-closed"
   | "stake"
   | "no-commit"
   | "already-revealed"
@@ -74,6 +86,8 @@ export type LedgerErrorCode =
   | "gates-missing"
   | "gate-failed"
   | "reproduced-finding"
+  | "finding-pending"
+  | "planted"
   | "not-merged"
   | "already-snapshotted"
   | "promoted"
@@ -111,16 +125,34 @@ export type LedgerState = CommonsState & { headAt: string };
 
 const EPOCH = "1970-01-01T00:00:00.000Z";
 
+// Longest a single claim entry may run. A cap is what stops one agent from
+// locking a task forever for a token stake. It belongs in Rules (claim.maxHours);
+// until types.ts has that field it is fixed here.
+export const MAX_CLAIM_MS = 7 * 24 * 3_600_000;
+
+// Default tolerance between an entry's `at` and the writer's clock.
+export const DEFAULT_MAX_SKEW_MS = 5 * 60_000;
+
 // ---------------------------------------------------------------------------
 // Envelope: what is signed and what is hashed.
 // ---------------------------------------------------------------------------
 
 export function entryMessage(e: Pick<LedgerEntry, "seq" | "prev" | "at" | "signer" | "body">): string {
-  return canonical({ seq: e.seq, prev: e.prev, at: e.at, signer: e.signer, body: e.body });
+  return canon({ seq: e.seq, prev: e.prev, at: e.at, signer: e.signer, body: e.body });
 }
 
 export function entryHash(e: Omit<LedgerEntry, "hash">): string {
-  return sha256hex(canonical({ seq: e.seq, prev: e.prev, at: e.at, signer: e.signer, body: e.body, sig: e.sig }));
+  return sha256hex(canon({ seq: e.seq, prev: e.prev, at: e.at, signer: e.signer, body: e.body, sig: e.sig }));
+}
+
+// canonical() throws TypeError on values JSON cannot carry and RangeError on
+// absurd nesting; from untrusted input both are just a malformed entry.
+function canon(value: unknown): string {
+  try {
+    return canonical(value);
+  } catch (e) {
+    throw new LedgerError("malformed", `not canonical JSON: ${(e as Error).message}`);
+  }
 }
 
 export function genesisEntry(body: GenesisBody, at: string): LedgerEntry {
@@ -145,7 +177,7 @@ export function signEntry(
 }
 
 function cloneJson<T>(value: T): T {
-  return JSON.parse(canonical(value)) as T;
+  return JSON.parse(canon(value)) as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +188,7 @@ function cloneJson<T>(value: T): T {
 
 type Check = (v: unknown) => boolean;
 
-const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const SEVERITIES: readonly Severity[] = ["low", "medium", "high", "critical"];
 const REASONS: readonly SettlementReason[] = [
@@ -183,7 +215,13 @@ const bool: Check = (v) => typeof v === "boolean";
 const array: Check = (v) => Array.isArray(v);
 const strings: Check = (v) => Array.isArray(v) && v.every(str);
 const hex64: Check = (v) => typeof v === "string" && HEX64_RE.test(v);
-const iso: Check = (v) => typeof v === "string" && ISO_RE.test(v) && !Number.isNaN(Date.parse(v));
+// One spelling per instant: the UTC form toISOString() produces. Date.parse
+// alone would accept 2026-02-30 (rolled to March 2) and many spellings of one
+// time, and other modules compare these strings.
+const iso: Check = (v) =>
+  typeof v === "string" && ISO_RE.test(v) && !Number.isNaN(Date.parse(v)) && new Date(v).toISOString() === v;
+// A finding target: an object of string fields, checked in depth by the rule.
+const target: Check = (v) => isPlainObject(v) && Object.values(v).every((x) => x === undefined || typeof x === "string");
 const severity: Check = (v) => SEVERITIES.includes(v as Severity);
 const ring: Check = (v) => v === 0 || v === 1 || v === 2;
 const reason: Check = (v) => REASONS.includes(v as SettlementReason);
@@ -203,7 +241,7 @@ const SHAPES: { [K in EntryKind]: Record<string, Check> } = {
   reviewAssignment: { submissionId: id, beacon: id, reviewers: strings },
   reviewCommit: { submissionId: id, commitment: hex64, stake: int },
   reviewReveal: { submissionId: id, verdict: any, salt: id },
-  finding: { id, target: any, severity, testPath: id, testCommand: id, stake: int },
+  finding: { id, target, severity, testPath: id, testCommand: id, stake: int },
   findingResult: { findingId: id, reproduced: bool, failsOnHead: bool, passesOnParent: bool, logDigest: str },
   merge: { submissionId: id, commit: id },
   snapshot: { id, commit: id, previousSnapshotId: idOrNull, submissionIds: strings },
@@ -234,15 +272,25 @@ function definedKeys(o: Record<string, unknown>): string[] {
 }
 
 // Exactly these fields, each passing its check. Returns a problem or null.
+// Own properties only, on both sides: `in` would also find Object.prototype
+// names (constructor, valueOf, ...), and JSON.parse makes "__proto__" an own
+// key, so either way extra data could ride along unhashed in the envelope.
 function fieldProblem(o: Record<string, unknown>, fields: Record<string, Check>, optional: readonly string[] = []) {
   for (const [name, check] of Object.entries(fields)) {
-    if (o[name] === undefined) return `missing field ${name}`;
+    if (!Object.hasOwn(o, name) || o[name] === undefined) return `missing field ${name}`;
     if (!check(o[name])) return `bad field ${name}`;
   }
   for (const key of definedKeys(o)) {
-    if (!(key in fields) && !optional.includes(key)) return `unknown field ${key}`;
+    if (!Object.hasOwn(fields, key) && !optional.includes(key)) return `unknown field ${key}`;
   }
   return null;
+}
+
+// A repo-relative POSIX path in its one spelling. Ring and airlock globs are
+// anchored, so `./a`, `a//b` or `a/../b` would dodge them while naming the same file.
+export function isCanonicalPath(p: unknown): p is string {
+  if (typeof p !== "string" || p === "" || p.includes("\\") || p.includes("\0")) return false;
+  return p.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 }
 
 const ENVELOPE: Record<string, Check> = { seq: nat, prev: str, at: iso, signer: str, body: any, sig: str, hash: str };
@@ -300,7 +348,9 @@ function verdictProblem(v: unknown): string | null {
 // body, in which case the entry is synthesised at `at` (default: the epoch);
 // use genesisEntry() when the entry itself must be kept.
 export function emptyState(genesis: LedgerEntry | GenesisBody, at: string = EPOCH): LedgerState {
-  const entry = "kind" in genesis && genesis.kind === "genesis" ? genesisEntry(genesis, at) : checkShape(genesis);
+  const isBody = isPlainObject(genesis) && (genesis as { kind?: unknown }).kind === "genesis";
+  // The synthesised entry gets the same shape check as a genesis line read from a file.
+  const entry = checkShape(isBody ? genesisEntry(genesis as GenesisBody, at) : genesis);
   const fail = (code: LedgerErrorCode, msg: string): never => {
     throw new LedgerError(code, `genesis: ${msg}`, 0);
   };
@@ -544,23 +594,34 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       if (state.tasks.has(body.id)) reject("duplicate-id", `task ${body.id} exists`);
       if (!state.proposals.has(body.proposalId)) reject("unknown-ref", `no proposal ${body.proposalId}`);
       if (!state.owners.has(body.specAuthor)) reject("unknown-ref", `spec author ${body.specAuthor} is not an owner`);
-      if (body.acceptanceTestPaths.length === 0 || body.acceptanceTestPaths.includes("")) {
-        reject("invalid-value", "a task needs acceptance test paths");
-      }
+      if (body.acceptanceTestPaths.length === 0) reject("invalid-value", "a task needs acceptance test paths");
+      if (!body.acceptanceTestPaths.every(isCanonicalPath)) reject("invalid-value", "acceptance test paths must be canonical");
       state.tasks.set(body.id, { ...body, acceptanceTestPaths: [...body.acceptanceTestPaths], seq });
       return;
     }
 
     case "claim": {
-      if (!state.tasks.has(body.taskId)) reject("unknown-ref", `no task ${body.taskId}`);
-      if (body.stake <= 0) reject("stake", "claim stake must be positive");
-      if (Date.parse(body.until) <= ms) reject("invalid-value", "claim must expire after it is made");
+      const task = state.tasks.get(body.taskId) ?? reject("unknown-ref", `no task ${body.taskId}`);
+      // The stake is a floor, not a fee: a token stake would let one agent
+      // squat every task for a point each.
+      const minStake = Math.max(1, claimStake(task.sizeEstimate, task.ring, state.rules));
+      if (body.stake < minStake) reject("stake", `claim stake must be at least ${minStake}`);
+      const until = Date.parse(body.until);
+      if (until <= ms) reject("invalid-value", "claim must expire after it is made");
+      if (until - ms > MAX_CLAIM_MS) reject("claim-too-long", `a claim may run at most ${MAX_CLAIM_MS / 3_600_000} hours`);
       for (const s of state.submissions.values()) {
         if (s.taskId === body.taskId && s.merged) reject("task-done", `task ${body.taskId} already merged`);
       }
       const current = state.claims.get(body.taskId);
-      // The holder may extend its own claim; anyone else waits for expiry.
-      if (current && current.agent !== signer && Date.parse(current.until) > ms) {
+      // The holder may extend its own claim (each extension capped like a new
+      // claim); anyone else waits for expiry. A revoked holder's claim is dead:
+      // revocation must not leave the task locked.
+      if (
+        current &&
+        current.agent !== signer &&
+        Date.parse(current.until) > ms &&
+        state.agents.get(current.agent)?.active === true
+      ) {
         reject("claim-live", `task ${body.taskId} is claimed until ${current.until}`);
       }
       state.claims.set(body.taskId, { taskId: body.taskId, agent: signer, until: body.until, stake: body.stake, seq });
@@ -578,8 +639,14 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
         }
       }
       if (body.linesChanged < 0) reject("invalid-value", "linesChanged must be >= 0");
-      if (body.changedFiles.length === 0 || body.changedFiles.includes("")) {
-        reject("invalid-value", "changedFiles must be non-empty");
+      if (body.changedFiles.length === 0) reject("invalid-value", "changedFiles must be non-empty");
+      const bad = body.changedFiles.find((f) => !isCanonicalPath(f));
+      if (bad !== undefined) reject("invalid-value", `changed file ${JSON.stringify(bad)} is not a canonical repo path`);
+      if (new Set(body.changedFiles).size !== body.changedFiles.length) reject("invalid-value", "changed file listed twice");
+      // A kernel change must go through a task, so it carries a claim stake at
+      // the ring 0 multiplier instead of none.
+      if (body.taskId === null && body.changedFiles.some((f) => ringOf(f, state.rules) === 0)) {
+        reject("task-required", "a submission touching ring 0 must name a task");
       }
       state.submissions.set(body.id, {
         id: body.id,
@@ -626,7 +693,14 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "reviewCommit": {
       const s = submission(body.submissionId);
       if (s.merged) reject("merged", "submission already merged");
-      checkCommit(s.reviews, ownerOf(s.author), body.stake);
+      const closedBy = s.reviews.some((r) => r.verdict)
+        ? "a review was revealed"
+        : s.planted
+          ? "the plant was revealed"
+          : s.findingIds.some((fid) => state.findings.get(fid)?.result?.reproduced === true)
+            ? "a finding on it reproduced"
+            : null;
+      checkCommit(s.reviews, ownerSet([s.id]), body.stake, closedBy);
       s.reviews.push({ reviewer: signer, commitment: body.commitment, stake: body.stake, committedSeq: seq });
       return;
     }
@@ -649,15 +723,19 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
         return reject("invalid-target", "target must name exactly one submission or snapshot");
       }
       let targetSubmission: string | null = null;
-      if (id(target.submissionId)) {
+      if (Object.hasOwn(target, "submissionId") && id(target.submissionId)) {
         const s = submission(target.submissionId as string);
         if (ownerOf(s.author) === ownerOf(signer)) reject("same-owner", "cannot file a finding on your owner's work");
         targetSubmission = s.id;
-      } else if (id(target.snapshotId)) {
-        snapshot(target.snapshotId as string);
+      } else if (Object.hasOwn(target, "snapshotId") && id(target.snapshotId)) {
+        const snap = snapshot(target.snapshotId as string);
+        if (ownerSet(covered(snap)).has(ownerOf(signer) ?? "")) {
+          reject("same-owner", "cannot file a finding on a snapshot of your owner's work");
+        }
       } else {
         reject("invalid-target", "target must name exactly one submission or snapshot");
       }
+      if (!isCanonicalPath(body.testPath)) reject("invalid-value", "testPath must be a canonical repo path");
       if (body.stake < state.rules.stake.finding) reject("stake", `finding stake below ${state.rules.stake.finding}`);
       state.findings.set(body.id, {
         id: body.id,
@@ -699,6 +777,12 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       if (s.findingIds.some((fid) => state.findings.get(fid)?.result?.reproduced === true)) {
         reject("reproduced-finding", "a reproduced finding targets this submission");
       }
+      // Undecided is not clean: merging before the harness answers would get
+      // past the reproduced-finding rule by timing alone.
+      if (s.findingIds.some((fid) => !state.findings.get(fid)?.result)) {
+        reject("finding-pending", "a finding on this submission has no result yet");
+      }
+      if (s.planted) reject("planted", "a revealed plant is a known defect");
       s.merged = { commit: body.commit, seq, at };
       return;
     }
@@ -732,7 +816,16 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "attestCommit": {
       const snap = snapshot(body.snapshotId);
       if (snap.promoted) reject("promoted", "snapshot already promoted");
-      checkCommit(snap.attestations, undefined, body.stake);
+      const chain = ancestry(snap, true);
+      const subs = chain.flatMap((x) => x.submissionIds);
+      const closedBy = snap.attestations.some((a) => a.verdict)
+        ? "an attestation was revealed"
+        : subs.some((sid) => state.submissions.get(sid)?.planted)
+          ? "a plant it covers was revealed"
+          : [...state.findings.values()].some((f) => f.result?.reproduced === true && chain.some((x) => targets(f, x, subs)))
+            ? "a finding on it reproduced"
+            : null;
+      checkCommit(snap.attestations, ownerSet(subs), body.stake, closedBy);
       snap.attestations.push({ reviewer: signer, commitment: body.commitment, stake: body.stake, committedSeq: seq });
       return;
     }
@@ -753,6 +846,7 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       const owner = state.ownerByKey.get(signer) ?? reject("unauthorised", "signer is not an owner");
       if (!state.rules.kernelSigners.includes(owner)) reject("unauthorised", `${owner} is not a kernel signer`);
       if (snap.promoted) reject("promoted", "snapshot already promoted");
+      if (ownerSet(covered(snap)).has(owner)) reject("same-owner", "cannot sign off a snapshot of your own agents' work");
       if (snap.signoffs.includes(owner)) reject("duplicate-signoff", `${owner} already signed off`);
       snap.signoffs.push(owner);
       return;
@@ -776,6 +870,11 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "plantReveal": {
       const s = submission(body.submissionId);
       if (s.planted) reject("already-planted", "plant already revealed");
+      // The preimage `${submissionId}:${salt}` is unambiguous only if the salt
+      // has no ':'; then a commitment names exactly one submission id, and
+      // already-planted is what makes each commitment usable once. Without this
+      // one commitment to "a:b:c" could later label "a" or "a:b", at choice.
+      if (body.salt.includes(":")) reject("invalid-value", "plant salt may not contain ':'");
       const commitment = sha256hex(`${body.submissionId}:${body.salt}`);
       const commit = state.plantCommitments.find((c) => c.commitment === commitment);
       if (!commit) return reject("plant-mismatch", "no plant commitment matches");
@@ -795,7 +894,14 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "escape": {
       const f = finding(body.findingId);
       if (f.result?.reproduced !== true) reject("not-reproduced", "escape needs a reproduced finding");
-      if (!snapshot(body.snapshotId).promoted) reject("not-promoted", "escape needs a promoted snapshot");
+      const snap = snapshot(body.snapshotId);
+      if (!snap.promoted) reject("not-promoted", "escape needs a promoted snapshot");
+      // What main holds at a snapshot is the snapshot and all its ancestors.
+      const lineage = ancestry(snap, false);
+      const shipped = lineage.flatMap((x) => x.submissionIds);
+      if (!lineage.some((x) => targets(f, x, shipped))) {
+        reject("invalid-target", "the finding is not on anything this snapshot shipped");
+      }
       if (state.escapes.some((e) => e.findingId === body.findingId)) reject("duplicate-escape", "already recorded");
       state.escapes.push({ findingId: body.findingId, snapshotId: body.snapshotId, seq, at });
       return;
@@ -824,15 +930,53 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     }
   }
 
-  // Shared by review and attestation commits: one commit per agent, never by
-  // the author's owner (attestations pass undefined: a snapshot has no single
-  // author), and at least the rules' review stake.
-  function checkCommit(existing: ReviewState[], authorOwner: OwnerId | undefined, stake: number): void {
-    if (authorOwner !== undefined && ownerOf(signer) === authorOwner) {
-      reject("same-owner", "cannot review your owner's work");
-    }
+  // Shared by review and attestation commits: never by an author's owner, one
+  // commit per owner (one person running several agents must not fill several
+  // seats), at least the rules' review stake, and only while the outcome is
+  // still hidden. Once a verdict is revealed, a plant is revealed or a finding
+  // reproduces, a late commit could copy the answer.
+  function checkCommit(existing: ReviewState[], authors: Set<OwnerId>, stake: number, closedBy: string | null): void {
+    const mine = ownerOf(signer);
+    if (mine !== undefined && authors.has(mine)) reject("same-owner", "cannot review your owner's work");
     if (existing.some((r) => r.reviewer === signer)) reject("duplicate-commit", "already committed");
+    if (existing.some((r) => ownerOf(r.reviewer) === mine)) {
+      reject("duplicate-commit", "another agent of this owner already committed");
+    }
+    if (closedBy !== null) reject("commit-closed", `commits are closed: ${closedBy}`);
     if (stake < state.rules.stake.review) reject("stake", `review stake below ${state.rules.stake.review}`);
+  }
+
+  function ownerSet(submissionIds: readonly string[]): Set<OwnerId> {
+    const owners = new Set<OwnerId>();
+    for (const sid of submissionIds) {
+      const o = ownerOf(state.submissions.get(sid)?.author ?? "");
+      if (o !== undefined) owners.add(o);
+    }
+    return owners;
+  }
+
+  // The snapshot and its ancestors, newest first. With `stopAtPromoted`, the
+  // walk ends before the first promoted ancestor: that is what a promotion of
+  // `snap` would cover. Ids are unique and a snapshot can only name an earlier
+  // one, so the chain is finite.
+  function ancestry(snap: SnapshotState, stopAtPromoted: boolean): SnapshotState[] {
+    const out = [snap];
+    for (let p = snap.previousSnapshotId; p !== null; ) {
+      const prev = state.snapshots.get(p);
+      if (!prev || (stopAtPromoted && prev.promoted)) break;
+      out.push(prev);
+      p = prev.previousSnapshotId;
+    }
+    return out;
+  }
+
+  function covered(snap: SnapshotState): string[] {
+    return ancestry(snap, true).flatMap((x) => x.submissionIds);
+  }
+
+  function targets(f: FindingState, snap: SnapshotState, submissionIds: readonly string[]): boolean {
+    const t = f.target;
+    return "snapshotId" in t ? t.snapshotId === snap.id : submissionIds.includes(t.submissionId);
   }
 
   function checkReveal(
@@ -896,13 +1040,32 @@ export class Ledger {
     return this.current;
   }
 
+  // Writes the writer's own entry: the writer is the clock, so `at` is trusted.
   append(body: EntryBody, signer: Signer, at: string): LedgerEntry {
-    return this.appendSigned(signEntry(this.current, body, signer, at));
+    return this.write(signEntry(this.current, body, signer, at));
   }
 
   // For entries signed elsewhere (an agent signs, the coordinator appends).
-  // Validates against the current state first; only a valid entry is written.
-  appendSigned(entry: LedgerEntry): LedgerEntry {
+  // The signer chose `at`, and replay judges claims, expiry and the
+  // no-backwards rule by it, so it must lie within `maxSkewMs` of the
+  // writer's clock `now` (both directions: far-future freezes the ledger and
+  // expires every claim, backdating revives an expired one). Then validates
+  // against the current state; only a valid entry is written. `clock` is
+  // optional only for callers that already enforce the same bound (server.ts);
+  // anything else appending a foreign entry must pass it.
+  appendSigned(entry: LedgerEntry, clock?: { now: string; maxSkewMs?: number }): LedgerEntry {
+    if (clock === undefined) return this.write(entry);
+    const now = Date.parse(clock.now);
+    const skew = clock.maxSkewMs ?? DEFAULT_MAX_SKEW_MS;
+    const at = isPlainObject(entry) && typeof entry.at === "string" ? Date.parse(entry.at) : Number.NaN;
+    if (Number.isNaN(now)) throw new TypeError("appendSigned: clock.now is not a time");
+    if (!(Math.abs(at - now) <= skew)) {
+      throw new LedgerError("clock-skew", `at must be within ${skew / 1000}s of ${clock.now}`, null);
+    }
+    return this.write(entry);
+  }
+
+  private write(entry: LedgerEntry): LedgerEntry {
     if (!fs.existsSync(this.path) || fs.statSync(this.path).size !== this.bytes) {
       throw new LedgerError("stale", `${this.path} changed on disk since it was opened`);
     }

@@ -417,26 +417,26 @@ test("task: unique id, proposal exists, spec author is an owner, acceptance test
 
 test("claim: task must exist, stake positive, expiry after the claim", () => {
   const w = new World().task();
-  w.reject("unknown-ref", { kind: "claim", taskId: "nope", until: iso(10_000), stake: 5 }, w.key("b1"));
+  w.reject("unknown-ref", { kind: "claim", taskId: "nope", until: iso(10_000), stake: 10 }, w.key("b1"));
   w.reject("stake", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 0 }, w.key("a1"));
   w.reject("stake", { kind: "claim", taskId: "t1", until: iso(10_000), stake: -3 }, w.key("a1"));
-  w.reject("invalid-value", { kind: "claim", taskId: "t1", until: w.now(), stake: 5 }, w.key("a1"), w.now());
+  w.reject("invalid-value", { kind: "claim", taskId: "t1", until: w.now(), stake: 10 }, w.key("a1"), w.now());
 });
 
 test("claim: another agent cannot take a live claim, but can after it expires", () => {
   const w = new World().task();
   const until = w.state.claims.get("t1")?.until ?? "";
-  w.reject("claim-live", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 5 }, w.key("b1"));
+  w.reject("claim-live", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 6 }, w.key("b1"));
   // the holder may extend
   w.apply({ kind: "claim", taskId: "t1", until: iso(800), stake: 10 }, w.key("a1"));
-  w.reject("claim-live", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 5 }, w.key("b1"), until);
-  w.apply({ kind: "claim", taskId: "t1", until: iso(10_000), stake: 5 }, w.key("b1"), iso(800));
+  w.reject("claim-live", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 6 }, w.key("b1"), until);
+  w.apply({ kind: "claim", taskId: "t1", until: iso(10_000), stake: 6 }, w.key("b1"), iso(800));
   assert.equal(w.state.claims.get("t1")?.agent, w.id("b1"));
 });
 
 test("claim: a merged task cannot be claimed again", () => {
   const w = new World().merged();
-  w.reject("task-done", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 5 }, w.key("a1"));
+  w.reject("task-done", { kind: "claim", taskId: "t1", until: iso(10_000), stake: 10 }, w.key("a1"));
 });
 
 // ---------------------------------------------------------------------------
@@ -460,12 +460,12 @@ test("submission: unique id, task exists, live claim by this agent", () => {
   w.apply({ ...taskBody("t2"), proposalId: "p2" } as EntryBody, w.coord);
   w.reject("claim-missing", submissionBody("s2", "t2"), w.key("a1"), w.now()); // never claimed
   const until = iso(w.minute + 10);
-  w.apply({ kind: "claim", taskId: "t2", until, stake: 5 }, w.key("a1"));
+  w.apply({ kind: "claim", taskId: "t2", until, stake: 6 }, w.key("a1"));
   w.apply(submissionBody("s2", "t2"), w.key("a1"), until); // until >= at is still live
   w.apply({ kind: "proposal", id: "p3", title: "z", evidence: [EVIDENCE] }, w.key("a1"));
   w.apply({ ...taskBody("t3"), proposalId: "p3" } as EntryBody, w.coord);
   const short = iso(w.minute + 2);
-  w.apply({ kind: "claim", taskId: "t3", until: short, stake: 5 }, w.key("a1"));
+  w.apply({ kind: "claim", taskId: "t3", until: short, stake: 6 }, w.key("a1"));
   w.reject("claim-missing", submissionBody("s3", "t3"), w.key("a1"), iso(w.minute + 3)); // expired
 });
 
@@ -580,9 +580,10 @@ test("finding: unique id, existing target, not the author's owner, enough stake"
   w.reject("invalid-target", findingBody("f2", { commit: "x" } as unknown as { submissionId: string }), w.key("c1"));
 });
 
-test("finding: snapshot targets may be filed by any agent", () => {
+test("finding: snapshot targets may be filed by any agent except the authors' owners", () => {
   const w = new World().snapshotted();
-  w.apply(findingBody("f1", { snapshotId: "r1" }), w.key("a2"));
+  w.reject("same-owner", findingBody("f1", { snapshotId: "r1" }), w.key("a2")); // alice wrote s1
+  w.apply(findingBody("f1", { snapshotId: "r1" }), w.key("b1"));
   assert.deepEqual(w.state.findings.get("f1")?.target, { snapshotId: "r1" });
 });
 
@@ -654,25 +655,27 @@ test("snapshot: unique id, existing previous, merged submissions not already shi
   assert.equal(w.state.snapshots.get("r2")?.previousSnapshotId, "r1");
 });
 
-test("attestCommit/attestReveal: any active agent, once each, before promotion", () => {
+test("attestCommit/attestReveal: any active non-author agent, once each, before promotion", () => {
   const w = new World().snapshotted();
   const v = verdict(0.05);
   const commit = (stake = 5): EntryBody => ({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(v, "q"), stake });
   w.reject("unknown-ref", { kind: "attestCommit", snapshotId: "nope", commitment: commitOf(v, "q"), stake: 5 }, w.key("b1"));
   w.reject("stake", commit(1), w.key("b1"));
   w.reject("unauthorised", commit(), w.key("bob"));
-  w.apply(commit(), w.key("a2")); // the author's owner may attest: a snapshot has no single author
-  w.reject("duplicate-commit", commit(), w.key("a2"));
-  w.reject("no-commit", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("b1"));
-  w.reject("commitment-mismatch", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "z" }, w.key("a2"));
-  w.apply({ kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("a2"));
-  w.reject("already-revealed", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("a2"));
+  w.reject("same-owner", commit(), w.key("a2")); // alice wrote s1, which r1 ships
+  w.apply(commit(), w.key("b1"));
+  w.reject("duplicate-commit", commit(), w.key("b1"));
+  w.reject("no-commit", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("d1"));
 
   // cited findings must target the snapshot itself
   w.apply(findingBody("f-sub", { submissionId: "s1" }), w.key("c1"));
   const cites = verdict(0.5, ["f-sub"]);
   w.apply({ kind: "attestCommit", snapshotId: "r1", commitment: commitOf(cites, "q"), stake: 5 }, w.key("c1"));
   w.reject("invalid-target", { kind: "attestReveal", snapshotId: "r1", verdict: cites, salt: "q" }, w.key("c1"));
+
+  w.reject("commitment-mismatch", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "z" }, w.key("b1"));
+  w.apply({ kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("b1"));
+  w.reject("already-revealed", { kind: "attestReveal", snapshotId: "r1", verdict: v, salt: "q" }, w.key("b1"));
 
   w.apply({ kind: "promotion", snapshotId: "r1", commit: "m1" }, w.coord);
   w.reject("promoted", commit(), w.key("b1"));
@@ -751,7 +754,10 @@ test("settlement: owner exists, integer delta, accumulates reputation", () => {
   const w = new World().people();
   w.reject("unknown-ref", { kind: "settlement", owner: "mallory", delta: 5, reason: "bounty", ref: "f" }, w.coord);
   // NaN cannot even be signed: canonical() refuses it
-  assert.throws(() => w.sign({ kind: "settlement", owner: "alice", delta: Number.NaN, reason: "bounty", ref: "f" }, w.coord), TypeError);
+  assert.throws(
+    () => w.sign({ kind: "settlement", owner: "alice", delta: Number.NaN, reason: "bounty", ref: "f" }, w.coord),
+    isCode("malformed"),
+  );
   w.apply({ kind: "settlement", owner: "alice", delta: 30, reason: "mergeVest", ref: "s1" }, w.coord);
   w.apply({ kind: "settlement", owner: "alice", delta: -12, reason: "authorSlash", ref: "f1" }, w.coord);
   assert.equal(w.owner("alice").reputationDelta, 18);

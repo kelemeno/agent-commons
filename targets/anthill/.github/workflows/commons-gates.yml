@@ -1,0 +1,139 @@
+# Agent-commons gates for every pull request. See .commons/README.md.
+#
+# Trust: this runs on `pull_request` (never `pull_request_target`), so a fork's
+# code runs with a read-only token and no secrets. The PR's code is executed
+# only by the behaviour-delta replay (its anthill-backend engine); nothing from
+# the PR is `npm install`ed. What the PR is judged against comes from the base
+# checkout: the ratified rules (.commons/rules.json) and the replay log, which
+# the base backend generates. Only declarations are taken from the PR, and only
+# the ones it adds (see "Behaviour-delta manifest" below).
+#
+# A `pull_request` workflow runs the PR's own copy of this file, so a PR can
+# weaken it. .github/** is ring 0: such a PR is a kernel change and gets kernel
+# review; make this check required in branch protection.
+
+name: commons-gates
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commons-gates-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # The coordinator version that judges PRs. Pin to a release tag or commit
+  # once agent-commons publishes one; changing it is a ring 0 change here.
+  COMMONS_REF: main
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # The merge commit GitHub builds for the PR (github.sha): what the base
+      # branch becomes if the PR lands. Its first parent is the base tip, so
+      # base.sha..github.sha is exactly the PR's change.
+      - name: Check out the PR (merge commit) with submodules
+        uses: actions/checkout@v4
+        with:
+          path: head
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the base with submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check out agent-commons
+        uses: actions/checkout@v4
+        with:
+          repository: kelemeno/agent-commons
+          ref: ${{ env.COMMONS_REF }}
+          path: commons
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install agent-commons
+        working-directory: commons
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Static gates (rings, airlock, size)
+        working-directory: commons
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          rules="$GITHUB_WORKSPACE/base/.commons/rules.json"
+          if [ ! -f "$rules" ]; then
+            echo "::error::the base branch has no .commons/rules.json; there are no ratified rules to judge this PR against"
+            exit 1
+          fi
+          npx tsx src/cli.ts gates \
+            --repo "$GITHUB_WORKSPACE/head" \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --rules "$rules"
+
+      - name: Generate the replay log with the base backend
+        if: ${{ !cancelled() }}
+        working-directory: commons
+        run: |
+          npx tsx scripts/make-anthill-fixture-log.ts \
+            --backend "$GITHUB_WORKSPACE/base/anthill-backend" \
+            --out "$RUNNER_TEMP/anthill-log.jsonl"
+
+      # A declaration counts only in the PR that adds it: declarations already
+      # on the base are dropped, so a stale one cannot cover a later change.
+      # A head manifest that is not {declared: [...]} is passed on unchanged,
+      # and the gate fails on it.
+      - name: Behaviour-delta manifest (declarations this PR adds)
+        if: ${{ !cancelled() }}
+        run: |
+          node - "$GITHUB_WORKSPACE/base/.commons/behaviour-delta.json" \
+                 "$GITHUB_WORKSPACE/head/.commons/behaviour-delta.json" \
+                 "$RUNNER_TEMP/behaviour-delta.json" <<'JS'
+          const fs = require("node:fs");
+          const [basePath, headPath, outPath] = process.argv.slice(2);
+          const key = (d) => JSON.stringify(d, Object.keys(d ?? {}).sort());
+          const baseDeclared = (() => {
+            try { return JSON.parse(fs.readFileSync(basePath, "utf8")).declared ?? []; }
+            catch { return []; }
+          })();
+          if (!fs.existsSync(headPath)) {
+            fs.writeFileSync(outPath, JSON.stringify({ declared: [] }));
+            process.exit(0);
+          }
+          const headText = fs.readFileSync(headPath, "utf8");
+          let head;
+          try { head = JSON.parse(headText); } catch { head = undefined; }
+          if (!head || !Array.isArray(head.declared) || !Array.isArray(baseDeclared)) {
+            fs.writeFileSync(outPath, headText);
+            process.exit(0);
+          }
+          const old = new Set(baseDeclared.map(key));
+          const declared = head.declared.filter((d) => !old.has(key(d)));
+          fs.writeFileSync(outPath, JSON.stringify({ declared }, null, 2));
+          console.log(`${declared.length} declaration(s) added by this PR`);
+          JS
+
+      - name: Behaviour-delta gate (base vs PR anthill-backend)
+        if: ${{ !cancelled() }}
+        working-directory: commons
+        run: |
+          npx tsx src/cli.ts delta \
+            --old "$GITHUB_WORKSPACE/base/anthill-backend" \
+            --new "$GITHUB_WORKSPACE/head/anthill-backend" \
+            --log "$RUNNER_TEMP/anthill-log.jsonl" \
+            --manifest "$RUNNER_TEMP/behaviour-delta.json"
