@@ -2,23 +2,27 @@
   "version": 1,
   "rings": [
     {
-      "glob": "anthill-backend/src/engine.ts",
+      "glob": "anthill-backend/src/**",
       "ring": 0
     },
     {
-      "glob": "anthill-backend/src/auth.ts",
+      "glob": "anthill-backend/anthillSnapshot.json",
       "ring": 0
     },
     {
-      "glob": "anthill-backend/src/store.ts",
-      "ring": 0
-    },
-    {
-      "glob": "anthill-backend/src/offchain*.ts",
+      "glob": "anthill-backend/tsconfig*.json",
       "ring": 0
     },
     {
       "glob": "anthill-contracts/src/**",
+      "ring": 0
+    },
+    {
+      "glob": "anthill-contracts/lib/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/remappings.txt",
       "ring": 0
     },
     {
@@ -31,6 +35,18 @@
     },
     {
       "glob": "anthill-frontend",
+      "ring": 0
+    },
+    {
+      "glob": "**/.gitmodules",
+      "ring": 0
+    },
+    {
+      "glob": "**/.npmrc",
+      "ring": 0
+    },
+    {
+      "glob": "**/.yarnrc*",
       "ring": 0
     },
     {
@@ -65,10 +81,16 @@
   "lockedPaths": [
     "**/package.json",
     "**/package-lock.json",
+    "**/npm-shrinkwrap.json",
     "**/yarn.lock",
     "**/pnpm-lock.yaml",
+    "**/bun.lock*",
+    "**/.npmrc",
+    "**/.yarnrc*",
     "**/foundry.toml",
-    ".gitmodules"
+    "**/remappings.txt",
+    "**/.gitmodules",
+    "anthill-contracts/lib/**"
   ],
   "maxLinesPerSubmission": 400,
   "minTreeDistance": 2,

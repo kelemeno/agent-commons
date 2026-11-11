@@ -195,7 +195,10 @@ function computeReputation(s: Structure, sent: Map<OwnerId, DagVote[]>): Map<Own
     const votes = sent.get(from) ?? [];
     if (votes.length === 0) continue;
     const total = votes.reduce((sum, v) => sum + v.weight, 0n);
-    if (total === 0n) throw new Error(`tree: DAG votes of ${from} have zero total weight`);
+    // Reachable by anyone (remove the join vote, then vote with weight 0). The
+    // engine divides by zero there; throwing here would let one member break
+    // every view, so zero-weight votes pass on nothing, as their weight says.
+    if (total === 0n) continue;
     const rep = raw.get(from) as bigint;
     for (const { to, weight } of votes) raw.set(to, (raw.get(to) as bigint) + (rep * weight) / total);
   }
@@ -401,23 +404,27 @@ export interface EngineLike {
 // computeReputation for why not through engine.calculateReputation), so the
 // view stays a consistent copy even if the engine changes afterwards.
 export function treeFromEngine(engine: EngineLike): TreeView {
+  // The engine keys its state by the id exactly as it was given; the view uses
+  // the lowercase form, so engine calls go through the engine's own spelling.
+  const engineId = new Map<OwnerId, string>();
   const parents = new Map<OwnerId, OwnerId | null>();
   for (const raw of engine.members()) {
     const id = canonicalAddress(raw);
     if (parents.has(id)) throw new Error(`tree: engine lists member ${id} twice`);
     const parent = canonicalAddress(engine.parent(raw));
     parents.set(id, parent === VIRTUAL_ROOT ? null : parent);
+    engineId.set(id, raw);
   }
   const s = buildStructure(parents);
   const engineRoot = canonicalAddress(engine.root());
   if (s.root !== engineRoot) throw new Error(`tree: engine root ${engineRoot} but the tree's root is ${s.root}`);
   const sentVotes = new Map<OwnerId, DagVote[]>();
-  for (const id of s.parents.keys()) {
-    if (!sameList(engine.children(id).map(canonicalAddress).sort(compareIds), s.children.get(id) ?? [])) {
+  for (const [id, raw] of engineId) {
+    if (!sameList(engine.children(raw).map(canonicalAddress).sort(compareIds), s.children.get(id) ?? [])) {
       throw new Error(`tree: engine children of ${id} disagree with their parents`);
     }
-    const votes = engine.endorsing(id).map((to): DagVote => {
-      const [, voted, , , , vote] = engine.findSentDagVote(id, to);
+    const votes = engine.endorsing(raw).map((to): DagVote => {
+      const [, voted, , , , vote] = engine.findSentDagVote(raw, to);
       if (!voted) throw new Error(`tree: engine lists a DAG vote ${id} -> ${to} it cannot find`);
       return { to: canonicalAddress(to), weight: vote.weight };
     });

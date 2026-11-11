@@ -14,31 +14,53 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { type Divergence, GATE, loadManifest, type Manifest, runBehaviourDelta } from "../gates/behaviourDelta";
+import {
+  type DeclaredDelta,
+  type Divergence,
+  GATE,
+  loadManifest,
+  type Manifest,
+  runBehaviourDelta,
+} from "../gates/behaviourDelta";
 import { type EngineLike, treeFromEngine, treeFromSnapshot } from "../tree";
 import type { GateReport, Rules, TreeView } from "../types";
 
 export const BACKEND_DIR_ENV = "ANTHILL_BACKEND_DIR";
+// The community the server moves the seed (the snapshot's tree) to.
+export const SNAPSHOT_COMMUNITY = "demo";
 
 // Anthill rules, version 1. First matching ring glob wins; unmatched is ring 1.
 export function anthillRules(): Rules {
   return {
     version: 1,
     rings: [
-      // Reputation maths, accounts, the log and the replay that rebuilds state.
-      { glob: "anthill-backend/src/engine.ts", ring: 0 },
-      { glob: "anthill-backend/src/auth.ts", ring: 0 },
-      { glob: "anthill-backend/src/store.ts", ring: 0 },
-      { glob: "anthill-backend/src/offchain*.ts", ring: 0 },
+      // The whole server: reputation maths, accounts, the log and its replay,
+      // and everything they load. A ring 1 module imported from here would run
+      // in the kernel's process (and inside the behaviour-delta replay), where
+      // it can patch the kernel at load time, so every module the server can
+      // reach is kernel. test/adapters-anthill.test.ts walks the import graph.
+      { glob: "anthill-backend/src/**", ring: 0 },
+      // The seed of the demo tree and of the behaviour-delta log; and the
+      // compiler config, whose `paths` can redirect a package import.
+      { glob: "anthill-backend/anthillSnapshot.json", ring: 0 },
+      { glob: "anthill-backend/tsconfig*.json", ring: 0 },
       { glob: "anthill-contracts/src/**", ring: 0 },
+      // Forge libraries compiled into the contracts, and the remappings that
+      // decide which file an import resolves to.
+      { glob: "anthill-contracts/lib/**", ring: 0 },
+      { glob: "**/remappings.txt", ring: 0 },
       // A submodule pointer whose diff was not expanded into the submodule's
       // files could hide any change, so on its own it counts as kernel.
       { glob: "anthill-backend", ring: 0 },
       { glob: "anthill-contracts", ring: 0 },
       { glob: "anthill-frontend", ring: 0 },
-      // What decides what runs and how changes are judged: CI, the commons
+      // What decides what runs and how changes are judged: where code is
+      // fetched from (submodule URLs, package registries), CI, the commons
       // config (rules, behaviour-delta declarations), deploy config, and the
       // coordinator itself while it still lives in this repo.
+      { glob: "**/.gitmodules", ring: 0 },
+      { glob: "**/.npmrc", ring: 0 },
+      { glob: "**/.yarnrc*", ring: 0 },
       { glob: ".github/**", ring: 0 },
       { glob: ".commons/**", ring: 0 },
       { glob: "anthill-commons/**", ring: 0 },
@@ -47,13 +69,21 @@ export function anthillRules(): Rules {
       { glob: "**/render.yaml", ring: 0 },
       { glob: "anthill-frontend/**", ring: 2 },
     ],
+    // Only the dependency track may change these: what gets installed, and
+    // from where.
     lockedPaths: [
       "**/package.json",
       "**/package-lock.json",
+      "**/npm-shrinkwrap.json",
       "**/yarn.lock",
       "**/pnpm-lock.yaml",
+      "**/bun.lock*",
+      "**/.npmrc",
+      "**/.yarnrc*",
       "**/foundry.toml",
-      ".gitmodules",
+      "**/remappings.txt",
+      "**/.gitmodules",
+      "anthill-contracts/lib/**",
     ],
     maxLinesPerSubmission: 400,
     minTreeDistance: 2,
@@ -133,7 +163,9 @@ export function loadBackend(backendDir: string): BackendModules {
 // A frozen TreeView of one Anthill community.
 //
 // With snapshotPath: read anthillSnapshot.json (no backend code runs). A
-// snapshot holds one tree, the original one, so `community` only labels it.
+// snapshot holds one tree, the original one, which the server keeps as the
+// `demo` community; any other community, or a backend to replay, is refused
+// rather than answered with the demo tree.
 // Otherwise: replay <dataDir>/log.jsonl (default <backendDir>/data, the
 // backend's own default when started from its directory) through the
 // backend's Store and Communities, exactly as the server does on startup, and
@@ -146,7 +178,14 @@ export async function anthillTree(opts: {
   env?: NodeJS.ProcessEnv;
 }): Promise<TreeView> {
   if (opts.snapshotPath !== undefined) {
-    if (opts.dataDir !== undefined) throw new Error("anthill: pass either snapshotPath or dataDir, not both");
+    if (opts.dataDir !== undefined || opts.backendDir !== undefined) {
+      throw new Error("anthill: pass either snapshotPath or backendDir/dataDir, not both");
+    }
+    if (opts.community !== SNAPSHOT_COMMUNITY) {
+      throw new Error(
+        `anthill: a snapshot holds only the ${SNAPSHOT_COMMUNITY} community, not ${opts.community}; replay a backend log for other communities`,
+      );
+    }
     return treeFromSnapshot(readFileSync(opts.snapshotPath, "utf8"));
   }
   const backendDir = resolveBackendDir(opts.backendDir, opts.env);
@@ -170,19 +209,37 @@ export async function anthillTree(opts: {
   return treeFromEngine(tree.engine);
 }
 
+// The declarations a change adds: head's, minus any already on the base. A
+// declaration counts only in the change that adds it, so one left in the file
+// cannot cover a later, unrelated divergence. Identity is the whole entry; an
+// edited note is a new declaration, which reviewers then see in the diff.
+export function addedDeclarations(base: Manifest, head: Manifest): Manifest {
+  const key = (d: DeclaredDelta) => JSON.stringify([d.community, d.fromEntry, d.note]);
+  const old = new Set(base.declared.map(key));
+  return { declared: head.declared.filter((d) => !old.has(key(d))) };
+}
+
 // The behaviour-delta gate for Anthill. Never throws: an unreadable manifest
 // is a failing report, like every other harness problem in runBehaviourDelta,
 // because a gate that cannot judge must not pass.
+//
+// With baseManifestPath, only the declarations the change adds count (see
+// addedDeclarations). A missing base file means the base declares nothing; a
+// malformed one fails, since the base is what the change is judged against.
 export async function behaviourDeltaFor(opts: {
   oldBackendDir: string;
   newBackendDir: string;
   logPath: string;
   manifestPath: string;
+  baseManifestPath?: string;
   timeoutMs?: number;
 }): Promise<GateReport & { divergences: Divergence[] }> {
   let manifest: Manifest;
   try {
     manifest = loadManifest(opts.manifestPath);
+    if (opts.baseManifestPath !== undefined && existsSync(opts.baseManifestPath)) {
+      manifest = addedDeclarations(loadBaseManifest(opts.baseManifestPath), manifest);
+    }
   } catch (e) {
     return { gate: GATE, pass: false, details: (e as Error).message, divergences: [] };
   }
@@ -193,4 +250,12 @@ export async function behaviourDeltaFor(opts: {
     manifest,
     ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
   });
+}
+
+function loadBaseManifest(path: string): Manifest {
+  try {
+    return loadManifest(path);
+  } catch (e) {
+    throw new Error(`base ${(e as Error).message}`);
+  }
 }

@@ -5,14 +5,24 @@
 //      (as the server does on first start), and the demo's story if the
 //      checkout has one (src/demoStory.ts) — leaves, climbs, switched votes;
 //   2. the commons, started by a founder, with every action kind;
-//   3. a private community joined through invites (invite placement).
+//   3. a private community joined through invites (invite placement);
+//   4. actions the engine refuses (a self-vote, a second join, the root
+//      switching with its parent, ...), appended to the log directly. The
+//      server never logs a refused action, so without these the replay would
+//      never ask the new checkout to refuse anything, and a change that drops
+//      a revert would pass. The base replay skips them with an error; a head
+//      that accepts one diverges there.
+//
+// The log covers the engine (`apply`, replayed from the log) only. What
+// offchain.ts checks at request time (parseAction, prepare, invites, the join
+// policy) never reaches a replay, so this gate cannot see a change to it.
 //
 // CI runs this with the BASE checkout's backend: the log must come from code
 // that is already trusted, and the head is then judged against it. Timestamps
 // and invite codes differ between runs; entry order and count do not, so the
 // entry numbers the gate reports are stable for a given base.
 //
-//   npx tsx scripts/make-anthill-fixture-log.ts --backend <anthill-backend dir> --out <log.jsonl>
+//   node --import tsx scripts/make-anthill-fixture-log.ts --backend <anthill-backend dir> --out <log.jsonl>
 //       [--snapshot <anthillSnapshot.json>]   (default <backend>/anthillSnapshot.json)
 //   ANTHILL_BACKEND_DIR may stand in for --backend.
 
@@ -29,6 +39,7 @@ const CREATED_AT = "2026-01-01T00:00:00.000Z";
 type Body = { fn: string; args?: Record<string, string> };
 type Tree = {
   id: string;
+  replay(entry: object): unknown;
   engine: { members(): string[]; children(id: string): string[]; root(): string };
   execute(by: string, body: Body): unknown;
   createAdminInvite(under: string): { code: string };
@@ -43,9 +54,20 @@ type Store = {
   setSeed(graph: unknown): void;
   moveCommons(to: object, founder: string): void;
   markMigration(id: string): void;
+  appendAction(community: string, by: string, action: Body): object;
 };
 
-export type FixtureSummary = { logPath: string; entries: number; actions: Record<string, number>; skipped: string[] };
+export type FixtureSummary = {
+  logPath: string;
+  entries: number;
+  actions: Record<string, number>;
+  // valid actions the backend refused (should be none)
+  skipped: string[];
+  // refused actions appended on purpose, and any the backend accepted instead
+  // (left out of the log; should be none)
+  refused: number;
+  notRefused: string[];
+};
 
 export async function makeAnthillFixtureLog(opts: {
   backendDir?: string;
@@ -140,11 +162,47 @@ export async function makeAnthillFixtureLog(opts: {
     }
     act(club, id(0xc103), { fn: "addDagVote", args: { recipient: FOUNDER, weight: "3" } });
 
+    // 4. refused actions. NOBODY is in no tree. Each is first tried on a
+    // throwaway copy of the state (engine.run rolls a reverted call back, so
+    // the copy stays as it was), and the log only gets ones this backend
+    // really refuses.
+    const NOBODY = id(0xdead);
+    const refusals: [community: string, by: string, body: Body][] = [
+      ["commons", NOBODY, { fn: "changeName", args: { name: "Nobody" } }],
+      ["commons", NOBODY, { fn: "leaveTree", args: {} }],
+      ["commons", NOBODY, { fn: "joinTreeAsRoot", args: { name: "Nobody" } }],
+      ["commons", NOBODY, { fn: "joinTree", args: { name: "Nobody", recipient: id(0xbeef) } }],
+      ["commons", NOBODY, { fn: "addDagVote", args: { recipient: FOUNDER, weight: "1" } }],
+      ["commons", a, { fn: "joinTree", args: { name: "Ada again", recipient: FOUNDER } }],
+      ["commons", b, { fn: "addDagVote", args: { recipient: b, weight: "1" } }],
+      ["commons", b, { fn: "addDagVote", args: { recipient: NOBODY, weight: "1" } }],
+      ["commons", f, { fn: "removeDagVote", args: { recipient: a } }],
+      ["commons", FOUNDER, { fn: "switchPositionWithParent", args: {} }],
+      ["commons", e, { fn: "moveTreeVote", args: { recipient: e } }],
+      ["commons", e, { fn: "moveTreeVote", args: { recipient: NOBODY } }],
+      ["demo", NOBODY, { fn: "changeName", args: { name: "Nobody" } }],
+      ["fixture-club", NOBODY, { fn: "leaveTree", args: {} }],
+    ];
+    const notRefused: string[] = [];
+    let refused = 0;
+    const probes = await fresh();
+    for (const [community, by, body] of refusals) {
+      const probe = probes.get(community) as Tree;
+      try {
+        probe.replay({ type: "action", at: CREATED_AT, by, action: body, community });
+      } catch {
+        store.appendAction(community, by, body);
+        refused++;
+        continue;
+      }
+      notRefused.push(`${community}: ${by} ${body.fn}`);
+    }
+
     const entries = readFileSync(store.logPath, "utf8")
       .split("\n")
       .filter((line) => line.trim() !== "").length;
     copyFileSync(store.logPath, outPath);
-    return { logPath: outPath, entries, actions, skipped };
+    return { logPath: outPath, entries, actions, skipped, refused, notRefused };
   } finally {
     rmSync(work, { recursive: true, force: true });
   }

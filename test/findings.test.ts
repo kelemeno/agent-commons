@@ -1,16 +1,21 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   checkTestPath,
   isSecretName,
   MAX_LOG_BYTES_PER_RUN,
+  MAX_TIMEOUT_MS,
   minimalEnv,
+  PID_NAMESPACE_SANDBOX,
+  redact,
+  removeTree,
   reproduceFinding,
+  runCommand,
   type ReproduceOptions,
 } from "../src/findings";
 
@@ -103,7 +108,8 @@ test("a test that fails on head and passes on the parent reproduces", async () =
   assert.match(r.log, /=== head: exit 1 ===/);
   assert.match(r.log, /=== base: exit 0 ===/);
   assert.match(r.log, /add ok/);
-  assert.ok(r.log.indexOf("=== head") < r.log.indexOf("=== base"));
+  // Base runs first, so the submission's code never runs before the parent's.
+  assert.ok(r.log.indexOf("=== base") < r.log.indexOf("=== head"));
 });
 
 test("the log digest is stable across runs: no temp paths or timings leak into the log", async () => {
@@ -136,6 +142,7 @@ test("a test that fails on both commits does not reproduce", async () => {
   assert.equal(r.failsOnHead, true);
   assert.equal(r.passesOnParent, false);
   assert.equal(r.reproduced, false);
+  assert.equal(r.harnessError, null);
   assert.match(r.log, /=== head: exit 3 ===/);
   assert.match(r.log, /=== base: exit 3 ===/);
 });
@@ -145,6 +152,7 @@ test("reversed commits do not reproduce: the test must pass on the parent", asyn
   assert.equal(r.failsOnHead, false);
   assert.equal(r.passesOnParent, false);
   assert.equal(r.reproduced, false);
+  assert.equal(r.harnessError, null);
 });
 
 test("death by a signal on head counts as failing", async () => {
@@ -153,6 +161,7 @@ test("death by a signal on head counts as failing", async () => {
   assert.equal(r.failsOnHead, true);
   assert.equal(r.passesOnParent, true);
   assert.equal(r.reproduced, true);
+  assert.equal(r.harnessError, null);
   assert.match(r.log, /=== head: killed by SIGSEGV ===/);
 });
 
@@ -316,9 +325,280 @@ test("the test file overwrites nothing in the main checkout and worktrees and te
   assert.equal(harnessTempDirs().length, tempBefore);
 });
 
-test("rejects a non-positive timeout", async () => {
-  await assert.rejects(reproduceFinding(opts({ testContent: ADD_TEST, timeoutMs: 0 })));
+test("rejects a timeout outside (0, MAX_TIMEOUT_MS]", async () => {
+  // setTimeout turns anything above 2^31-1 ms into 1 ms, which would time out
+  // every run instantly and make every finding unreproducible.
+  for (const bad of [0, -1, NaN, Infinity, MAX_TIMEOUT_MS + 1, 3e9]) {
+    await assert.rejects(reproduceFinding(opts({ testContent: ADD_TEST, timeoutMs: bad })), /timeoutMs/, `should reject ${bad}`);
+  }
+  const r = await reproduceFinding(opts({ testContent: ADD_TEST, timeoutMs: MAX_TIMEOUT_MS }));
+  assert.equal(r.reproduced, true);
+  assert.equal(r.harnessError, null);
 });
+
+// --- hostile repositories and hostile commands -------------------------------
+
+function refsAndConfig(): string {
+  return sh(["for-each-ref", "--format=%(refname) %(objectname)"]) + "\n" + readFileSync(join(repo, ".git", "config"), "utf8");
+}
+
+function liveHooks(): string[] {
+  return readdirSync(join(repo, ".git", "hooks")).filter((n) => !n.endsWith(".sample"));
+}
+
+test("hooks and fsmonitor configured in the repository never run during the harness's own git calls", async () => {
+  // Stands for a repository an earlier hostile run already tampered with.
+  const marker = join(scratch, "hook-ran");
+  const script = `#!/bin/sh\necho "$0" >> ${JSON.stringify(marker)}\nexit 0\n`;
+  const hooks = ["post-checkout", "post-index-change", "reference-transaction", "pre-auto-gc"];
+  for (const h of hooks) {
+    writeFileSync(join(repo, ".git", "hooks", h), script);
+    chmodSync(join(repo, ".git", "hooks", h), 0o755);
+  }
+  const fsmonitor = join(scratch, "fsmonitor.sh");
+  writeFileSync(fsmonitor, script);
+  chmodSync(fsmonitor, 0o755);
+  sh(["config", "core.fsmonitor", fsmonitor]);
+  try {
+    const r = await reproduceFinding(opts({ testContent: ADD_TEST }));
+    assert.equal(r.reproduced, true, r.log);
+    assert.equal(existsSync(marker), false, existsSync(marker) ? readFileSync(marker, "utf8") : "");
+  } finally {
+    sh(["config", "--unset", "core.fsmonitor"]);
+    for (const h of hooks) rmSync(join(repo, ".git", "hooks", h));
+  }
+});
+
+test("the command's checkout is not linked to the repository: it cannot plant hooks, move refs, replace objects or edit config", async () => {
+  const before = refsAndConfig();
+  const attack = [
+    `if git rev-parse --git-dir >/dev/null 2>&1; then echo FOUND""-A-REPO; fi`,
+    `d=$(git rev-parse --git-common-dir 2>/dev/null) && mkdir -p "$d/hooks" && printf '#!/bin/sh\\necho $DEPLOY_TOKEN > /tmp/stolen\\n' > "$d/hooks/post-checkout" && chmod +x "$d/hooks/post-checkout"`,
+    `git replace -f ${parent} ${head} 2>/dev/null`,
+    `git update-ref refs/heads/main ${parent} 2>/dev/null`,
+    `git config core.hooksPath /tmp 2>/dev/null`,
+    `test -e .git && echo HAS""-DOT-GIT`,
+    `node test/finding-1.test.js`,
+  ].join("\n");
+  process.env.DEPLOY_TOKEN = "deploy-token-value-1234";
+  try {
+    const r = await reproduceFinding(opts({ testContent: ADD_TEST, testCommand: attack }));
+    assert.equal(r.reproduced, true, r.log);
+    assert.equal(r.harnessError, null);
+    assert.doesNotMatch(r.log, /FOUND-A-REPO|HAS-DOT-GIT|deploy-token-value/);
+  } finally {
+    delete process.env.DEPLOY_TOKEN;
+  }
+  assert.equal(refsAndConfig(), before);
+  assert.deepEqual(liveHooks(), []);
+  assert.equal(sh(["replace", "--list"]), "");
+  assert.equal(worktreeCount(), 1);
+});
+
+test("both commits are resolved and checked out before any command runs, and base runs first", async () => {
+  // A same-uid command that knows where the repository is can still change it;
+  // what must hold is that it cannot change what this reproduction checks.
+  sh(["branch", "-f", "basebr", parent]);
+  try {
+    const attack = `git -C "$REPO" update-ref refs/heads/basebr ${head}; git -C "$REPO" update-ref refs/heads/headbr ${parent}; node test/finding-1.test.js`;
+    sh(["branch", "-f", "headbr", head]);
+    const r = await reproduceFinding(
+      opts({ testContent: ADD_TEST, testCommand: attack, baseCommit: "basebr", headCommit: "headbr", env: { PATH, REPO: repo } }),
+    );
+    assert.equal(r.reproduced, true, r.log);
+    assert.match(r.log, new RegExp(`=== base ${parent} ===`));
+    assert.match(r.log, new RegExp(`=== head ${head} ===`));
+  } finally {
+    sh(["branch", "-D", "basebr", "headbr"]);
+  }
+});
+
+test("a planted git replace cannot swap the tree behind a genuine parent sha", async () => {
+  sh(["replace", "-f", parent, head]);
+  try {
+    // Plain git now shows the buggy tree under the parent's sha...
+    assert.match(sh(["show", `${parent}:math.js`]), /a - b/);
+    // ...but the harness checks out the real one.
+    const r = await reproduceFinding(opts({ testContent: ADD_TEST }));
+    assert.equal(r.passesOnParent, true, r.log);
+    assert.equal(r.reproduced, true);
+  } finally {
+    sh(["replace", "-d", parent]);
+  }
+});
+
+test("a timeout settles even when a setsid descendant keeps the output pipes open", async () => {
+  const pidFile = join(scratch, "setsid-timeout.pid");
+  const started = Date.now();
+  try {
+    const r = await reproduceFinding(
+      opts({
+        testContent: ADD_TEST,
+        testCommand: `setsid sh -c 'echo $$ >> "$PIDFILE"; exec sleep 1000' & sleep 1000`,
+        timeoutMs: 1000,
+        env: { PATH, PIDFILE: pidFile },
+      }),
+    );
+    assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started} ms`);
+    assert.equal(r.reproduced, false);
+    assert.match(r.harnessError ?? "", /^head: timed out/);
+    assert.match(r.log, /=== base: timeout/);
+    assert.equal(worktreeCount(), 1);
+    assert.equal(r.cleanupError, null);
+  } finally {
+    killPids(pidFile);
+  }
+});
+
+test("a setsid descendant holding the pipes after the shell exits delays the result by at most the drain period", async () => {
+  const pidFile = join(scratch, "setsid-exit.pid");
+  const started = Date.now();
+  try {
+    const r = await reproduceFinding(
+      opts({
+        testContent: ADD_TEST,
+        testCommand: `setsid sh -c 'echo $$ >> "$PIDFILE"; exec sleep 1000' & node test/finding-1.test.js`,
+        timeoutMs: 60_000,
+        env: { PATH, PIDFILE: pidFile },
+      }),
+    );
+    assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started} ms`);
+    assert.equal(r.reproduced, true, r.log);
+    assert.equal(r.harnessError, null);
+  } finally {
+    killPids(pidFile);
+  }
+});
+
+test("a spawn failure is a harness error, never a reproduction", async () => {
+  const r = await reproduceFinding(opts({ testContent: ADD_TEST, sandbox: ["/nonexistent/sandbox-wrapper"] }));
+  assert.equal(r.failsOnHead, false);
+  assert.equal(r.passesOnParent, false);
+  assert.equal(r.reproduced, false);
+  assert.match(r.harnessError ?? "", /^head: spawn failed: .*ENOENT/);
+  assert.match(r.log, /=== base: harness error: spawn failed/);
+  assert.equal(worktreeCount(), 1);
+
+  const o = await runCommand("true", join(scratch, "no-such-dir"), { PATH }, 5000);
+  assert.equal(o.kind, "error");
+  await assert.rejects(reproduceFinding(opts({ testContent: ADD_TEST, sandbox: [] })), /sandbox/);
+});
+
+test("cleanup survives a command that fakes .git and locks directories, and never replaces the result", async () => {
+  const tempBefore = harnessTempDirs().length;
+  const r = await reproduceFinding(
+    opts({
+      testContent: ADD_TEST,
+      testCommand: `echo 'gitdir: /x' > .git; mkdir -p locked/inner; touch locked/inner/f; chmod 000 locked/inner locked; chmod 000 "$HOME"; node test/finding-1.test.js`,
+    }),
+  );
+  assert.equal(r.reproduced, true, r.log);
+  assert.equal(r.cleanupError, null);
+  assert.equal(worktreeCount(), 1);
+  assert.equal(sh(["worktree", "list"]).split("\n").length, 1);
+  assert.equal(harnessTempDirs().length, tempBefore);
+  // removeTree reports instead of throwing when something truly cannot go.
+  const err = await removeTree("/proc/self/fdinfo");
+  assert.match(err ?? "", /could not remove/);
+});
+
+test("redact replaces secret values and drops a secret's prefix left at a truncation cut", () => {
+  assert.equal(redact("a hunter22 b hunter22", ["hunter22"], false), "a <redacted> b <redacted>");
+  assert.equal(redact("x abcdefgh", ["abcdefgh", "abcd"], false), "x <redacted>");
+  assert.equal(redact("tail abcd", ["abcdefgh"], true), "tail ");
+  assert.equal(redact("tail abcd", ["abcdefgh"], false), "tail abcd");
+});
+
+// The secret is in the environment the process was LAUNCHED with, so it shows
+// in /proc/<pid>/environ; setting process.env at runtime would not.
+function runInChild(over: Record<string, unknown>, secret: string): ReturnType<typeof reproduceFinding> extends Promise<infer R> ? R : never {
+  const script = join(scratch, "child-reproduce.ts");
+  writeFileSync(
+    script,
+    `import { reproduceFinding } from ${JSON.stringify(resolve(__dirname, "../src/findings.ts"))};
+reproduceFinding(JSON.parse(process.argv[2] ?? "{}")).then((r) => process.stdout.write(JSON.stringify(r)));
+`,
+  );
+  const out = execFileSync(process.execPath, ["--import", "tsx", script, JSON.stringify({ ...opts({}), ...over })], {
+    cwd: resolve(__dirname, ".."),
+    env: { ...process.env, LAUNCH_SECRET_TOKEN: secret },
+    encoding: "utf8",
+  });
+  return JSON.parse(out);
+}
+
+test("a secret in the coordinator's launch environment, read through /proc/$PPID/environ, is redacted from the log", () => {
+  const secret = "launch-secret-value-5678";
+  const out = join(scratch, "proc-dump-plain");
+  const r = runInChild(
+    {
+      testContent: ADD_TEST,
+      testCommand: `tr '\\0' '\\n' < /proc/$PPID/environ | grep LAUNCH_SECRET; cat /proc/$PPID/environ > "$OUT"; node test/finding-1.test.js`,
+      env: { PATH, OUT: out },
+    },
+    secret,
+  );
+  assert.equal(r.reproduced, true, r.log);
+  assert.ok(!r.log.includes(secret), "log leaks the launch secret");
+  assert.match(r.log, /LAUNCH_SECRET_TOKEN=<redacted>/);
+  // Redaction protects the log only: without a sandbox the command can still
+  // read the value, which is why untrusted findings need `sandbox`.
+  assert.ok(readFileSync(out, "utf8").includes(secret));
+});
+
+const sandboxWorks =
+  spawnSync(PID_NAMESPACE_SANDBOX[0] ?? "", [...PID_NAMESPACE_SANDBOX.slice(1), "/bin/sh", "-c", "true"], { stdio: "ignore" })
+    .status === 0;
+
+test("with the PID-namespace sandbox the command cannot see the coordinator's processes or outlive the run", { skip: !sandboxWorks && "unshare/setpriv sandbox unavailable" }, async () => {
+  const secret = "sandboxed-secret-value-9012";
+  const out = join(scratch, "proc-dump-sandbox");
+  const late = join(scratch, "daemon-survived");
+  const r = runInChild(
+    {
+      testContent: ADD_TEST,
+      testCommand: [
+        `cat /proc/[0-9]*/environ > "$OUT" 2>/dev/null`,
+        `umount /proc 2>/dev/null && echo UM""OUNTED`,
+        `unshare --user --mount sh -c 'umount /proc' 2>/dev/null && echo UM""OUNTED-NESTED`,
+        `setsid sh -c 'sleep 2; echo alive > "$LATE"' &`,
+        `node test/finding-1.test.js`,
+      ].join("\n"),
+      env: { PATH, OUT: out, LATE: late },
+      sandbox: PID_NAMESPACE_SANDBOX,
+    },
+    secret,
+  );
+  assert.equal(r.reproduced, true, r.log);
+  assert.equal(r.harnessError, null);
+  assert.doesNotMatch(r.log, /UMOUNTED/);
+  assert.ok(!readFileSync(out, "utf8").includes(secret), "sandboxed command read the coordinator's environment");
+  await new Promise((done) => setTimeout(done, 3000));
+  assert.equal(existsSync(late), false, "a setsid daemon outlived the sandboxed run");
+});
+
+test("the sandbox preserves exit codes, signals and timeouts", { skip: !sandboxWorks && "unshare/setpriv sandbox unavailable" }, async () => {
+  const sig = `const { add } = require("../math.js"); if (add(2, 3) !== 5) process.kill(process.pid, "SIGSEGV");\n`;
+  const a = await reproduceFinding(opts({ testContent: sig, testCommand: "exec node test/finding-1.test.js", sandbox: PID_NAMESPACE_SANDBOX }));
+  assert.equal(a.reproduced, true, a.log);
+  assert.match(a.log, /=== head: exit 139 ===/);
+  const b = await reproduceFinding(opts({ testContent: "process.exit(3);\n", sandbox: PID_NAMESPACE_SANDBOX }));
+  assert.match(b.log, /=== head: exit 3 ===/);
+  const c = await reproduceFinding(opts({ testContent: ADD_TEST, testCommand: "setsid sleep 1000 & sleep 1000", timeoutMs: 1000, sandbox: PID_NAMESPACE_SANDBOX }));
+  assert.match(c.harnessError ?? "", /^head: timed out/);
+  assert.equal(c.reproduced, false);
+});
+
+function killPids(file: string): void {
+  if (!existsSync(file)) return;
+  for (const pid of readFileSync(file, "utf8").trim().split("\n").map(Number)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+}
 
 async function waitDead(pid: number): Promise<void> {
   for (let i = 0; i < 50; i++) {

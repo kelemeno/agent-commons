@@ -1,12 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { defaultRules, globToRegExp, validateRules } from "../src/rules";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { claimStake, defaultRules, globToRegExp, ringOf, validateRules } from "../src/rules";
 import type { Ring, Rules } from "../src/types";
-
-// First matching glob wins; unmatched is ring 1 (the contract in types.ts).
-function ringOf(path: string, rules: Rules): Ring {
-  return rules.rings.find((r) => globToRegExp(r.glob).test(path))?.ring ?? 1;
-}
 
 function withRules(edit: (r: Rules) => void): string[] {
   const r = defaultRules();
@@ -207,4 +204,74 @@ test("validateRules survives malformed input from a ledger line", () => {
   rejects((r) => ((r as unknown as { stake: unknown }).stake = 5), /stake must be an object/);
   rejects((r) => ((r as unknown as { rings: unknown[] }).rings = [null]), /rings\[0\] must be an object/);
   rejects((r) => ((r.rings[0] as unknown as Record<string, unknown>).extra = 1), /exactly the fields/);
+});
+
+test("ringOf: first matching glob wins, unmatched is ring 1", () => {
+  const r: Rules = { ...defaultRules(), rings: [{ glob: "a/**", ring: 2 }, { glob: "a/k.ts", ring: 0 }] };
+  assert.equal(ringOf("a/k.ts", r), 2);
+  assert.equal(ringOf("b.ts", r), 1);
+});
+
+test("claimStake: the protocol formula, superlinear in lines and scaled by ring", () => {
+  const r = defaultRules();
+  assert.equal(claimStake(100, 1, r), 15);
+  assert.equal(claimStake(400, 0, r), 320);
+  assert.equal(claimStake(50, 1, r), 6);
+  assert.equal(claimStake(0, 2, r), 1, "max(lines, 1) keeps a zero-line task priced");
+  assert.ok(claimStake(200, 1, r) > 2 * claimStake(100, 1, r));
+});
+
+// Regression: these decide who may act or what runs, so they are kernel.
+test("default rings put auth wiring, build, deploy and toolchain config in ring 0", () => {
+  const r = defaultRules();
+  for (const p of [
+    "anthill-backend/src/http.ts",
+    "anthill-backend/src/App.ts",
+    "anthill-backend/Procfile",
+    "Procfile",
+    "anthill-backend/tsconfig.json",
+    "anthill-frontend/tsconfig.app.json",
+    "anthill-backend/scripts/backupLog.sh",
+    "anthill-contracts/remappings.txt",
+    "anthill-contracts/lib/forge-std/src/Test.sol",
+    "anthill-backend/docker-compose.yml",
+    "anthill-frontend/.github-like/ci.yaml",
+    "anthill-backend/Dockerfile.prod",
+    "anthill-frontend/vite.config.ts",
+    "anthill-frontend/index.html",
+    ".commons/rules.json",
+    "anthill-backend",
+  ]) {
+    assert.equal(ringOf(p, r), 0, p);
+  }
+  assert.equal(ringOf("anthill-backend/scripts/diffEngine.ts", r), 1);
+  assert.equal(ringOf("anthill-frontend/src/main.tsx", r), 2);
+});
+
+test("default locked paths cover registry and toolchain overrides", () => {
+  const locked = defaultRules().lockedPaths.map(globToRegExp);
+  for (const p of [".npmrc", "anthill-backend/.npmrc", "anthill-frontend/.yarnrc.yml", ".yarnrc", "anthill-backend/.nvmrc"]) {
+    assert.ok(locked.some((re) => re.test(p)), p);
+  }
+});
+
+// Regression: any backend source that checks admin tokens, passkeys, sessions
+// or reads the environment is kernel. Scans the real checkout when present.
+test("every Anthill backend source with auth or env handling is ring 0", (t) => {
+  const dir = path.join(__dirname, "..", "..", "anthill-backend", "src");
+  if (!fs.existsSync(dir)) return t.skip("anthill-backend not checked out");
+  const marker = /ADMIN_TOKEN|requireAdmin|passkey|webauthn|cookie|process\.env/i;
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".ts") && marker.test(fs.readFileSync(path.join(dir, f), "utf8")));
+  assert.ok(files.length > 0);
+  for (const f of files) assert.equal(ringOf(`anthill-backend/src/${f}`, defaultRules()), 0, f);
+});
+
+// Regression: `key in template` let Object.prototype names through as fields.
+test("validateRules: Object.prototype names are not known fields", () => {
+  for (const name of ["constructor", "valueOf", "toString", "hasOwnProperty"]) {
+    rejects((r) => ((r as unknown as Record<string, unknown>)[name] = "x"), new RegExp(`${name} is not a known field`));
+    rejects((r) => ((r.stake as unknown as Record<string, unknown>)[name] = 1), new RegExp(`stake\\.${name} is not a known field`));
+  }
+  const proto = JSON.parse(JSON.stringify(defaultRules()).replace(/^\{/, '{"__proto__":{"x":1},')) as Rules;
+  assert.ok(validateRules(proto).some((p) => /__proto__ is not a known field/.test(p)));
 });

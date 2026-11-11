@@ -3,8 +3,8 @@
 // promotion rule gates on (seeded recall and the critical-defect upper bound).
 // Pure: no clock, no randomness. Accuracy target is 1e-6 absolute on bounds.
 
-import { plantCaught, revealedPlants } from "./plants";
-import type { CommonsState } from "./types";
+import { atOrAfter, plantCaught, revealedPlants, windowStart } from "./plants";
+import type { CommonsState, FindingState, SubmissionState } from "./types";
 
 // ---------------------------------------------------------------------------
 // Special functions
@@ -28,7 +28,14 @@ export function logGamma(x: number): number {
 
 const EPS = 1e-15;
 const TINY = 1e-300;
-const MAX_ITER = 1000;
+
+// Near the distribution's centre, both the series and the continued fractions
+// need O(sqrt(shape)) terms. A cap fixed at 1000 fails from about shape = 2e4
+// (for example poissonUpper(20000, 0.9)). The terms shrink like
+// exp(-n²/(2·shape)), so 20·sqrt(shape) goes far past 1e-15.
+function maxIter(shape: number): number {
+  return 1000 + 20 * Math.ceil(Math.sqrt(shape));
+}
 
 // Continued fraction for the incomplete beta (Numerical Recipes betacf, modified
 // Lentz). Converges fast for x < (a+1)/(a+b+2); the caller uses the symmetry
@@ -42,7 +49,8 @@ function betaContinuedFraction(a: number, b: number, x: number): number {
   if (Math.abs(d) < TINY) d = TINY;
   d = 1 / d;
   let h = d;
-  for (let m = 1; m <= MAX_ITER; m++) {
+  const cap = maxIter(Math.max(a, b));
+  for (let m = 1; m <= cap; m++) {
     const m2 = 2 * m;
     let aa = (m * (b - m) * x) / ((qam + m2) * (a + m2));
     d = 1 + aa * d;
@@ -106,7 +114,8 @@ export function regularizedGammaP(a: number, x: number): number {
     let ap = a;
     let sum = 1 / a;
     let del = sum;
-    for (let n = 0; n < MAX_ITER; n++) {
+    const cap = maxIter(a);
+    for (let n = 0; n < cap; n++) {
       ap += 1;
       del *= x / ap;
       sum += del;
@@ -118,7 +127,8 @@ export function regularizedGammaP(a: number, x: number): number {
   let c = 1 / TINY;
   let d = 1 / b;
   let h = d;
-  for (let i = 1; i <= MAX_ITER; i++) {
+  const cap = maxIter(a);
+  for (let i = 1; i <= cap; i++) {
     const an = -i * (i - a);
     b += 2;
     d = an * d + b;
@@ -242,12 +252,6 @@ export function calibrationFactor(predictedEscapes: number, actualEscapes: numbe
 // Ledger-derived
 // ---------------------------------------------------------------------------
 
-function atOrAfter(iso: string, sinceIso: string): boolean {
-  const since = Date.parse(sinceIso);
-  if (Number.isNaN(since)) throw new RangeError(`invalid sinceIso: ${sinceIso}`);
-  return Date.parse(iso) >= since;
-}
-
 // Seeded recall over revealed plants submitted since `sinceIso`, with one-sided
 // 90% Clopper–Pearson bounds. No seeds gives the uninformative [0, 1].
 export function seededRecall(
@@ -263,42 +267,97 @@ export function seededRecall(
 
 const AT_LEAST_MEDIUM = new Set(["medium", "high", "critical"]);
 
-// Escapes since `sinceIso`, one per finding, whose finding is on the ledger.
-function escapesSince(state: CommonsState, sinceIso: string): { severity: string }[] {
+// Escapes, one per finding, whose finding is on the ledger. One defect filed as
+// two findings is two escapes, and the severity is the finder's own claim.
+// Neither can be fixed here: the ledger records no duplicate link and no
+// adjudicated severity.
+function uniqueEscapes(state: CommonsState): { finding: FindingState; snapshotId: string; at: string }[] {
   const seen = new Set<string>();
-  const out: { severity: string }[] = [];
+  const out: { finding: FindingState; snapshotId: string; at: string }[] = [];
   for (const e of state.escapes) {
-    if (seen.has(e.findingId) || !atOrAfter(e.at, sinceIso)) continue;
     const f = state.findings.get(e.findingId);
-    if (!f) continue;
+    if (seen.has(e.findingId) || !f) continue;
     seen.add(e.findingId);
-    out.push({ severity: f.severity });
+    out.push({ finding: f, snapshotId: e.snapshotId, at: e.at });
   }
   return out;
 }
 
-// What reviewers predicted would escape: for each non-plant submission shipped
-// in a snapshot promoted since `sinceIso`, the mean revealed defectProbability
-// (the probability of a defect of severity >= medium). Submissions without a
-// revealed review contribute nothing; there was no prediction to calibrate.
-export function predictedEscapes(state: CommonsState, sinceIso: string): number {
-  const shipped = new Set<string>();
+// When each snapshot's content first reached main: the earliest promotion of
+// the snapshot itself or of a descendant, because a promotion ships the whole
+// ancestry. Snapshots that never reached main are absent.
+function firstShipped(state: CommonsState): Map<string, { seq: number; at: string }> {
+  const out = new Map<string, { seq: number; at: string }>();
   for (const snap of state.snapshots.values()) {
-    if (snap.promoted && atOrAfter(snap.promoted.at, sinceIso)) for (const id of snap.submissionIds) shipped.add(id);
+    if (!snap.promoted) continue;
+    const visited = new Set<string>(); // the ledger makes chains acyclic; hand-built state might not
+    for (let cur: string | null = snap.id; cur !== null && !visited.has(cur); ) {
+      visited.add(cur);
+      const prev = out.get(cur);
+      if (!prev || snap.promoted.seq < prev.seq) out.set(cur, snap.promoted);
+      cur = state.snapshots.get(cur)?.previousSnapshotId ?? null;
+    }
   }
+  return out;
+}
+
+// The calibration cohort: snapshots that first reached main at or after
+// `sinceIso`. Predicted and actual escapes are both counted over the same
+// cohort, so an escape found now in work shipped before the window has no
+// prediction to be compared with and is left out of calibration.
+function cohort(state: CommonsState, sinceIso: string): Set<string> {
+  windowStart(sinceIso);
+  const out = new Set<string>();
+  for (const [id, p] of firstShipped(state)) if (atOrAfter(p.at, sinceIso)) out.add(id);
+  return out;
+}
+
+// Mean revealed defectProbability of the submission's assigned reviewers, or
+// null without one. Open reviewers are left out. One agent revealing p = 1 on
+// everything that shipped would otherwise inflate the prediction and pin
+// calibrationFactor at its floor.
+function assignedPrediction(s: SubmissionState): number | null {
+  const assigned = new Set(s.assignment?.reviewers ?? []);
+  const ps = s.reviews.flatMap((r) => (r.verdict && assigned.has(r.reviewer) ? [r.verdict.defectProbability] : []));
+  return ps.length === 0 ? null : ps.reduce((a, b) => a + b, 0) / ps.length;
+}
+
+// What reviewers predicted would escape from the cohort. For each non-plant
+// submission listed by a cohort snapshot, add the assigned reviewers' mean
+// defectProbability (probability of a defect of severity >= medium).
+// Submissions with no assigned reveal add nothing, because nothing was
+// predicted for them.
+export function predictedEscapes(state: CommonsState, sinceIso: string): number {
+  const shippedSnaps = cohort(state, sinceIso);
+  const counted = new Set<string>();
   let total = 0;
-  for (const id of shipped) {
-    const s = state.submissions.get(id);
-    if (!s || s.planted) continue;
-    const ps = s.reviews.flatMap((r) => (r.verdict ? [r.verdict.defectProbability] : []));
-    if (ps.length > 0) total += ps.reduce((a, b) => a + b, 0) / ps.length;
+  for (const id of shippedSnaps) {
+    for (const sid of state.snapshots.get(id)?.submissionIds ?? []) {
+      const s = state.submissions.get(sid);
+      if (!s || s.planted || counted.has(sid)) continue;
+      counted.add(sid);
+      total += assignedPrediction(s) ?? 0;
+    }
   }
   return total;
 }
 
-// Escapes since `sinceIso` of severity >= medium: the outcome predictedEscapes predicts.
+// Escapes of severity >= medium (the outcome predictedEscapes predicts) whose
+// defect lies in the cohort. The defect is located by the finding's target: a
+// snapshot directly, or the snapshot that lists the targeted submission. If
+// neither is known, the escape's own snapshot is used.
 export function actualEscapes(state: CommonsState, sinceIso: string): number {
-  return escapesSince(state, sinceIso).filter((e) => AT_LEAST_MEDIUM.has(e.severity)).length;
+  const shippedSnaps = cohort(state, sinceIso);
+  const snapshotOf = new Map<string, string>();
+  for (const snap of state.snapshots.values()) for (const sid of snap.submissionIds) snapshotOf.set(sid, snap.id);
+  let n = 0;
+  for (const { finding, snapshotId } of uniqueEscapes(state)) {
+    if (!AT_LEAST_MEDIUM.has(finding.severity)) continue;
+    const origin =
+      "snapshotId" in finding.target ? finding.target.snapshotId : snapshotOf.get(finding.target.submissionId);
+    if (shippedSnaps.has(origin !== undefined && state.snapshots.has(origin) ? origin : snapshotId)) n += 1;
+  }
+  return n;
 }
 
 // Upper bound (90%) on critical defects still undiscovered in what shipped.
@@ -310,11 +369,13 @@ export function actualEscapes(state: CommonsState, sinceIso: string): number {
 // zero observed escapes is not proof of zero defects. The result is scaled by
 // the calibration factor of reviewer predictions against actual escapes.
 // Without any revealed plant, recall is unknown and the bound is Infinity.
+// c counts critical escapes recorded since `sinceIso` (escape time).
+// Calibration uses the promotion cohort since `sinceIso`, as described above.
 export function criticalUpperBound90(state: CommonsState, sinceIso: string): number {
   const recall = seededRecall(state, sinceIso);
   if (recall.seeds < 1) return Number.POSITIVE_INFINITY;
   const r = recall.lower90;
-  const criticals = escapesSince(state, sinceIso).filter((e) => e.severity === "critical").length;
+  const criticals = uniqueEscapes(state).filter((e) => e.finding.severity === "critical" && atOrAfter(e.at, sinceIso)).length;
   const calibration = calibrationFactor(predictedEscapes(state, sinceIso), actualEscapes(state, sinceIso));
   return ((poissonUpper(criticals, 0.9) * (1 - r)) / Math.max(r, 1e-9)) * calibration;
 }

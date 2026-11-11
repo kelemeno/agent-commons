@@ -397,7 +397,8 @@ function enforcePolicy(ctx: Ctx, state: CommonsState, owner: OwnerId, body: Entr
     const task = state.tasks.get(body.taskId);
     if (task) {
       const stake = ctx.policy.claimStake(task.sizeEstimate, task.ring, state.rules);
-      if (body.stake !== stake) throw new HttpError(400, "stake", `claim stake must be ${stake}`);
+      // At least, as the ledger's own claim rule; more only locks more of the owner's reputation.
+      if (!(body.stake >= stake)) throw new HttpError(400, "stake", `claim stake must be at least ${stake}`);
     }
   }
 }

@@ -13,10 +13,22 @@
 // renders a sealed (committed, unrevealed) verdict: the ledger state holds no
 // verdict until a reveal matched the commitment, and the pages only say that a
 // commitment exists. Plants are shown only once plantReveal set
-// `submission.planted`; plant commitments are only counted.
+// `submission.planted`. Plant commitments are not listed in the stream at all:
+// where one sits relative to the submissions after it would point at the plant.
+//
+// Size contract. The ledger bounds no string or list length, so any agent can
+// write megabyte titles or thousands of changed files. Every attacker string is
+// clipped where it is displayed (`clip`, CLIP), every list is cut at MAX_LIST,
+// and /api/entries is capped by bytes as well as entries. The full values stay
+// in the signed entries, which /api/entries serves to anyone who wants them.
+//
+// Error contract. Exception text never reaches a reply: it can carry file
+// paths and internals. Failures go to `log`; the reply says only what failed.
 
 import { keyIdOf } from "../crypto";
+import { LedgerError } from "../ledger";
 import type {
+  AgentState,
   CommonsState,
   EntryBody,
   Evidence,
@@ -60,12 +72,26 @@ export type Site = {
   tree: TreeView;
   nowIso: string;
   derive: Derive;
+  // Reuses a rendered body for the same key while the ledger and `nowIso` are
+  // unchanged. The caller owns invalidation; without it everything is rendered
+  // per request.
+  memo?: <T>(key: string, f: () => T) => T;
+  // Where failures are reported instead of the reply. Defaults to console.error.
+  log?: (error: unknown) => void;
 };
 
 export type Reply = { status: number; headers: Record<string, string>; body: string };
 
 export const STREAM_LENGTH = 100;
 export const MAX_ENTRIES_PAGE = 500;
+// A page of /api/entries stops once its entries pass this many bytes (it always
+// carries at least one entry, so a client can make progress past a huge one).
+export const MAX_ENTRIES_BYTES = 4 * 1024 * 1024;
+// Display limits for attacker-controlled text: `line` in the stream and lists,
+// `text` on an object's own page, `id` for ids, names and paths.
+export const CLIP = { line: 200, text: 2000, id: 256 } as const;
+// Longest list rendered on any page; the rest is counted, not shown.
+export const MAX_LIST = 200;
 
 // ---------------------------------------------------------------------------
 // Escaping: the one helper
@@ -105,23 +131,49 @@ export function h(strings: TemplateStringsArray, ...parts: Part[]): Html {
 // Small formatting helpers
 // ---------------------------------------------------------------------------
 
-const path = (...segments: string[]) => `/${segments.map(encodeURIComponent).join("/")}`;
-const submissionHref = (id: string) => path("submissions", id);
-const snapshotHref = (id: string) => path("snapshots", id);
-const ownerHref = (id: string) => path("owners", id);
-const agentHref = (id: string) => path("agents", id);
-const anchor = (prefix: string, id: string) => `${prefix}-${encodeURIComponent(id)}`;
+export function clip(value: string, n: number): string {
+  return value.length <= n ? value : `${value.slice(0, n)}… [${value.length - n} more characters]`;
+}
+
+type ObjectKind = "submissions" | "snapshots" | "owners" | "agents";
+
+// The ledger accepts any non-empty id. "." and ".." are dot segments that URL
+// parsers (ours and every browser's) normalise away, and a huge id would make
+// every link to it huge, so those objects are linked by query instead: by the
+// seq of the entry that created them where there is one, else by id.
+function objectHref(kind: ObjectKind, id: string, seq?: number): string {
+  if (id.length <= CLIP.id && !/^\.{1,2}$/.test(id)) return `/${kind}/${encodeURIComponent(id)}`;
+  return seq === undefined ? `/${kind}?id=${encodeURIComponent(id)}` : `/${kind}?seq=${seq}`;
+}
+const submissionHref = (state: CommonsState, id: string) =>
+  objectHref("submissions", id, state.submissions.get(id)?.submittedSeq);
+const snapshotHref = (state: CommonsState, id: string) => objectHref("snapshots", id, state.snapshots.get(id)?.seq);
+const ownerHref = (id: string) => objectHref("owners", id);
+const agentHref = (id: string) => objectHref("agents", id);
+// Finding anchors use the filing seq: bounded, and unique like the id.
+const findingAnchor = (f: FindingState) => `f-${f.seq}`;
 
 function short(id: string, n = 8): string {
   return id.length > n + 2 ? `${id.slice(0, n)}…` : id;
 }
 
 function idLink(href: string, id: string): Html {
-  return h`<a class="id" href="${href}" title="${id}">${short(id, 12)}</a>`;
+  return h`<a class="id" href="${href}" title="${clip(id, CLIP.id)}">${short(id, 12)}</a>`;
 }
 
 function code(text: string, full?: string): Html {
-  return h`<code class="id" title="${full ?? text}">${text}</code>`;
+  return h`<code class="id" title="${clip(full ?? text, CLIP.id)}">${clip(text, CLIP.id)}</code>`;
+}
+
+// "and N more" under a list cut at `max`.
+function more(total: number, max = MAX_LIST): Html {
+  return total > max ? h`<p class="note">and ${total - max} more not shown; the full list is in the signed entries.</p>` : h``;
+}
+
+// Items rendered inline, comma-separated, cut at `max`.
+function inline<T>(items: readonly T[], render: (x: T) => Html | string, max: number): Html {
+  const shown = items.slice(0, max).map((x, i) => h`${i > 0 ? ", " : ""}${render(x)}`);
+  return h`${shown}${items.length > max ? ` and ${items.length - max} more` : ""}`;
 }
 
 type Tone = "ok" | "bad" | "warn" | "mut";
@@ -143,11 +195,11 @@ function fmtValue(v: unknown): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "number") return num(v);
   if (typeof v === "boolean") return v ? "yes" : "no";
-  if (typeof v === "string") return v;
+  if (typeof v === "string") return clip(v, CLIP.line);
   try {
-    return JSON.stringify(v);
+    return clip(JSON.stringify(v), CLIP.line);
   } catch {
-    return String(v);
+    return clip(String(v), CLIP.line);
   }
 }
 
@@ -174,16 +226,20 @@ function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-function attempt<T>(f: () => T): { ok: true; value: T } | { ok: false; error: string } {
+const defaultLog = (e: unknown) => console.error("playground:", e);
+
+// The error is logged, never returned: see the error contract above.
+function attempt<T>(site: Pick<Site, "log">, f: () => T): { ok: true; value: T } | { ok: false } {
   try {
     return { ok: true, value: f() };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    (site.log ?? defaultLog)(e);
+    return { ok: false };
   }
 }
 
-function unavailable(what: string, error: string): Html {
-  return h`<p class="note">${badge("warn", "unavailable")} ${what} could not be computed: ${error}</p>`;
+function unavailable(what: string): Html {
+  return h`<p class="note">${badge("warn", "unavailable")} ${what} could not be computed.</p>`;
 }
 
 function treeDistance(tree: TreeView, a: OwnerId | undefined, b: OwnerId | undefined): number | null {
@@ -200,14 +256,14 @@ function treeDistance(tree: TreeView, a: OwnerId | undefined, b: OwnerId | undef
 // ---------------------------------------------------------------------------
 
 function ownerLink(id: OwnerId): Html {
-  return h`<a href="${ownerHref(id)}">${id}</a>`;
+  return h`<a href="${ownerHref(id)}">${clip(id, CLIP.id)}</a>`;
 }
 
 function agentLabel(state: CommonsState, keyId: KeyId): Html {
   const a = state.agents.get(keyId);
   if (!a) return h`key ${code(short(keyId), keyId)}`;
   const revoked = a.active ? "" : h` ${badge("bad", "revoked")}`;
-  return h`agent ${idLink(agentHref(keyId), keyId)} (owner ${ownerLink(a.owner)}, ${a.modelFamily})${revoked}`;
+  return h`agent ${idLink(agentHref(keyId), keyId)} (owner ${ownerLink(a.owner)}, ${clip(a.modelFamily, CLIP.id)})${revoked}`;
 }
 
 // Who signed an entry, as a phrase.
@@ -236,16 +292,22 @@ function reproductionText(r: { failsOnHead: boolean; passesOnParent: boolean }):
   return `${r.failsOnHead ? "fails" : "passes"} on head, ${r.passesOnParent ? "passes" : "fails"} on parent`;
 }
 
+// The ledger refuses to merge a PR with any failed gate result (ledger.ts,
+// "merge"), so a failure stays a block even if a later run of that gate passed.
+// The label follows the ledger's rule rather than the latest run.
+function statusOf(state: CommonsState, s: SubmissionState): { tone: Tone; label: string } {
+  if (s.merged) return { tone: "ok", label: "merged" };
+  if (s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true)) {
+    return { tone: "bad", label: "blocked: reproduced finding" };
+  }
+  if (s.gates.some((g) => !g.pass)) return { tone: "bad", label: "blocked: gate failed" };
+  if (s.assignment) return { tone: "mut", label: "in review" };
+  return { tone: "mut", label: "open" };
+}
+
 function submissionStatus(state: CommonsState, s: SubmissionState): Html {
-  const parts: Html[] = [];
-  if (s.planted) parts.push(badge("warn", "planted bug (revealed)"));
-  const reproduced = s.findingIds.some((id) => state.findings.get(id)?.result?.reproduced === true);
-  if (s.merged) parts.push(badge("ok", "merged"));
-  else if (reproduced) parts.push(badge("bad", "blocked: reproduced finding"));
-  else if (s.gates.some((g) => !g.pass)) parts.push(badge("bad", "blocked: gate failed"));
-  else if (s.assignment) parts.push(badge("mut", "in review"));
-  else parts.push(badge("mut", "open"));
-  return h`${parts.map((p) => h`${p} `)}`;
+  const { tone, label } = statusOf(state, s);
+  return h`${s.planted ? h`${badge("warn", "planted bug (revealed)")} ` : ""}${badge(tone, label)} `;
 }
 
 function snapshotStatus(s: SnapshotState): Html {
@@ -256,33 +318,34 @@ function reviewCell(r: ReviewState): Html {
   if (!r.verdict) return h`${badge("mut", "sealed")} commitment recorded at #${r.committedSeq}`;
   const p = r.verdict.defectProbability;
   const tone: Tone = p >= 0.5 ? "bad" : p >= 0.2 ? "warn" : "ok";
-  return h`${badge(tone, `defect p=${p.toFixed(2)}`)} ${r.verdict.summary}`;
+  return h`${badge(tone, `defect p=${p.toFixed(2)}`)} ${clip(r.verdict.summary, CLIP.text)}`;
 }
 
 function evidenceKinds(ev: readonly Evidence[]): string {
   const names = { failingTest: "failing test", diagnostic: "diagnostic", location: "location" } as const;
-  return ev.map((e) => names[e.kind] ?? "evidence").join(", ");
+  return [...new Set(ev.map((e) => names[e.kind] ?? "evidence"))].join(", ");
 }
 
 function targetLink(state: CommonsState, target: FindingState["target"]): Html {
-  if ("submissionId" in target) return h`PR ${idLink(submissionHref(target.submissionId), target.submissionId)}`;
+  if ("submissionId" in target) return h`PR ${idLink(submissionHref(state, target.submissionId), target.submissionId)}`;
   return state.snapshots.has(target.snapshotId)
-    ? h`snapshot ${idLink(snapshotHref(target.snapshotId), target.snapshotId)}`
-    : h`snapshot ${target.snapshotId}`;
+    ? h`snapshot ${idLink(snapshotHref(state, target.snapshotId), target.snapshotId)}`
+    : h`snapshot ${code(target.snapshotId)}`;
 }
 
 function findingLink(state: CommonsState, id: string): Html {
   const f = state.findings.get(id);
-  if (!f) return h`finding ${id}`;
-  const page = "submissionId" in f.target ? submissionHref(f.target.submissionId) : snapshotHref(f.target.snapshotId);
-  return h`finding <a class="id" href="${page}#${anchor("f", id)}" title="${id}">${short(id, 12)}</a>`;
+  if (!f) return h`finding ${code(id)}`;
+  const page =
+    "submissionId" in f.target ? submissionHref(state, f.target.submissionId) : snapshotHref(state, f.target.snapshotId);
+  return h`finding <a class="id" href="${page}#${findingAnchor(f)}" title="${clip(id, CLIP.id)}">${short(id, 12)}</a>`;
 }
 
 // A settlement ref is free text; link it when it names a known object exactly.
 function refLink(state: CommonsState, ref: string): Html {
-  if (state.submissions.has(ref)) return h`PR ${idLink(submissionHref(ref), ref)}`;
+  if (state.submissions.has(ref)) return h`PR ${idLink(submissionHref(state, ref), ref)}`;
   if (state.findings.has(ref)) return findingLink(state, ref);
-  if (state.snapshots.has(ref)) return h`snapshot ${idLink(snapshotHref(ref), ref)}`;
+  if (state.snapshots.has(ref)) return h`snapshot ${idLink(snapshotHref(state, ref), ref)}`;
   return code(short(ref, 24), ref);
 }
 
@@ -293,8 +356,9 @@ function refLink(state: CommonsState, ref: string): Html {
 export function sentence(state: CommonsState, entry: LedgerEntry): Html {
   const b: EntryBody = entry.body;
   const who = actor(state, entry.signer);
-  const pr = (id: string) => h`PR ${idLink(submissionHref(id), id)}`;
-  const snap = (id: string) => h`snapshot ${idLink(snapshotHref(id), id)}`;
+  const pr = (id: string) => h`PR ${idLink(submissionHref(state, id), id)}`;
+  const snap = (id: string) => h`snapshot ${idLink(snapshotHref(state, id), id)}`;
+  const line = (text: string) => clip(text, CLIP.line);
   switch (b.kind) {
     case "genesis":
       return h`ledger opened for project ${code(b.project)} with ${plural(b.admins.length, "admin")} (rules v${b.rules.version})`;
@@ -304,12 +368,12 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
         : h`owner ${ownerLink(b.owner)} joined, invited by ${ownerLink(b.inviter)}`;
     case "agentRegistered": {
       const keyId = keyIdOf(b.publicKey);
-      return h`owner ${ownerLink(b.owner)} registered agent ${idLink(agentHref(keyId), keyId)} (${b.modelFamily}, harness ${b.harness})`;
+      return h`owner ${ownerLink(b.owner)} registered agent ${idLink(agentHref(keyId), keyId)} (${line(b.modelFamily)}, harness ${line(b.harness)})`;
     }
     case "agentRevoked":
-      return h`${agentLabel(state, b.agent)} was ${entry.signer === state.coordinatorKey ? "suspended by the coordinator" : "revoked by its owner"}: ${b.reason}`;
+      return h`${agentLabel(state, b.agent)} was ${entry.signer === state.coordinatorKey ? "suspended by the coordinator" : "revoked by its owner"}: ${line(b.reason)}`;
     case "proposal":
-      return h`${who} proposed ${code(b.id)}: “${b.title}” (evidence: ${evidenceKinds(b.evidence)})`;
+      return h`${who} proposed ${code(b.id)}: “${line(b.title)}” (evidence: ${evidenceKinds(b.evidence)})`;
     case "task":
       return h`task ${code(b.id)} opened from proposal ${code(b.proposalId)}: ring ${b.ring}, ~${b.sizeEstimate} lines, spec by ${ownerLink(b.specAuthor)}`;
     case "claim":
@@ -319,13 +383,13 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
     case "gateResult":
       return b.pass
         ? h`gate ${code(b.gate)} ${badge("ok", "passed")} on ${pr(b.submissionId)}`
-        : h`gate ${code(b.gate)} ${badge("bad", "failed")} on ${pr(b.submissionId)}: ${b.details}`;
+        : h`gate ${code(b.gate)} ${badge("bad", "failed")} on ${pr(b.submissionId)}: ${line(b.details)}`;
     case "reviewAssignment":
-      return h`reviewers drawn for ${pr(b.submissionId)}: ${b.reviewers.map((r, i) => h`${i > 0 ? ", " : ""}${agentLabel(state, r)}`)}`;
+      return h`reviewers drawn for ${pr(b.submissionId)}: ${inline(b.reviewers, (r) => agentLabel(state, r), 10)}`;
     case "reviewCommit":
       return h`${who} sealed a review of ${pr(b.submissionId)} (stake ${b.stake})`;
     case "reviewReveal":
-      return h`${who} reviewed ${pr(b.submissionId)}: defect p=${b.verdict.defectProbability.toFixed(2)} — ${b.verdict.summary}`;
+      return h`${who} reviewed ${pr(b.submissionId)}: defect p=${b.verdict.defectProbability.toFixed(2)} — ${line(b.verdict.summary)}`;
     case "finding":
       return h`${who} filed ${findingLink(state, b.id)} (${b.severity}) on ${targetLink(state, b.target)}: ${code(b.testPath)}`;
     case "findingResult": {
@@ -341,7 +405,7 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
     case "attestCommit":
       return h`${who} sealed an attestation of ${snap(b.snapshotId)} (stake ${b.stake})`;
     case "attestReveal":
-      return h`${who} attested ${snap(b.snapshotId)}: defect p=${b.verdict.defectProbability.toFixed(2)} — ${b.verdict.summary}`;
+      return h`${who} attested ${snap(b.snapshotId)}: defect p=${b.verdict.defectProbability.toFixed(2)} — ${line(b.verdict.summary)}`;
     case "signoff": {
       const owner = state.ownerByKey.get(entry.signer);
       return h`kernel signer ${owner === undefined ? who : ownerLink(owner)} signed off ${snap(b.snapshotId)}`;
@@ -349,10 +413,10 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
     case "promotion":
       return h`${snap(b.snapshotId)} ${badge("ok", "promoted")} to main`;
     case "plantCommit":
-      // Only the fact of a commitment: what it commits to is secret until the reveal.
+      // Not shown in the overview stream (see the header); kept for completeness.
       return h`the seeding custodian committed to a planted bug (sealed)`;
     case "plantReveal":
-      return h`${pr(b.submissionId)} revealed as a ${badge("warn", "planted bug")} (${b.severity}): ${b.description}`;
+      return h`${pr(b.submissionId)} revealed as a ${badge("warn", "planted bug")} (${b.severity}): ${line(b.description)}`;
     case "honeytokenTriggered":
       return h`${agentLabel(state, b.agent)} ${badge("bad", "triggered a honeytoken")} ${code(b.tokenId)}`;
     case "escape":
@@ -363,7 +427,7 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
       return h`rules changed to v${b.rules.version} (poll ${code(b.pollId)})`;
     default: {
       const unknown: { kind?: unknown } = b;
-      return h`entry of kind ${String(unknown.kind)}`;
+      return h`entry of kind ${code(String(unknown.kind))}`;
     }
   }
 }
@@ -441,7 +505,7 @@ function page(site: { state: CommonsState; nowIso: string } | null, title: strin
   return h`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>${title} · agent commons</title><style>${new Html(CSS)}</style></head>
+<title>${clip(title, 80)} · agent commons</title><style>${new Html(CSS)}</style></head>
 <body><main>
 <header class="top"><a class="home" href="/">agent commons</a>${meta}<button id="refresh-toggle" type="button">auto-refresh: on</button></header>
 ${body}
@@ -469,64 +533,78 @@ ${c(snaps.length, "snapshots")}${c(snaps.filter((s) => s.promoted).length, "prom
 ${c(state.escapes.length, "escapes")}${c(state.settlements.length, "settlements")}
 </div>`;
 
-  const m = attempt(() => site.derive.metrics());
+  const m = attempt(site, () => site.derive.metrics());
   const metrics = !m.ok
-    ? unavailable("Metrics", m.error)
+    ? unavailable("Metrics")
     : m.value.length === 0
       ? h`<p class="note">No metrics yet.</p>`
       : h`<table><thead><tr><th>group</th><th>metric</th><th>value</th><th>status</th><th>note</th></tr></thead><tbody>
 ${m.value.map(
   (r) =>
-    h`<tr class="${r.bad ? "bad" : ""}"><td>${r.group}</td><td>${r.metric}</td><td><code>${fmtValue(r.value)}</code></td><td>${r.bad ? badge("bad", "attention") : badge("ok", "ok")}</td><td>${r.note}</td></tr>\n`,
+    h`<tr class="${r.bad ? "bad" : ""}"><td>${r.group}</td><td>${r.metric}</td><td><code>${fmtValue(r.value)}</code></td><td>${r.bad ? badge("bad", "attention") : badge("ok", "ok")}</td><td>${clip(r.note, CLIP.text)}</td></tr>\n`,
 )}</tbody></table>`;
 
-  const latest = entries.slice(-STREAM_LENGTH).reverse();
+  // Plant commitments are left out: see the header.
+  const latest: LedgerEntry[] = [];
+  for (let i = entries.length - 1; i >= 0 && latest.length < STREAM_LENGTH; i--) {
+    const e = entries[i] as LedgerEntry;
+    if (e.body.kind !== "plantCommit") latest.push(e);
+  }
   const stream = h`<ol class="stream">${latest.map(
     (e) =>
-      h`<li><span class="seq">#${e.seq}</span><span class="when" title="${e.at}">${ago(e.at, nowIso)}</span>${attemptHtml(() => sentence(state, e))}</li>\n`,
+      h`<li><span class="seq">#${e.seq}</span><span class="when" title="${e.at}">${ago(e.at, nowIso)}</span>${attemptHtml(site, () => sentence(state, e))}</li>\n`,
   )}</ol>`;
 
   const openSubs = subs.filter((s) => !s.merged).slice(-20).reverse();
   const recentSnaps = snaps.slice(-10).reverse();
   const owners = [...state.owners.values()].sort((a, b) => b.reputationDelta - a.reputationDelta || cmp(a.id, b.id));
+  const agentCount = agentsByOwner(state);
 
   const body = h`<h1>Agents at work</h1>
 <p class="note">A live view of the commons ledger: proposals, PRs, sealed reviews, reproduced findings, snapshots and settlements, each one a signed entry.</p>
 ${counts}
 <h2>Health</h2>${metrics}
-<h2>Latest ${Math.min(STREAM_LENGTH, entries.length)} entries</h2>${stream}
+<h2>Latest ${latest.length} entries</h2>${stream}
+<p class="note">Plant commitments are not listed here, so their position cannot point at a plant; they are in the signed entries.</p>
 <h2>Open PRs</h2>${
     openSubs.length === 0
       ? h`<p class="note">None.</p>`
-      : h`<ul class="plain">${openSubs.map((s) => h`<li>${idLink(submissionHref(s.id), s.id)} ${submissionStatus(state, s)} by ${agentLabel(state, s.author)}</li>`)}</ul>`
+      : h`<ul class="plain">${openSubs.map((s) => h`<li>${idLink(submissionHref(state, s.id), s.id)} ${submissionStatus(state, s)} by ${agentLabel(state, s.author)}</li>`)}</ul>`
   }
 <h2>Snapshots</h2>${
     recentSnaps.length === 0
       ? h`<p class="note">None.</p>`
-      : h`<ul class="plain">${recentSnaps.map((s) => h`<li>${idLink(snapshotHref(s.id), s.id)} ${snapshotStatus(s)} ${plural(s.submissionIds.length, "PR")}</li>`)}</ul>`
+      : h`<ul class="plain">${recentSnaps.map((s) => h`<li>${idLink(snapshotHref(state, s.id), s.id)} ${snapshotStatus(s)} ${plural(s.submissionIds.length, "PR")}</li>`)}</ul>`
   }
 <h2>Owners</h2>${
     owners.length === 0
       ? h`<p class="note">None.</p>`
-      : h`<table><thead><tr><th>owner</th><th>reputation delta</th><th>locked stake</th><th>agents</th></tr></thead><tbody>${owners.map(
+      : h`<table><thead><tr><th>owner</th><th>reputation delta</th><th>locked stake</th><th>agents</th></tr></thead><tbody>${owners.slice(0, MAX_LIST).map(
           (o) =>
-            h`<tr><td>${ownerLink(o.id)}</td><td>${signed(o.reputationDelta)}</td><td>${o.lockedStake}</td><td>${agentsOf(state, o.id).length}</td></tr>`,
-        )}</tbody></table>`
+            h`<tr><td>${ownerLink(o.id)}</td><td>${signed(o.reputationDelta)}</td><td>${o.lockedStake}</td><td>${agentCount.get(o.id)?.length ?? 0}</td></tr>`,
+        )}</tbody></table>${more(owners.length)}`
   }`;
   return page(site, "overview", body);
 }
 
-function attemptHtml(f: () => Html): Html {
-  const r = attempt(f);
-  return r.ok ? r.value : h`${badge("warn", "unrenderable entry")} ${r.error}`;
+function attemptHtml(site: Site, f: () => Html): Html {
+  const r = attempt(site, f);
+  return r.ok ? r.value : badge("warn", "unrenderable entry");
 }
 
 function cmp(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function agentsOf(state: CommonsState, owner: OwnerId) {
-  return [...state.agents.values()].filter((a) => a.owner === owner);
+// One pass over the agents; calling a per-owner filter in a loop is owners x agents.
+function agentsByOwner(state: CommonsState): Map<OwnerId, AgentState[]> {
+  const out = new Map<OwnerId, AgentState[]>();
+  for (const a of state.agents.values()) {
+    const list = out.get(a.owner);
+    if (list) list.push(a);
+    else out.set(a.owner, [a]);
+  }
+  return out;
 }
 
 function submissionPage(site: Site, s: SubmissionState): string {
@@ -536,20 +614,24 @@ function submissionPage(site: Site, s: SubmissionState): string {
   const task = s.taskId === null ? undefined : state.tasks.get(s.taskId);
   const proposal = task ? state.proposals.get(task.proposalId) : undefined;
 
+  // Every gate result stays on the ledger and every failure blocks the merge
+  // (see statusOf), so a failure a later run passed is shown, and said so.
+  const laterPass = (i: number) => s.gates.some((g, j) => j > i && g.pass && g.gate === s.gates[i]?.gate);
   const gates =
     s.gates.length === 0
       ? h`<p class="note">No gate results recorded yet.</p>`
-      : h`<table><thead><tr><th>gate</th><th>result</th><th>details</th></tr></thead><tbody>${s.gates.map(
-          (g) =>
-            h`<tr class="${g.pass ? "" : "bad"}"><td><code>${g.gate}</code></td><td>${g.pass ? badge("ok", "pass") : badge("bad", "fail")}</td><td>${g.details}</td></tr>`,
-        )}</tbody></table>`;
+      : h`<table><thead><tr><th>gate</th><th>result</th><th>details</th></tr></thead><tbody>${s.gates.slice(0, MAX_LIST).map(
+          (g, i) =>
+            h`<tr class="${g.pass ? "" : "bad"}"><td>${code(g.gate)}</td><td>${g.pass ? badge("ok", "pass") : badge("bad", "fail")}${!g.pass && laterPass(i) ? h`<br><span class="note">a later run passed; the ledger still counts this failure</span>` : ""}</td><td>${clip(g.details, CLIP.text)}</td></tr>`,
+        )}</tbody></table>${more(s.gates.length)}`;
 
   // Assigned seats first (even if not yet committed), then open reviewers.
   const assigned = s.assignment?.reviewers ?? [];
+  const assignedSet = new Set(assigned);
   const byReviewer = new Map(s.reviews.map((r) => [r.reviewer, r]));
   const rows = [
     ...assigned.map((k) => ({ keyId: k, seat: "assigned", review: byReviewer.get(k) })),
-    ...s.reviews.filter((r) => !assigned.includes(r.reviewer)).map((r) => ({ keyId: r.reviewer, seat: "open", review: r })),
+    ...s.reviews.filter((r) => !assignedSet.has(r.reviewer)).map((r) => ({ keyId: r.reviewer, seat: "open", review: r })),
   ];
   const otherFamily = rows.some((r) => {
     const f = state.agents.get(r.keyId)?.modelFamily;
@@ -558,19 +640,19 @@ function submissionPage(site: Site, s: SubmissionState): string {
   const reviewers =
     rows.length === 0
       ? h`<p class="note">No reviewers drawn yet.</p>`
-      : h`<table><thead><tr><th>reviewer</th><th>model</th><th>tree distance</th><th>seat</th><th>review</th></tr></thead><tbody>${rows.map(
+      : h`<table><thead><tr><th>reviewer</th><th>model</th><th>tree distance</th><th>seat</th><th>review</th></tr></thead><tbody>${rows.slice(0, MAX_LIST).map(
           (r) => {
             const agent = state.agents.get(r.keyId);
             const d = treeDistance(tree, authorOwner, agent?.owner);
             const sameFamily = agent !== undefined && agent.modelFamily === authorFamily;
-            return h`<tr><td>${agentLabel(state, r.keyId)}</td><td>${agent?.modelFamily ?? "?"}${sameFamily ? h` ${badge("warn", "same as author")}` : ""}</td><td>${d === null ? h`<span class="note">not in tree</span>` : d}</td><td>${r.seat}</td><td>${r.review ? reviewCell(r.review) : badge("mut", "not committed")}</td></tr>`;
+            return h`<tr><td>${agentLabel(state, r.keyId)}</td><td>${clip(agent?.modelFamily ?? "?", CLIP.id)}${sameFamily ? h` ${badge("warn", "same as author")}` : ""}</td><td>${d === null ? h`<span class="note">not in tree</span>` : d}</td><td>${r.seat}</td><td>${r.review ? reviewCell(r.review) : badge("mut", "not committed")}</td></tr>`;
           },
-        )}</tbody></table>
+        )}</tbody></table>${more(rows.length)}
 <p class="note">${otherFamily ? badge("ok", "other model family present") : badge("warn", "no other model family")} Sealed reviews show only that a commitment exists; the verdict appears once it is revealed and matches.</p>`;
 
   const findingRows = s.findingIds.map((id) => state.findings.get(id)).filter((f): f is FindingState => f !== undefined);
   const body = h`<h1>PR ${code(s.id)} ${submissionStatus(state, s)}</h1>
-${proposal ? h`<p>“${proposal.title}”</p>` : ""}
+${proposal ? h`<p>“${clip(proposal.title, CLIP.text)}”</p>` : ""}
 <dl>
 <dt>author</dt><dd>${agentLabel(state, s.author)}</dd>
 <dt>task</dt><dd>${task ? h`${code(task.id)} · ring ${task.ring} · spec by ${ownerLink(task.specAuthor)}` : "none (untasked)"}</dd>
@@ -580,8 +662,8 @@ ${proposal ? h`<p>“${proposal.title}”</p>` : ""}
 ${s.merged ? h`<dt>merged</dt><dd>${fmtTime(s.merged.at)} at ${code(short(s.merged.commit, 12), s.merged.commit)}</dd>` : ""}
 ${s.assignment ? h`<dt>beacon</dt><dd>${code(short(s.assignment.beacon, 16), s.assignment.beacon)} (#${s.assignment.seq})</dd>` : ""}
 </dl>
-${s.planted ? h`<p>${badge("warn", "planted bug")} revealed after the review window: (${s.planted.severity}) ${s.planted.description}</p>` : ""}
-<h2>Changed files</h2><ul class="plain">${s.changedFiles.map((f) => h`<li><code>${f}</code></li>`)}</ul>
+${s.planted ? h`<p>${badge("warn", "planted bug")} revealed after the review window: (${s.planted.severity}) ${clip(s.planted.description, CLIP.text)}</p>` : ""}
+<h2>Changed files</h2><ul class="plain">${s.changedFiles.slice(0, MAX_LIST).map((f) => h`<li>${code(f)}</li>`)}</ul>${more(s.changedFiles.length)}
 <h2>Gates</h2>${gates}
 <h2>Reviewers</h2>${reviewers}
 <h2>Findings</h2>${findingsTable(site, findingRows)}`;
@@ -591,32 +673,35 @@ ${s.planted ? h`<p>${badge("warn", "planted bug")} revealed after the review win
 function findingsTable(site: Site, findings: FindingState[]): Html {
   const { state } = site;
   if (findings.length === 0) return h`<p class="note">No findings filed.</p>`;
-  return h`<table><thead><tr><th>finding</th><th>by</th><th>severity</th><th>test</th><th>reproduction</th></tr></thead><tbody>${findings.map(
+  return h`<table><thead><tr><th>finding</th><th>by</th><th>severity</th><th>test</th><th>reproduction</th></tr></thead><tbody>${findings.slice(0, MAX_LIST).map(
     (f) =>
-      h`<tr id="${anchor("f", f.id)}"><td>${code(short(f.id, 12), f.id)}</td><td>${agentLabel(state, f.finder)}</td><td>${f.severity}</td><td><code>${f.testPath}</code><br><span class="note">$ </span><code>${f.testCommand}</code></td><td>${findingStatus(f)}${
+      h`<tr id="${findingAnchor(f)}"><td>${code(short(f.id, 12), f.id)}</td><td>${agentLabel(state, f.finder)}</td><td>${f.severity}</td><td>${code(f.testPath)}<br><span class="note">$ </span><code>${clip(f.testCommand, CLIP.text)}</code></td><td>${findingStatus(f)}${
         f.result
           ? h`<br><span class="note">${reproductionText(f.result)}; log ${code(short(f.result.logDigest, 12), f.result.logDigest)}</span>`
           : ""
       }</td></tr>`,
-  )}</tbody></table>`;
+  )}</tbody></table>${more(findings.length)}`;
 }
 
 function snapshotPage(site: Site, snap: SnapshotState): string {
   const { state } = site;
+  const ANCESTRY = 50;
   const ancestry: SnapshotState[] = [];
-  for (let s: SnapshotState | undefined = snap; s && ancestry.length < 1000; ) {
+  let s: SnapshotState | undefined = snap;
+  for (; s && ancestry.length < ANCESTRY; ) {
     ancestry.push(s);
     s = s.previousSnapshotId === null ? undefined : state.snapshots.get(s.previousSnapshotId);
   }
+  const olderAncestors = s !== undefined;
 
-  const coverageRows = snap.submissionIds.map((sid) => {
+  const coverageRows = snap.submissionIds.slice(0, MAX_LIST).map((sid) => {
     const s = state.submissions.get(sid);
-    if (!s) return h`<tr><td>${sid}</td><td colspan="4">unknown</td></tr>`;
+    if (!s) return h`<tr><td>${code(sid)}</td><td colspan="4">unknown</td></tr>`;
     const revealed = s.reviews.filter((r) => r.verdict);
-    const families = new Set(revealed.map((r) => state.agents.get(r.reviewer)?.modelFamily ?? "?"));
+    const families = new Set(revealed.map((r) => clip(state.agents.get(r.reviewer)?.modelFamily ?? "?", CLIP.id)));
     const reproduced = s.findingIds.filter((id) => state.findings.get(id)?.result?.reproduced === true).length;
     const reviewTone: Tone = revealed.length === 0 ? "bad" : "ok";
-    return h`<tr><td>${idLink(submissionHref(sid), sid)}</td><td>${badge(reviewTone, `${revealed.length}/${s.reviews.length} revealed`)}</td><td>${[...families].sort().join(", ") || "—"}</td><td>${s.findingIds.length} (${reproduced} reproduced)</td><td>${s.planted ? badge("warn", "plant") : ""}</td></tr>`;
+    return h`<tr><td>${idLink(submissionHref(state, sid), sid)}</td><td>${badge(reviewTone, `${revealed.length}/${s.reviews.length} revealed`)}</td><td>${families.size === 0 ? "—" : inline([...families].sort(), (f) => f, 10)}</td><td>${s.findingIds.length} (${reproduced} reproduced)</td><td>${s.planted ? badge("warn", "plant") : ""}</td></tr>`;
   });
   const reviewed = snap.submissionIds.filter((sid) => state.submissions.get(sid)?.reviews.some((r) => r.verdict)).length;
 
@@ -626,24 +711,24 @@ function snapshotPage(site: Site, snap: SnapshotState): string {
   const attestations =
     snap.attestations.length === 0
       ? h`<p class="note">No attestations yet.</p>`
-      : h`<table><thead><tr><th>attester</th><th>attestation</th></tr></thead><tbody>${snap.attestations.map(
+      : h`<table><thead><tr><th>attester</th><th>attestation</th></tr></thead><tbody>${snap.attestations.slice(0, MAX_LIST).map(
           (a) => h`<tr><td>${agentLabel(state, a.reviewer)}</td><td>${reviewCell(a)}</td></tr>`,
-        )}</tbody></table>
-<p class="note">Revealed attestations span ${plural(attFamilies.size, "model family", "model families")} and ${plural(attOwners.size, "owner")}.</p>`;
+        )}</tbody></table>${more(snap.attestations.length)}
+<p class="note">Revealed attestations span ${plural(attFamilies.size, "model family", "model families")} and ${plural(attOwners.size, "owner")}. Sealed attestations show only that a commitment exists.</p>`;
 
   const need = state.rules.promotion.kernelSignoffs;
   const signers = state.rules.kernelSigners;
   const signoffs = h`<p>${badge(snap.signoffs.length >= need ? "ok" : "warn", `${snap.signoffs.length} of ${need} required`)} ${
-    snap.signoffs.length === 0 ? "no signoffs yet" : snap.signoffs.map((o, i) => h`${i > 0 ? ", " : ""}${ownerLink(o)}`)
-  }</p><p class="note">Kernel signers: ${signers.length === 0 ? "none configured" : signers.map((o, i) => h`${i > 0 ? ", " : ""}${o}`)}</p>`;
+    snap.signoffs.length === 0 ? "no signoffs yet" : inline(snap.signoffs, ownerLink, MAX_LIST)
+  }</p><p class="note">Kernel signers: ${signers.length === 0 ? "none configured" : inline(signers, (o) => clip(o, CLIP.id), MAX_LIST)}</p>`;
 
-  const p = attempt(() => site.derive.promotion(snap.id));
+  const p = attempt(site, () => site.derive.promotion(snap.id));
   const promotion = !p.ok
-    ? unavailable("Promotion checks", p.error)
+    ? unavailable("Promotion checks")
     : h`<p>${p.value.pass ? badge("ok", "all checks pass") : badge("bad", "not ready")}</p>
 <table><thead><tr><th>check</th><th>result</th><th>detail</th></tr></thead><tbody>${p.value.checks.map(
         (c) =>
-          h`<tr class="${c.pass ? "" : "bad"}"><td>${c.name}</td><td>${c.pass ? badge("ok", "pass") : badge("bad", "fail")}</td><td>${c.detail}</td></tr>`,
+          h`<tr class="${c.pass ? "" : "bad"}"><td>${c.name}</td><td>${c.pass ? badge("ok", "pass") : badge("bad", "fail")}</td><td>${clip(c.detail, CLIP.text)}</td></tr>`,
       )}</tbody></table>`;
 
   const snapFindings = [...state.findings.values()].filter((f) => "snapshotId" in f.target && f.target.snapshotId === snap.id);
@@ -653,18 +738,18 @@ function snapshotPage(site: Site, snap: SnapshotState): string {
 <dl>
 <dt>commit</dt><dd>${code(short(snap.commit, 12), snap.commit)}</dd>
 <dt>cut</dt><dd>${fmtTime(snap.at)} (#${snap.seq})</dd>
-<dt>previous</dt><dd>${snap.previousSnapshotId === null ? "none" : idLink(snapshotHref(snap.previousSnapshotId), snap.previousSnapshotId)}</dd>
-<dt>ancestry</dt><dd>${ancestry.map((s, i) => h`${i > 0 ? " ← " : ""}${idLink(snapshotHref(s.id), s.id)}`)}</dd>
+<dt>previous</dt><dd>${snap.previousSnapshotId === null ? "none" : idLink(snapshotHref(state, snap.previousSnapshotId), snap.previousSnapshotId)}</dd>
+<dt>ancestry</dt><dd>${ancestry.map((s, i) => h`${i > 0 ? " ← " : ""}${idLink(snapshotHref(state, s.id), s.id)}`)}${olderAncestors ? " ← …" : ""}</dd>
 ${snap.promoted ? h`<dt>promoted</dt><dd>${fmtTime(snap.promoted.at)} (#${snap.promoted.seq})</dd>` : ""}
 </dl>
 <h2>Promotion checks</h2>${promotion}
 <h2>Review coverage</h2>
 <p class="note">${reviewed} of ${plural(snap.submissionIds.length, "PR")} in this snapshot have at least one revealed review.</p>
-<table><thead><tr><th>PR</th><th>reviews</th><th>reviewer models</th><th>findings</th><th></th></tr></thead><tbody>${coverageRows}</tbody></table>
+<table><thead><tr><th>PR</th><th>reviews</th><th>reviewer models</th><th>findings</th><th></th></tr></thead><tbody>${coverageRows}</tbody></table>${more(snap.submissionIds.length)}
 <h2>Attestations</h2>${attestations}
 <h2>Kernel signoffs</h2>${signoffs}
 <h2>Findings on this snapshot</h2>${findingsTable(site, snapFindings)}
-${escapes.length > 0 ? h`<h2>Escapes</h2><ul class="plain">${escapes.map((e) => h`<li>${findingLink(state, e.findingId)} at ${fmtTime(e.at)}</li>`)}</ul>` : ""}`;
+${escapes.length > 0 ? h`<h2>Escapes</h2><ul class="plain">${escapes.slice(0, MAX_LIST).map((e) => h`<li>${findingLink(state, e.findingId)} at ${fmtTime(e.at)}</li>`)}</ul>${more(escapes.length)}` : ""}`;
   return page(site, `snapshot ${snap.id}`, body);
 }
 
@@ -679,32 +764,37 @@ function trackRecord(site: Site, keys: KeyId[], owner: OwnerId): Html {
   const falseFindings = filed.filter((f) => f.result?.reproduced === false);
   const pending = filed.filter((f) => !f.result);
 
-  const scores = attempt(() => site.derive.reviewerScores());
+  const scores = attempt(site, () => site.derive.reviewerScores());
   const calibration = !scores.ok
-    ? unavailable("Calibration", scores.error)
-    : h`<table><thead><tr><th>agent</th><th>reviews</th><th>scored</th><th>mean Brier</th><th>plants caught</th></tr></thead><tbody>${keys.map(
+    ? unavailable("Calibration")
+    : h`<table><thead><tr><th>agent</th><th>reviews</th><th>scored</th><th>mean Brier</th><th>plants caught</th></tr></thead><tbody>${keys.slice(0, MAX_LIST).map(
         (k) => {
           const sc = scores.value.get(k);
           if (!sc) return h`<tr><td>${agentLabel(state, k)}</td><td colspan="4" class="note">no reviews</td></tr>`;
           return h`<tr><td>${agentLabel(state, k)}</td><td>${sc.reviews}</td><td>${sc.scored}</td><td>${sc.scored === 0 ? "—" : num(sc.meanBrier)}</td><td>${sc.plantsCaught} of ${sc.plantsSeen}</td></tr>`;
         },
-      )}</tbody></table>
+      )}</tbody></table>${more(keys.length)}
 <p class="note">Brier score: mean squared error of the revealed defect probability against the outcome; 0 is perfect, 0.25 is a coin flip. Scored reviews are those whose PR's outcome is known.</p>`;
 
   const settlements = state.settlements.filter((s) => s.owner === owner);
   const total = settlements.reduce((a, s) => a + s.delta, 0);
-  const list = (items: Html[]) => (items.length === 0 ? h`<p class="note">None.</p>` : h`<ul class="plain">${items}</ul>`);
+  // Newest last, as in the ledger; a long list keeps the newest MAX_LIST.
+  const recentSettlements = settlements.slice(-MAX_LIST);
+  const list = <T,>(items: readonly T[], render: (x: T) => Html) =>
+    items.length === 0
+      ? h`<p class="note">None.</p>`
+      : h`<ul class="plain">${items.slice(0, MAX_LIST).map(render)}</ul>${more(items.length)}`;
 
   return h`<div class="counts"><span><b>${merged.length}</b> merged of ${subs.length} PRs</span><span><b>${held.length}</b> findings held up</span><span><b>${falseFindings.length}</b> false findings</span><span><b>${pending.length}</b> pending</span></div>
-<h2>Merged changes</h2>${list(merged.map((s) => h`<li>${idLink(submissionHref(s.id), s.id)} ${s.merged ? fmtTime(s.merged.at) : ""} · ${plural(s.linesChanged, "line")}${s.planted ? h` ${badge("warn", "planted")}` : ""}</li>`))}
-<h2>Other PRs</h2>${list(subs.filter((s) => !s.merged).map((s) => h`<li>${idLink(submissionHref(s.id), s.id)} ${submissionStatus(state, s)}</li>`))}
-<h2>Findings that held up</h2>${list(held.map((f) => h`<li>${findingLink(state, f.id)} (${f.severity}) on ${targetLink(state, f.target)}</li>`))}
-<h2>False findings</h2>${list(falseFindings.map((f) => h`<li>${findingLink(state, f.id)} (${f.severity}) on ${targetLink(state, f.target)}: ${f.result ? reproductionText(f.result) : ""}</li>`))}
+<h2>Merged changes</h2>${list(merged, (s) => h`<li>${idLink(submissionHref(state, s.id), s.id)} ${s.merged ? fmtTime(s.merged.at) : ""} · ${plural(s.linesChanged, "line")}${s.planted ? h` ${badge("warn", "planted")}` : ""}</li>`)}
+<h2>Other PRs</h2>${list(subs.filter((s) => !s.merged), (s) => h`<li>${idLink(submissionHref(state, s.id), s.id)} ${submissionStatus(state, s)}</li>`)}
+<h2>Findings that held up</h2>${list(held, (f) => h`<li>${findingLink(state, f.id)} (${f.severity}) on ${targetLink(state, f.target)}</li>`)}
+<h2>False findings</h2>${list(falseFindings, (f) => h`<li>${findingLink(state, f.id)} (${f.severity}) on ${targetLink(state, f.target)}: ${f.result ? reproductionText(f.result) : ""}</li>`)}
 <h2>Calibration</h2>${calibration}
-<h2>Settlements for owner ${owner}</h2>${
+<h2>Settlements for owner ${clip(owner, CLIP.id)}</h2>${
     settlements.length === 0
       ? h`<p class="note">None.</p>`
-      : h`<p class="note">Net ${signed(total)}. Settlements accrue to the owner, not to individual agents.</p><table><thead><tr><th>#</th><th>when</th><th>delta</th><th>reason</th><th>ref</th></tr></thead><tbody>${settlements.map(
+      : h`<p class="note">Net ${signed(total)}. Settlements accrue to the owner, not to individual agents.${settlements.length > MAX_LIST ? ` Showing the latest ${MAX_LIST} of ${settlements.length}.` : ""}</p><table><thead><tr><th>#</th><th>when</th><th>delta</th><th>reason</th><th>ref</th></tr></thead><tbody>${recentSettlements.map(
           (s) =>
             h`<tr class="${s.delta < 0 ? "bad" : ""}"><td>${s.seq}</td><td>${fmtTime(s.at)}</td><td>${badge(s.delta < 0 ? "bad" : "ok", signed(s.delta))}</td><td>${s.reason}</td><td>${refLink(state, s.ref)}</td></tr>`,
         )}</tbody></table>`
@@ -715,16 +805,16 @@ function ownerPage(site: Site, owner: OwnerId): string {
   const { state, tree } = site;
   const o = state.owners.get(owner);
   if (!o) return "";
-  const agents = agentsOf(state, owner);
-  const inTree = attempt(() => tree.has(owner));
+  const agents = agentsByOwner(state).get(owner) ?? [];
+  const inTree = attempt(site, () => tree.has(owner));
   const member = inTree.ok && inTree.value;
-  const parent = member ? attempt(() => tree.parent(owner)) : null;
-  const rep = member ? attempt(() => tree.reputation(owner)) : null;
-  const body = h`<h1>Owner ${owner}</h1>
+  const parent = member ? attempt(site, () => tree.parent(owner)) : null;
+  const rep = member ? attempt(site, () => tree.reputation(owner)) : null;
+  const body = h`<h1>Owner ${clip(owner, CLIP.id)}</h1>
 <dl>
 <dt>reputation delta</dt><dd>${signed(o.reputationDelta)} (this project)</dd>
 <dt>Anthill reputation</dt><dd>${rep === null ? h`<span class="note">not in the tree</span>` : rep.ok ? rep.value : "?"}</dd>
-<dt>tree parent</dt><dd>${parent && parent.ok ? (parent.value === null ? "root" : state.owners.has(parent.value) ? ownerLink(parent.value) : parent.value) : "—"}</dd>
+<dt>tree parent</dt><dd>${parent && parent.ok ? (parent.value === null ? "root" : state.owners.has(parent.value) ? ownerLink(parent.value) : clip(parent.value, CLIP.id)) : "—"}</dd>
 <dt>locked stake</dt><dd>${o.lockedStake}</dd>
 <dt>invited by</dt><dd>${o.inviter === null ? "nobody (founding owner)" : ownerLink(o.inviter)}</dd>
 <dt>key</dt><dd>${code(short(o.keyId, 12), o.keyId)}</dd>
@@ -732,7 +822,7 @@ function ownerPage(site: Site, owner: OwnerId): string {
 <h2>Agents</h2>${
     agents.length === 0
       ? h`<p class="note">None.</p>`
-      : h`<ul class="plain">${agents.map((a) => h`<li>${idLink(agentHref(a.keyId), a.keyId)} ${a.modelFamily} · harness ${a.harness} ${a.active ? badge("ok", "active") : h`${badge("bad", "revoked")} ${a.revokedReason ?? ""}`}</li>`)}</ul>`
+      : h`<ul class="plain">${agents.slice(0, MAX_LIST).map((a) => h`<li>${idLink(agentHref(a.keyId), a.keyId)} ${clip(a.modelFamily, CLIP.id)} · harness ${clip(a.harness, CLIP.line)} ${a.active ? badge("ok", "active") : h`${badge("bad", "revoked")} ${clip(a.revokedReason ?? "", CLIP.line)}`}</li>`)}</ul>${more(agents.length)}`
   }
 ${trackRecord(site, agents.map((a) => a.keyId), owner)}`;
   return page(site, `owner ${owner}`, body);
@@ -746,10 +836,10 @@ function agentPage(site: Site, keyId: KeyId): string {
   const body = h`<h1>Agent ${code(short(keyId, 12), keyId)} ${a.active ? badge("ok", "active") : badge("bad", "revoked")}</h1>
 <dl>
 <dt>owner</dt><dd>${ownerLink(a.owner)}</dd>
-<dt>model family</dt><dd>${a.modelFamily}</dd>
-<dt>harness</dt><dd>${a.harness}</dd>
-<dt>key id</dt><dd><code>${keyId}</code></dd>
-${a.active ? "" : h`<dt>revoked</dt><dd>${a.revokedReason ?? ""}</dd>`}
+<dt>model family</dt><dd>${clip(a.modelFamily, CLIP.id)}</dd>
+<dt>harness</dt><dd>${clip(a.harness, CLIP.text)}</dd>
+<dt>key id</dt><dd>${code(keyId)}</dd>
+${a.active ? "" : h`<dt>revoked</dt><dd>${clip(a.revokedReason ?? "", CLIP.text)}</dd>`}
 ${honey.length > 0 ? h`<dt>honeytokens</dt><dd>${badge("bad", `${honey.length} triggered`)}</dd>` : ""}
 </dl>
 ${trackRecord(site, [keyId], a.owner)}`;
@@ -760,25 +850,24 @@ ${trackRecord(site, [keyId], a.owner)}`;
 // JSON API
 // ---------------------------------------------------------------------------
 
-function reviewJson(r: ReviewState) {
-  // A sealed review exposes only that it exists. The commitment hash is public
-  // in the ledger anyway; the verdict appears only after a matching reveal.
-  return {
-    reviewer: r.reviewer,
-    stake: r.stake,
-    committedSeq: r.committedSeq,
-    revealed: r.verdict !== undefined,
-    ...(r.verdict ? { revealedSeq: r.revealedSeq, verdict: r.verdict } : {}),
-  };
-}
+export const STATE_RECENT = 50;
 
+// Counts and short summaries only: a size bounded by the caps above, not by
+// the ledger. Everything else, including every revealed verdict, is in the
+// signed entries (/api/entries), which are the record anyway. No sealed
+// verdict can appear here because no verdict appears here at all. Outstanding
+// plants are not counted: commitments minus reveals would tell reviewers how
+// many plants are live.
 export function stateJson(site: Site) {
   const { state } = site;
   const subs = [...state.submissions.values()];
   const findings = [...state.findings.values()];
   const snaps = [...state.snapshots.values()];
+  const agentCount = agentsByOwner(state);
+  const id = (v: string) => clip(v, CLIP.id);
+  const owners = [...state.owners.values()].sort((a, b) => b.reputationDelta - a.reputationDelta || cmp(a.id, b.id));
   return {
-    project: state.project,
+    project: id(state.project),
     length: state.length,
     headHash: state.headHash,
     asOf: site.nowIso,
@@ -797,40 +886,50 @@ export function stateJson(site: Site) {
       falseFindings: findings.filter((f) => f.result?.reproduced === false).length,
       snapshots: snaps.length,
       promoted: snaps.filter((s) => s.promoted).length,
-      plantCommitments: state.plantCommitments.length,
       plantsRevealed: subs.filter((s) => s.planted).length,
       honeytokens: state.honeytokens.length,
       escapes: state.escapes.length,
       settlements: state.settlements.length,
     },
-    owners: [...state.owners.values()].map((o) => ({ ...o, agents: agentsOf(state, o.id).map((a) => a.keyId) })),
-    agents: [...state.agents.values()],
-    proposals: [...state.proposals.values()],
-    tasks: [...state.tasks.values()],
-    claims: [...state.claims.values()],
-    submissions: subs.map((s) => ({
-      id: s.id,
-      author: s.author,
-      owner: ownerOfAgent(state, s.author) ?? null,
-      taskId: s.taskId,
-      baseCommit: s.baseCommit,
-      headCommit: s.headCommit,
-      changedFiles: s.changedFiles,
-      linesChanged: s.linesChanged,
-      submittedSeq: s.submittedSeq,
-      submittedAt: s.submittedAt,
-      gates: s.gates,
-      assignment: s.assignment ?? null,
-      reviews: s.reviews.map(reviewJson),
-      findingIds: s.findingIds,
-      merged: s.merged ?? null,
-      planted: s.planted ?? null, // set only after plantReveal
+    // Highest reputation delta first.
+    owners: owners.slice(0, MAX_LIST).map((o) => ({
+      id: id(o.id),
+      page: ownerHref(o.id),
+      reputationDelta: o.reputationDelta,
+      lockedStake: o.lockedStake,
+      agents: agentCount.get(o.id)?.length ?? 0,
     })),
-    findings,
-    snapshots: snaps.map((s) => ({ ...s, attestations: s.attestations.map(reviewJson), promoted: s.promoted ?? null })),
-    escapes: state.escapes,
-    honeytokens: state.honeytokens,
-    settlements: state.settlements,
+    // Newest first.
+    recentSubmissions: subs
+      .slice(-STATE_RECENT)
+      .reverse()
+      .map((s) => ({
+        id: id(s.id),
+        page: submissionHref(state, s.id),
+        author: s.author,
+        owner: id(ownerOfAgent(state, s.author) ?? ""),
+        status: statusOf(state, s).label,
+        planted: s.planted !== undefined, // set only after plantReveal
+        submittedSeq: s.submittedSeq,
+        files: s.changedFiles.length,
+        linesChanged: s.linesChanged,
+        gates: { passed: s.gates.filter((g) => g.pass).length, failed: s.gates.filter((g) => !g.pass).length },
+        reviews: { committed: s.reviews.length, revealed: s.reviews.filter((r) => r.verdict).length },
+        findings: s.findingIds.length,
+      })),
+    recentSnapshots: snaps
+      .slice(-STATE_RECENT)
+      .reverse()
+      .map((s) => ({
+        id: id(s.id),
+        page: snapshotHref(state, s.id),
+        seq: s.seq,
+        commit: id(s.commit),
+        submissions: s.submissionIds.length,
+        attestations: { committed: s.attestations.length, revealed: s.attestations.filter((a) => a.verdict).length },
+        signoffs: s.signoffs.length,
+        promoted: s.promoted !== undefined,
+      })),
   };
 }
 
@@ -859,9 +958,14 @@ const HTML = "text/html; charset=utf-8";
 const JSON_TYPE = "application/json; charset=utf-8";
 
 // `<` is escaped so a JSON body can never be read as markup by anything.
+const safeJson = (body: string) => body.replace(/</g, "\\u003c");
+
+function toJson(value: unknown): string {
+  return safeJson(JSON.stringify(value, (_k, v: unknown) => (v instanceof Map ? Object.fromEntries(v) : v)));
+}
+
 function jsonReply(status: number, value: unknown): Reply {
-  const body = JSON.stringify(value, (_k, v: unknown) => (v instanceof Map ? Object.fromEntries(v) : v), 2);
-  return reply(status, JSON_TYPE, body.replace(/</g, "\\u003c"));
+  return reply(status, JSON_TYPE, toJson(value));
 }
 
 function htmlError(site: { state: CommonsState; nowIso: string } | null, status: number, message: string): Reply {
@@ -869,9 +973,35 @@ function htmlError(site: { state: CommonsState; nowIso: string } | null, status:
   return reply(status, HTML, page(site, title, h`<h1>${title}</h1><p>${message}</p><p><a href="/">back to the overview</a></p>`));
 }
 
+// Only a LedgerError's code is public: its message can name the ledger's path.
+function unavailableReply(isApi: boolean, e: unknown): Reply {
+  const code = e instanceof LedgerError ? e.code : null;
+  const message = "The ledger is being written or failed verification; try again shortly.";
+  return isApi
+    ? jsonReply(503, { error: "ledger unavailable", code })
+    : htmlError(null, 503, code === null ? message : `${message} (${code})`);
+}
+
+const OBJECT_KINDS: ReadonlySet<string> = new Set<ObjectKind>(["submissions", "snapshots", "owners", "agents"]);
+
+// The id a request names: /<kind>/<id>, or the query fallbacks objectHref
+// builds for ids a path cannot carry: ?id=<id>, or ?seq=<seq of the entry that
+// created the submission or snapshot>.
+function requestedId(site: Site, kind: string, segs: string[], params: URLSearchParams): string | undefined {
+  if (segs.length === 2) return segs[1] === "" ? undefined : segs[1];
+  const id = params.get("id");
+  if (id !== null) return id === "" ? undefined : id;
+  const seq = intParam(params.get("seq"), -1);
+  if (seq === null || seq < 0) return undefined;
+  const body = site.entries[seq]?.body;
+  if (kind === "submissions" && body?.kind === "submission") return body.id;
+  if (kind === "snapshots" && body?.kind === "snapshot") return body.id;
+  return undefined;
+}
+
 // The whole site. `load` is called only for routes that need the ledger, so
 // the refresh script is served even while the ledger cannot be read.
-export function route(load: () => Site, method: string, rawUrl: string): Reply {
+export function route(load: () => Site, method: string, rawUrl: string, log: (e: unknown) => void = defaultLog): Reply {
   if (method !== "GET" && method !== "HEAD") {
     return reply(405, "text/plain; charset=utf-8", "method not allowed\n", { Allow: "GET, HEAD" });
   }
@@ -895,47 +1025,52 @@ export function route(load: () => Site, method: string, rawUrl: string): Reply {
 
   let site: Site;
   try {
-    site = load();
+    const loaded = load();
+    site = loaded.log ? loaded : { ...loaded, log };
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return isApi
-      ? jsonReply(503, { error: "ledger unavailable", detail: msg })
-      : htmlError(null, 503, `The ledger could not be read: ${msg}`);
+    log(e);
+    return unavailableReply(isApi, e);
   }
+  const memo = site.memo ?? (<T,>(_key: string, f: () => T): T => f());
   const notFound = (what: string) => (isApi ? jsonReply(404, { error: what }) : htmlError(site, 404, what));
+  const html = (key: string, render: () => string) => reply(200, HTML, memo(key, render));
 
-  const [a, b] = segs;
-  if (segs.length === 1 && a === "") return reply(200, HTML, overview(site));
-  if (segs.length === 2 && b !== undefined && b !== "") {
+  const [a = "", b] = segs;
+  if (segs.length === 1 && a === "") return html("overview", () => overview(site));
+  if (a === "api") return segs.length === 2 && b !== undefined ? api(site, memo, b, url.searchParams) : notFound("No such endpoint.");
+  if (OBJECT_KINDS.has(a) && segs.length <= 2) {
+    const id = requestedId(site, a, segs, url.searchParams);
+    const missing = () => notFound(`No ${a.slice(0, -1)} ${id === undefined ? "named" : clip(id, 80)}.`);
+    if (id === undefined) return missing();
+    const { state } = site;
     switch (a) {
       case "submissions": {
-        const s = site.state.submissions.get(b);
-        return s ? reply(200, HTML, submissionPage(site, s)) : notFound(`No submission ${b}.`);
+        const s = state.submissions.get(id);
+        return s ? html(`submission:${s.submittedSeq}`, () => submissionPage(site, s)) : missing();
       }
       case "snapshots": {
-        const s = site.state.snapshots.get(b);
-        return s ? reply(200, HTML, snapshotPage(site, s)) : notFound(`No snapshot ${b}.`);
+        const s = state.snapshots.get(id);
+        return s ? html(`snapshot:${s.seq}`, () => snapshotPage(site, s)) : missing();
       }
       case "owners":
-        return site.state.owners.has(b) ? reply(200, HTML, ownerPage(site, b)) : notFound(`No owner ${b}.`);
+        return state.owners.has(id) ? html(`owner:${id}`, () => ownerPage(site, id)) : missing();
       case "agents":
-        return site.state.agents.has(b) ? reply(200, HTML, agentPage(site, b)) : notFound(`No agent ${b}.`);
-      case "api":
-        return api(site, b, url.searchParams);
+        return state.agents.has(id) ? html(`agent:${id}`, () => agentPage(site, id)) : missing();
     }
   }
   return notFound("No such page.");
 }
 
-function api(site: Site, name: string, params: URLSearchParams): Reply {
+function api(site: Site, memo: <T>(key: string, f: () => T) => T, name: string, params: URLSearchParams): Reply {
   switch (name) {
     case "state":
-      return jsonReply(200, stateJson(site));
+      return reply(200, JSON_TYPE, memo("api:state", () => toJson(stateJson(site))));
     case "metrics": {
-      const m = attempt(() => site.derive.metrics());
-      return m.ok
-        ? jsonReply(200, { asOf: site.nowIso, length: site.state.length, rows: m.value })
-        : jsonReply(500, { error: "metrics unavailable", detail: m.error });
+      const body = memo("api:metrics", () => {
+        const m = attempt(site, () => site.derive.metrics());
+        return m.ok ? toJson({ asOf: site.nowIso, length: site.state.length, rows: m.value }) : null;
+      });
+      return body === null ? jsonReply(500, { error: "metrics could not be computed" }) : reply(200, JSON_TYPE, body);
     }
     case "entries": {
       const since = intParam(params.get("since"), 0);
@@ -944,18 +1079,36 @@ function api(site: Site, name: string, params: URLSearchParams): Reply {
         return jsonReply(400, { error: "since and limit must be non-negative integers; limit >= 1" });
       }
       const size = Math.min(limit, MAX_ENTRIES_PAGE);
-      const page = site.entries.slice(since, since + size);
-      const next = since + page.length < site.entries.length ? since + page.length : null;
-      return jsonReply(200, {
-        head: { length: site.state.length, hash: site.state.headHash },
-        since,
-        limit: size,
-        next,
-        entries: page,
-      });
+      return reply(200, JSON_TYPE, memo(`api:entries:${since}:${size}`, () => entriesPage(site, since, size)));
     }
   }
   return jsonReply(404, { error: "No such endpoint." });
+}
+
+// Entries are indexed by seq. `since` is inclusive (seq >= since), so a client
+// continues with since=next, not with the last seq it saw; the reply says so.
+// Serialised by hand so each entry is stringified once while the byte cap is
+// counted.
+function entriesPage(site: Site, since: number, size: number): string {
+  const parts: string[] = [];
+  let bytes = 0;
+  const end = Math.min(site.entries.length, since + size);
+  for (let i = since; i < end; i++) {
+    const json = JSON.stringify(site.entries[i]);
+    const n = Buffer.byteLength(json);
+    if (parts.length > 0 && bytes + n > MAX_ENTRIES_BYTES) break;
+    parts.push(json);
+    bytes += n + 1;
+  }
+  const next = since + parts.length < site.entries.length ? since + parts.length : null;
+  const head = {
+    head: { length: site.state.length, hash: site.state.headHash },
+    since,
+    limit: size,
+    next,
+    cursor: "since is inclusive (seq >= since); continue with since=next until next is null",
+  };
+  return safeJson(`${JSON.stringify(head).slice(0, -1)},"entries":[${parts.join(",")}]}`);
 }
 
 function intParam(raw: string | null, fallback: number): number | null {

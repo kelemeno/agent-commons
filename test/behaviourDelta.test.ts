@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import {
   compareReplays,
+  type DigestRecord,
   digestEngine,
   type EngineLike,
   loadManifest,
@@ -20,6 +21,9 @@ const id = (n: number) => `0x${n.toString(16).padStart(40, "0")}`;
 let root: string;
 let logPath: string; // seed (demo) + an "alpha" community with joins and votes
 let seedOnlyLog: string; // seed and commonsMoved, no actions
+let lateActionLog: string; // seed, then several non-action entries, then demo's first action
+let lateActionLines: { type: string; community?: string }[];
+let constructorLog: string; // a community whose id is an Object.prototype key
 let lines: { type: string; community?: string; action?: { fn: string } }[];
 const checkouts: Record<string, string> = {};
 
@@ -37,6 +41,12 @@ function checkout(name: string, file?: string, edits: [string, string][] = []): 
     writeFileSync(path, text);
   }
   return dir;
+}
+
+function seedEntry(): number {
+  const i = lines.findIndex((l) => l.type === "seed");
+  assert.ok(i >= 0);
+  return i;
 }
 
 // Entry index of the first action of `community` (optionally of one fn).
@@ -68,6 +78,33 @@ before(async () => {
   s0.setSeed(graph);
   s0.moveCommons(demo, id(0xf00));
   seedOnlyLog = s0.logPath;
+
+  const late = new Store(join(root, "late"));
+  late.setSeed(graph);
+  late.moveCommons(demo, id(0xf00));
+  const lateCommunities = new Communities(late);
+  await lateCommunities.load(async () => {});
+  for (const c of ["beta", "gamma", "delta"]) {
+    late.addCommunity({ ...demo, id: c, name: c });
+  }
+  const lateDemo = lateCommunities.get("demo");
+  const lateSpot = lateDemo.engine.members().sort().find((m: string) => lateDemo.engine.children(m).length < 2);
+  lateDemo.execute(id(0xd1), { fn: "joinTree", args: { name: "Dee", recipient: lateSpot } });
+  lateActionLog = late.logPath;
+  lateActionLines = readFileSync(lateActionLog, "utf8")
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .map((l) => JSON.parse(l));
+
+  const ctor = new Store(join(root, "ctor"));
+  const ctorCommunities = new Communities(ctor);
+  await ctorCommunities.load(async () => {});
+  const { tree: ctorTree } = ctorCommunities.create(
+    { id: id(0xc1), name: "Cee" },
+    { id: "constructor", name: "C", visibility: "public", joinPolicy: "open" },
+  );
+  ctorTree.execute(id(0xc2), { fn: "joinTree", args: { name: "Cy", recipient: id(0xc1) } });
+  constructorLog = ctor.logPath;
 
   const store = new Store(join(root, "data"));
   store.setSeed(graph);
@@ -122,6 +159,16 @@ before(async () => {
     ["mkdirSync(dir, { recursive: true });", 'throw new Error("boom");'],
   ]);
   checkouts.exits = checkout("exits", "offchain.ts", [["export class ActionError", "process.exit(0);\nexport class ActionError"]]);
+  checkouts.voteDist = checkout("vote-dist", "engine.ts", [["dist: recDist,", "dist: recDist + 7,"]]);
+  checkouts.seedNames = checkout("seed-names", "engine.ts", [
+    ["this.s.nameOf.set(nodeId, node.name);", 'this.s.nameOf.set(nodeId, node.name + "!");'],
+  ]);
+  checkouts.copiesEntries = checkout("copies-entries", "offchain.ts", [
+    ["await onReplayed({ tree, entry, events });", "await onReplayed({ tree, entry: { ...entry }, events });"],
+  ]);
+  checkouts.dropsRenames = checkout("drops-renames", "store.ts", [
+    ["this.actionEntries.push(entry);", 'if (entry.action.fn !== "changeName") this.actionEntries.push(entry);'],
+  ]);
   checkouts.dropsAlpha = checkout("drops-alpha", "offchain.ts", [
     ["for (const { id } of store.communities()) {", 'for (const { id } of store.communities().filter((c) => c.id !== "alpha")) {'],
   ]);
@@ -153,14 +200,18 @@ describe("runBehaviourDelta on the real backend", () => {
       const result = await replayCheckout(checkouts.same!, data);
       assert.equal(console.warn, warn, "console.warn restored");
       assert.equal(result.entries, lines.length);
-      const alpha = result.communities.alpha ?? [];
+      const alpha = result.communities.get("alpha") ?? [];
       const skipped = alpha.find((r) => r.entry === bad);
       assert.ok(skipped?.error, "the bad entry is recorded with its error");
       const before = alpha[alpha.indexOf(skipped) - 1];
       assert.equal(skipped.digest, before?.digest, "a skip leaves the digest unchanged");
       assert.deepEqual(
         alpha.map((r) => r.entry),
-        [...lines.flatMap((l, i) => (l.type === "action" && l.community === "alpha" ? [i] : [])), lines.length],
+        [
+          lines.findIndex((l) => l.type === "seed"),
+          ...lines.flatMap((l, i) => (l.type === "action" && l.community === "alpha" ? [i] : [])),
+          lines.length,
+        ],
       );
     } finally {
       rmSync(data, { recursive: true, force: true });
@@ -169,14 +220,14 @@ describe("runBehaviourDelta on the real backend", () => {
     assert.equal(r.pass, true, r.details);
   });
 
-  test("a reputation change diverges every community from its first action", async () => {
+  test("a reputation change diverges the seeded community at the seed and the others at their first action", async () => {
     const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.doubled!, logPath });
     assert.equal(r.pass, false);
     assert.deepEqual(
       r.divergences.map((d) => [d.community, d.fromEntry]),
       [
         ["alpha", firstAction("alpha")],
-        ["demo", firstAction("demo")],
+        ["demo", seedEntry()],
       ],
     );
     for (const d of r.divergences) {
@@ -191,7 +242,7 @@ describe("runBehaviourDelta on the real backend", () => {
 
   test("declared divergences pass; a declaration starting later than the divergence fails", async () => {
     const alpha = firstAction("alpha");
-    const demo = firstAction("demo");
+    const demo = seedEntry();
     const declared = (a: number, d: number) => ({
       declared: [
         { community: "alpha", fromEntry: a, note: "reputation doubled on purpose" },
@@ -208,6 +259,10 @@ describe("runBehaviourDelta on the real backend", () => {
 
     const earlier = await run(declared(0, 0));
     assert.equal(earlier.pass, true, earlier.details);
+    assert.match(earlier.details, new RegExp(`declared from entry 0, ${alpha} entries before it starts`));
+
+    const demoFromItsFirstAction = await run(declared(alpha, firstAction("demo")));
+    assert.equal(demoFromItsFirstAction.pass, false, "the seed-time divergence is not covered");
 
     const late = await run(declared(alpha + 1, demo));
     assert.equal(late.pass, false);
@@ -263,8 +318,8 @@ describe("runBehaviourDelta on the real backend", () => {
       r.divergences.map((d) => d.community),
       ["alpha"],
     );
-    assert.equal(r.divergences[0]?.fromEntry, firstAction("alpha"));
-    assert.match(r.divergences[0]?.error ?? "", /new checkout fails to replay this entry: no such community/);
+    assert.equal(r.divergences[0]?.fromEntry, seedEntry(), "alpha is already missing before any action");
+    assert.match(r.divergences[0]?.error ?? "", /old checkout has state here and the new one does not/);
   });
 
   test("a seed-only community is compared through its final digest", async () => {
@@ -272,10 +327,112 @@ describe("runBehaviourDelta on the real backend", () => {
     assert.equal(r.pass, false);
     assert.deepEqual(
       r.divergences.map((d) => [d.community, d.fromEntry]),
-      [["demo", 2]], // two entries: seed, commonsMoved; the final digest sits at 2
+      [["demo", 0]], // the seed already digests differently
     );
     const same = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.same!, logPath: seedOnlyLog });
     assert.equal(same.pass, true, same.details);
+  });
+
+  test("a seed-time change is reported at the seed, not at the first action", async () => {
+    const seed = lateActionLines.findIndex((l) => l.type === "seed");
+    const first = lateActionLines.findIndex((l) => l.type === "action" && l.community === "demo");
+    assert.ok(first - seed >= 4, "the fixture has entries between the seed and the first action");
+    const run = (manifest?: { declared: { community: string; fromEntry: number; note: string }[] }) =>
+      runBehaviourDelta({
+        oldBackendDir: BACKEND,
+        newBackendDir: checkouts.seedNames!,
+        logPath: lateActionLog,
+        ...(manifest ? { manifest } : {}),
+      });
+    const r = await run();
+    assert.equal(r.pass, false);
+    assert.deepEqual(
+      r.divergences.map((d) => [d.community, d.fromEntry]),
+      [["demo", seed]],
+    );
+    const late = await run({ declared: [{ community: "demo", fromEntry: first, note: "names" }] });
+    assert.equal(late.pass, false, "declaring from the first action does not cover the seed");
+    const exact = await run({ declared: [{ community: "demo", fromEntry: seed, note: "names" }] });
+    assert.equal(exact.pass, true, exact.details);
+  });
+
+  test("a change to a vote's dist is a divergence", async () => {
+    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.voteDist!, logPath });
+    assert.equal(r.pass, false);
+    const alpha = r.divergences.find((d) => d.community === "alpha");
+    assert.ok(alpha, r.details);
+    assert.ok(alpha.fromEntry <= firstAction("alpha", "addDagVote"));
+    assert.equal(alpha.error, undefined);
+  });
+
+  test("a replay that passes copies of the entries still matches them to their lines", async () => {
+    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.copiesEntries!, logPath });
+    assert.equal(r.pass, true, r.details);
+  });
+
+  test("a Store that drops actions is a declarable divergence, not a harness failure", async () => {
+    const rename = firstAction("alpha", "changeName");
+    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.dropsRenames!, logPath });
+    assert.equal(r.pass, false);
+    assert.deepEqual(
+      r.divergences.map((d) => [d.community, d.fromEntry]),
+      [["alpha", rename]],
+    );
+    assert.match(r.divergences[0]?.error ?? "", /new checkout fails to replay this entry: skipped without a report/);
+    const declared = await runBehaviourDelta({
+      oldBackendDir: BACKEND,
+      newBackendDir: checkouts.dropsRenames!,
+      logPath,
+      manifest: { declared: [{ community: "alpha", fromEntry: rename, note: "renames are no longer replayed" }] },
+    });
+    assert.equal(declared.pass, true, declared.details);
+  });
+
+  test("community ids that are Object.prototype keys are compared like any other", async () => {
+    const same = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.same!, logPath: constructorLog });
+    assert.equal(same.pass, true, same.details);
+    const doubled = await runBehaviourDelta({
+      oldBackendDir: BACKEND,
+      newBackendDir: checkouts.doubled!,
+      logPath: constructorLog,
+    });
+    assert.equal(doubled.pass, false);
+    assert.ok(
+      doubled.divergences.some((d) => d.community === "constructor"),
+      doubled.details,
+    );
+  });
+
+  test("the new side cannot copy the old side's result", async () => {
+    // doubled reputation, plus code that looks for any other replay's result
+    // in the coordinator's temp dir and passes it off as its own
+    const dir = checkout("copies-old-result", "offchain.ts", [
+      [
+        "export class ActionError",
+        `import { copyFileSync as __cp, existsSync as __ex, readdirSync as __ls } from "node:fs";
+import { dirname as __dn, join as __j } from "node:path";
+{
+  // polls for a sibling result.json next to its own work dir, for 2 s
+  const own = process.argv[process.argv.length - 1] as string;
+  const top = __dn(__dn(own));
+  for (let tries = 0; tries < 40; tries++) {
+    for (const d of __ls(top)) {
+      const other = __j(top, d, "result.json");
+      if (other !== own && __ex(other)) {
+        __cp(other, own);
+        process.exit(0);
+      }
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+}
+export class ActionError`,
+      ],
+    ]);
+    cpSync(join(checkouts.doubled!, "src", "engine.ts"), join(dir, "src", "engine.ts"));
+    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: dir, logPath });
+    assert.equal(r.pass, false, r.details);
+    assert.ok(r.divergences.length > 0, r.details);
   });
 
   test("unused declarations are reported but do not fail", async () => {
@@ -291,7 +448,10 @@ describe("runBehaviourDelta on the real backend", () => {
 });
 
 describe("runBehaviourDelta failures that no manifest can excuse", () => {
-  const everything = { declared: [{ community: "*", fromEntry: 0, note: "x" }] };
+  // Every real community of the fixture, from its first entry.
+  const everything = {
+    declared: ["alpha", "commons", "demo"].map((community) => ({ community, fromEntry: 0, note: "anything" })),
+  };
 
   test("a checkout that hangs times out", async () => {
     const r = await runBehaviourDelta({
@@ -303,25 +463,99 @@ describe("runBehaviourDelta failures that no manifest can excuse", () => {
     });
     assert.equal(r.pass, false);
     assert.match(r.details, /new checkout: replay timed out/);
+    assert.deepEqual(r.divergences, []);
   });
 
   test("a checkout whose Store throws fails", async () => {
-    const r = await runBehaviourDelta({ oldBackendDir: checkouts.storeThrows!, newBackendDir: BACKEND, logPath });
+    const r = await runBehaviourDelta({
+      oldBackendDir: checkouts.storeThrows!,
+      newBackendDir: BACKEND,
+      logPath,
+      manifest: everything,
+    });
     assert.equal(r.pass, false);
     assert.match(r.details, /old checkout: boom/);
     assert.deepEqual(r.divergences, []);
   });
 
   test("a checkout that exits early without a result fails", async () => {
-    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.exits!, logPath });
+    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: checkouts.exits!, logPath, manifest: everything });
     assert.equal(r.pass, false);
     assert.match(r.details, /new checkout: replay died \(exit code 0\) without a result/);
+    assert.deepEqual(r.divergences, []);
   });
 
   test("a missing checkout fails", async () => {
-    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: join(root, "nope"), logPath });
+    const r = await runBehaviourDelta({
+      oldBackendDir: BACKEND,
+      newBackendDir: join(root, "nope"),
+      logPath,
+      manifest: everything,
+    });
     assert.equal(r.pass, false);
     assert.match(r.details, /new checkout: .*Cannot find module/);
+    assert.deepEqual(r.divergences, []);
+  });
+
+  // A grandchild that keeps the worker's stderr open must not hold the gate:
+  // it settles on the worker's exit, and kills the worker's process group.
+  const grandchild = (name: string, detached: boolean) => {
+    const pidFile = join(root, `${name}.pid`);
+    const dir = checkout(name, "offchain.ts", [
+      [
+        "export class ActionError",
+        `import { spawn as __spawn } from "node:child_process";
+import { writeFileSync as __write } from "node:fs";
+{
+  const c = __spawn("sleep", ["30"], { stdio: ["ignore", "ignore", "inherit"], detached: ${detached} });
+  c.unref();
+  __write(${JSON.stringify(pidFile)}, String(c.pid));
+  process.exit(1);
+}
+export class ActionError`,
+      ],
+    ]);
+    return { dir, pid: () => Number(readFileSync(pidFile, "utf8")) };
+  };
+  // A killed orphan can linger as a zombie when nothing reaps it (no init in
+  // a container); that is dead for our purposes.
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return false;
+    }
+    try {
+      return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+    } catch {
+      return true; // no /proc: trust the signal probe
+    }
+  };
+
+  test("a grandchild holding stderr open does not stall the gate, and is killed", async () => {
+    const g = grandchild("grandchild", false);
+    const started = performance.now();
+    const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: g.dir, logPath, manifest: everything, timeoutMs: 3000 });
+    assert.ok(performance.now() - started < 10_000, "returned promptly");
+    assert.equal(r.pass, false);
+    assert.match(r.details, /new checkout: replay died \(exit code 1\)/);
+    const pid = g.pid();
+    for (let i = 0; i < 50 && alive(pid); i++) await new Promise((res) => setTimeout(res, 20));
+    assert.equal(alive(pid), false, "the grandchild in the worker's process group is dead");
+  });
+
+  test("a grandchild in its own process group does not stall the gate either", async () => {
+    const g = grandchild("detached-grandchild", true);
+    try {
+      const started = performance.now();
+      const r = await runBehaviourDelta({ oldBackendDir: BACKEND, newBackendDir: g.dir, logPath, manifest: everything, timeoutMs: 3000 });
+      assert.ok(performance.now() - started < 10_000, "returned promptly");
+      assert.equal(r.pass, false);
+      assert.match(r.details, /new checkout: replay died/);
+    } finally {
+      // it escaped the group kill (see "Isolation" in the module header)
+      if (alive(g.pid())) process.kill(g.pid(), "SIGKILL");
+    }
   });
 
   test("a missing log fails", async () => {
@@ -401,7 +635,8 @@ describe("manifest", () => {
 });
 
 describe("digestEngine", () => {
-  type Node = { name: string; parent: string; children: string[]; votes: [string, bigint][]; rep: bigint };
+  type Vote = readonly [string, bigint, bigint, bigint]; // id, weight, dist, posInOther
+  type Node = { name: string; parent: string; children: string[]; sent: Vote[]; rec: Vote[]; total: bigint; rep: bigint };
   const stub = (nodes: Record<string, Node>, order = Object.keys(nodes)): EngineLike => {
     const at = (i: string) => nodes[i] as Node;
     return {
@@ -411,18 +646,18 @@ describe("digestEngine", () => {
       calculateReputation: (i) => at(i).rep,
       read: {
         nameOf: async ([i]) => at(i).name,
-        sentDagVoteCount: async ([i]) => BigInt(at(i).votes.length),
-        sentDagVote: async ([i, pos]) => {
-          const v = at(i).votes[Number(pos)] as [string, bigint];
-          return [v[0], v[1], 0n, 0n] as const;
-        },
+        sentDagVoteCount: async ([i]) => BigInt(at(i).sent.length),
+        sentDagVote: async ([i, pos]) => at(i).sent[Number(pos)] as Vote,
+        recDagVoteCount: async ([i]) => BigInt(at(i).rec.length),
+        recDagVote: async ([i, pos]) => at(i).rec[Number(pos)] as Vote,
+        sentDagVoteTotalWeight: async ([i]) => at(i).total,
       },
     };
   };
   const base = (): Record<string, Node> => ({
-    r: { name: "R", parent: "0x1", children: ["a", "b"], votes: [], rep: 10n },
-    a: { name: "A", parent: "r", children: [], votes: [["r", 2n]], rep: 1n },
-    b: { name: "B", parent: "r", children: [], votes: [["r", 1n], ["a", 1n]], rep: 1n },
+    r: { name: "R", parent: "0x1", children: ["a", "b"], sent: [], rec: [["a", 2n, 1n, 0n], ["b", 1n, 1n, 0n]], total: 0n, rep: 10n },
+    a: { name: "A", parent: "r", children: [], sent: [["r", 2n, 1n, 0n]], rec: [["b", 1n, 0n, 1n]], total: 2n, rep: 1n },
+    b: { name: "B", parent: "r", children: [], sent: [["r", 1n, 1n, 1n], ["a", 1n, 0n, 0n]], rec: [], total: 2n, rep: 1n },
   });
 
   test("is independent of member enumeration order", async () => {
@@ -435,8 +670,13 @@ describe("digestEngine", () => {
       (n) => void (n.a!.name = "A2"),
       (n) => void (n.a!.parent = "b"),
       (n) => void (n.r!.children = ["b", "a"]), // child order is state
-      (n) => void (n.a!.votes = [["r", 3n]]),
-      (n) => void (n.b!.votes = [["a", 1n], ["r", 1n]]), // vote order is state
+      (n) => void (n.a!.sent = [["r", 3n, 1n, 0n]]), // weight
+      (n) => void (n.a!.sent = [["r", 2n, 8n, 0n]]), // dist
+      (n) => void (n.a!.sent = [["r", 2n, 1n, 1n]]), // posInOther
+      (n) => void (n.b!.sent = [["a", 1n, 0n, 0n], ["r", 1n, 1n, 1n]]), // vote order is state
+      (n) => void (n.r!.rec = [["b", 1n, 1n, 0n], ["a", 2n, 1n, 0n]]), // received slot order
+      (n) => void (n.a!.rec = [["b", 1n, 7n, 1n]]), // received dist
+      (n) => void (n.a!.total = 3n),
       (n) => void (n.r!.rep = 11n),
     ];
     for (const change of variants) {
@@ -453,7 +693,10 @@ describe("digestEngine", () => {
 });
 
 describe("compareReplays", () => {
-  const run = (communities: ReplayResult["communities"]): ReplayResult => ({ entries: 10, communities });
+  const run = (communities: Record<string, DigestRecord[]>): ReplayResult => ({
+    entries: 10,
+    communities: new Map(Object.entries(communities)),
+  });
 
   test("reports the first difference only", () => {
     const d = compareReplays(
@@ -478,6 +721,29 @@ describe("compareReplays", () => {
     );
     assert.match(d[0]?.error ?? "", /new checkout has state here/);
     assert.match(d[2]?.error ?? "", /old checkout has state here/);
+  });
+
+  test("community ids that are Object.prototype keys are ordinary ids", () => {
+    // built as Maps: an object literal's __proto__ key sets the prototype
+    const of = (pairs: [string, DigestRecord[]][]): ReplayResult => ({ entries: 10, communities: new Map(pairs) });
+    const d = compareReplays(
+      of([
+        ["constructor", [{ entry: 1, digest: "a" }]],
+        ["__proto__", [{ entry: 1, digest: "a" }]],
+      ]),
+      of([
+        ["constructor", [{ entry: 1, digest: "b" }]],
+        ["__proto__", [{ entry: 1, digest: "a" }]],
+        ["toString", [{ entry: 2, digest: "t" }]],
+      ]),
+    );
+    assert.deepEqual(
+      d.map((x) => [x.community, x.fromEntry]),
+      [
+        ["constructor", 1],
+        ["toString", 2],
+      ],
+    );
   });
 
   test("same digest but different replay errors diverge", () => {

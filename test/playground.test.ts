@@ -6,13 +6,16 @@ import * as path from "node:path";
 import type { AddressInfo } from "node:net";
 import type * as http from "node:http";
 import { canonical, generateKeyPair, keyIdOf, sha256hex } from "../src/crypto";
-import { Ledger, type Signer } from "../src/ledger";
+import { Ledger, LedgerError, type Signer } from "../src/ledger";
 import { defaultRules } from "../src/rules";
 import { treeFromParents } from "../src/tree";
 import {
+  CLIP,
+  clip,
   esc,
   h,
   Html,
+  MAX_ENTRIES_BYTES,
   MAX_ENTRIES_PAGE,
   route,
   type Derive,
@@ -23,14 +26,21 @@ import type { EntryBody, LedgerEntry, ReviewVerdict } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Fixture: a real file-backed ledger with generated keys, covering most entry
-// kinds, with attacker-controlled strings in every free-text field and one
-// sealed (never revealed) review whose verdict must not leak.
+// kind, with attacker-controlled strings in every free-text field and in ids
+// (which are rendered inside attributes), one sealed review and one sealed
+// attestation whose verdicts must not leak, and an unrevealed plant.
 // ---------------------------------------------------------------------------
 
 const XSS = `<script>alert(1)</script>"><img src=x onerror=alert(2)>`;
+// Breaks out of a double-quoted attribute if it is not escaped there.
+const ATTR = `q" onmouseover="alert(3)" data-x="`;
 const SECRET_SUMMARY = "SECRET-UNREVEALED-VERDICT";
 const SECRET_REVIEW_SALT = "a".repeat(64);
+const SECRET_ATTEST = "SECRET-UNREVEALED-ATTESTATION";
+const SECRET_ATTEST_SALT = "f".repeat(64);
 const PLANT_SALT = "b".repeat(64);
+const PLANT3_ID = `s3${ATTR}`;
+const FINDING8_ID = `F-8${ATTR}`;
 const NOW = "2026-01-02T00:00:00.000Z";
 
 const T0 = Date.UTC(2026, 0, 1);
@@ -128,15 +138,50 @@ function buildFixture() {
   );
   add({ kind: "merge", submissionId: "s1", commit: "merge1" }, coord);
   add({ kind: "snapshot", id: "S-3", commit: "merge1", previousSnapshotId: null, submissionIds: ["s1"] }, coord);
+  const attested: ReviewVerdict = { defectProbability: 0.05, summary: `ships ${XSS}`, findingIds: [] };
+  const sealedAttest: ReviewVerdict = { defectProbability: 0.81, summary: SECRET_ATTEST, findingIds: [] };
+  const attestSalt = "9".repeat(64);
+  add({ kind: "attestCommit", snapshotId: "S-3", commitment: sha256hex(canonical(sealedAttest) + SECRET_ATTEST_SALT), stake: 5 }, key("c1"));
+  add({ kind: "attestCommit", snapshotId: "S-3", commitment: sha256hex(canonical(attested) + attestSalt), stake: 5 }, key("b1"));
+  add({ kind: "attestReveal", snapshotId: "S-3", verdict: attested, salt: attestSalt }, key("b1"));
   add({ kind: "signoff", snapshotId: "S-3" }, key("carol"));
   add({ kind: "promotion", snapshotId: "S-3", commit: "merge1" }, coord);
+  add(
+    { kind: "finding", id: FINDING8_ID, target: { snapshotId: "S-3" }, severity: "critical", testPath: "test/b.test.ts", testCommand: "npm test", stake: 5 },
+    key("d1"),
+  );
+  add(
+    { kind: "findingResult", findingId: FINDING8_ID, reproduced: true, failsOnHead: true, passesOnParent: true, logDigest: "d2g" },
+    coord,
+  );
+  add({ kind: "escape", findingId: FINDING8_ID, snapshotId: "S-3" }, coord);
   add({ kind: "settlement", owner: "dave", delta: -5, reason: "falseFinding", ref: "F-7" }, coord);
   add({ kind: "settlement", owner: "alice", delta: 10, reason: "mergeVest", ref: "s1" }, coord);
+  add({ kind: "settlement", owner: "bob", delta: 1, reason: "cleanReview", ref: ATTR }, coord);
   add(
     { kind: "submission", id: "s2", taskId: null, baseCommit: "merge1", headCommit: "head2", changedFiles: ["src/x.ts"], linesChanged: 3 },
     key("b1"),
   );
-  return { dir, file, ledger, coord, a1: id("a1"), c1: id("c1") };
+  // A failure and a later pass of the same gate: the failure still blocks (ledger merge rule).
+  add({ kind: "gateResult", submissionId: "s2", gate: "tsc", pass: false, details: "1 error" }, coord);
+  add({ kind: "gateResult", submissionId: "s2", gate: "tsc", pass: true, details: "ok" }, coord);
+  // A revealed plant, with an attribute-breaking id.
+  const plant3Salt = "e".repeat(64);
+  add({ kind: "plantCommit", commitment: sha256hex(`${PLANT3_ID}:${plant3Salt}`) }, admin);
+  add(
+    { kind: "submission", id: PLANT3_ID, taskId: null, baseCommit: "merge1", headCommit: "head3", changedFiles: ["src/z.ts"], linesChanged: 1 },
+    key("b1"),
+  );
+  add({ kind: "plantReveal", submissionId: PLANT3_ID, salt: plant3Salt, description: `off by one ${XSS}`, severity: "high" }, admin);
+  // An id that is a URL dot segment.
+  const dots = add(
+    { kind: "submission", id: "..", taskId: null, baseCommit: "merge1", headCommit: "head4", changedFiles: ["src/y.ts"], linesChanged: 2 },
+    key("b1"),
+  );
+  add({ kind: "honeytokenTriggered", agent: id("c1"), tokenId: `tok${ATTR}` }, coord);
+  add({ kind: "rulesChange", rules: { ...rules, version: rules.version + 1 }, pollId: `poll${ATTR}` }, admin);
+  add({ kind: "agentRevoked", agent: id("d1"), reason: `retired ${XSS}` }, key("dave"));
+  return { dir, file, ledger, coord, a1: id("a1"), c1: id("c1"), dotsSeq: dots.seq };
 }
 
 const fx = buildFixture();
@@ -150,15 +195,26 @@ const fakeDerive: Derive = {
   reviewerScores: () => new Map([[fx.a1, { reviews: 0, scored: 0, meanBrier: 0, plantsSeen: 0, plantsCaught: 0 }]]),
 };
 
+const quiet = () => {};
+
 function site(derive: Derive = fakeDerive): Site {
   const l = Ledger.open(fx.file);
-  return { state: l.state(), entries: l.entries(), tree, nowIso: NOW, derive };
+  return { state: l.state(), entries: l.entries(), tree, nowIso: NOW, derive, log: quiet };
 }
 
-const get = (url: string, s: () => Site = () => site()): Reply => route(s, "GET", url);
+const get = (url: string, s: () => Site = () => site()): Reply => route(s, "GET", url, quiet);
 
-const PAGES = ["/", "/submissions/s1", "/submissions/s2", "/snapshots/S-3", "/owners/alice", "/owners/dave"];
-const pagesWithAgents = () => [...PAGES, `/agents/${fx.a1}`, `/agents/${fx.c1}`];
+const PAGES = [
+  "/",
+  "/submissions/s1",
+  "/submissions/s2",
+  `/submissions/${encodeURIComponent(PLANT3_ID)}`,
+  "/snapshots/S-3",
+  "/owners/alice",
+  "/owners/bob",
+  "/owners/dave",
+];
+const pagesWithAgents = () => [...PAGES, `/submissions?seq=${fx.dotsSeq}`, `/agents/${fx.a1}`, `/agents/${fx.c1}`];
 const API = ["/api/state", "/api/entries?since=0", "/api/metrics"];
 
 // ---------------------------------------------------------------------------
@@ -221,7 +277,8 @@ test("attacker strings are escaped on every page", () => {
     const body = get(url).body;
     assert.ok(!body.includes("<script>alert"), `${url} contains a raw script tag`);
     assert.ok(!body.includes("<img"), `${url} contains a raw img tag`);
-    assert.ok(!/onerror=alert\(2\)>/.test(body) || body.includes("&quot;&gt;&lt;img"), url);
+    // Our own markup has no event handlers, so any one is a broken-out attribute.
+    assert.ok(!/"\s*on[a-z]+=/i.test(body), `${url} lets a value break out of an attribute`);
     // exactly one <script> tag: the external refresh script
     assert.equal(body.match(/<script/g)?.length, 1, url);
   }
@@ -229,38 +286,82 @@ test("attacker strings are escaped on every page", () => {
   assert.ok(pr.includes("Fix &lt;script&gt;alert(1)&lt;/script&gt;"), "proposal title is shown escaped");
   assert.ok(pr.includes("looks fine &lt;script&gt;"), "revealed review summary is shown escaped");
   assert.ok(pr.includes("test/&lt;script&gt;"), "finding test path is shown escaped");
+  // Ids land in attributes (title=, href=, id=) and are escaped there too.
+  const overview = get("/").body;
+  assert.ok(overview.includes(`title="${esc(PLANT3_ID)}"`), "a submission id is escaped inside title=");
+  assert.ok(overview.includes(`title="${esc(`tok${ATTR}`)}"`), "a honeytoken id is escaped inside title=");
+  assert.ok(overview.includes(`title="${esc(`poll${ATTR}`)}"`), "a poll id is escaped inside title=");
+  assert.ok(overview.includes(`href="/submissions/${encodeURIComponent(PLANT3_ID)}"`), "an id is URL-encoded in href=");
+  assert.ok(get("/owners/bob").body.includes(`title="${esc(ATTR)}"`), "a settlement ref is escaped inside title=");
+  assert.ok(get("/snapshots/S-3").body.includes(`title="${esc(FINDING8_ID)}"`), "a finding id is escaped inside title=");
 });
 
 test("sealed verdicts, salts and plant meaning never leak", () => {
   const s = site();
   for (const url of [...pagesWithAgents(), ...API]) {
-    const body = route(() => s, "GET", url).body;
+    const body = route(() => s, "GET", url, quiet).body;
     assert.ok(!body.includes(SECRET_SUMMARY), `${url} leaks a sealed verdict`);
     assert.ok(!body.includes(SECRET_REVIEW_SALT), `${url} leaks a sealed review's salt`);
+    assert.ok(!body.includes(SECRET_ATTEST), `${url} leaks a sealed attestation`);
+    assert.ok(!body.includes(SECRET_ATTEST_SALT), `${url} leaks a sealed attestation's salt`);
     assert.ok(!body.includes(PLANT_SALT), `${url} leaks a plant salt`);
-    assert.ok(!/0\.93/.test(body), `${url} leaks the sealed probability`);
+    assert.ok(!/0\.93|0\.81/.test(body), `${url} leaks a sealed probability`);
   }
   const pr = get("/submissions/s1").body;
   assert.match(pr, /sealed<\/span> commitment recorded/);
   assert.match(pr, /defect p=0\.12/);
+  const snap = get("/snapshots/S-3").body;
+  assert.match(snap, /sealed<\/span> commitment recorded/, "the sealed attestation is shown as a commitment only");
+  assert.match(snap, /defect p=0\.05/, "the revealed attestation is shown");
   const s2 = get("/submissions/s2").body;
   assert.ok(!/planted/i.test(s2), "an unrevealed plant is not labelled");
+  assert.match(get(`/submissions/${encodeURIComponent(PLANT3_ID)}`).body, /planted bug \(revealed\)/);
+
   const state = JSON.parse(get("/api/state").body);
-  const sub = state.submissions.find((x: { id: string }) => x.id === "s1");
-  const c1 = sub.reviews.find((r: { reviewer: string }) => r.reviewer === fx.c1);
-  assert.deepEqual(c1, { reviewer: fx.c1, stake: 5, committedSeq: c1.committedSeq, revealed: false });
-  assert.equal(state.submissions.find((x: { id: string }) => x.id === "s2").planted, null);
-  assert.equal(state.counts.plantCommitments, 1);
+  const sub = state.recentSubmissions.find((x: { id: string }) => x.id === "s1");
+  assert.deepEqual(sub.reviews, { committed: 2, revealed: 1 });
+  assert.equal(state.recentSubmissions.find((x: { id: string }) => x.id === "s2").planted, false);
+  assert.equal(state.recentSubmissions.find((x: { id: string }) => x.id === PLANT3_ID).planted, true);
+  assert.deepEqual(state.recentSnapshots.find((x: { id: string }) => x.id === "S-3").attestations, { committed: 2, revealed: 1 });
+  // The number of outstanding plants is not published.
+  assert.equal(state.counts.plantCommitments, undefined);
+  assert.ok(!/verdict|summary|salt|commitment/i.test(get("/api/state").body), "/api/state carries no verdicts or commitments");
 });
 
-test("overview renders the stream as sentences and highlights bad metrics", () => {
+test("overview renders every entry kind as a sentence, except plant commitments", () => {
   const body = get("/").body;
-  assert.match(body, /reviewed PR <a class="id" href="\/submissions\/s1"[^>]*>s1<\/a>: defect p=0\.12/);
-  assert.match(body, /did not reproduce<\/span>: passes on head, passes on parent/);
-  assert.match(body, /snapshot <a class="id" href="\/snapshots\/S-3"[^>]*>S-3<\/a> <span class="b ok">promoted<\/span> to main/);
-  assert.match(body, /owner <a href="\/owners\/bob">bob<\/a> joined, invited by/);
+  for (const [kind, pattern] of [
+    ["reviewReveal", /reviewed PR <a class="id" href="\/submissions\/s1"[^>]*>s1<\/a>: defect p=0\.12/],
+    ["findingResult", /did not reproduce<\/span>: passes on head, passes on parent/],
+    ["promotion", /snapshot <a class="id" href="\/snapshots\/S-3"[^>]*>S-3<\/a> <span class="b ok">promoted<\/span> to main/],
+    ["ownerKey", /owner <a href="\/owners\/bob">bob<\/a> joined, invited by/],
+    ["agentRevoked", /was revoked by its owner: retired &lt;script&gt;/],
+    ["attestCommit", /sealed an attestation of snapshot/],
+    ["attestReveal", /attested snapshot <a[^>]*>S-3<\/a>: defect p=0\.05 — ships &lt;script&gt;/],
+    ["plantReveal", /revealed as a <span class="b warn">planted bug<\/span> \(high\): off by one &lt;script&gt;/],
+    ["honeytokenTriggered", /<span class="b bad">triggered a honeytoken<\/span>/],
+    ["escape", /<span class="b bad">escape<\/span>: finding <a/],
+    ["rulesChange", /rules changed to v\d+ \(poll <code/],
+    ["settlement", /<span class="b ok">\+1<\/span> \(cleanReview, <code/],
+  ] as const) {
+    assert.match(body, pattern, kind);
+  }
   assert.match(body, /<tr class="bad"><td>review<\/td><td>seeded recall<\/td>/);
-  assert.match(body, /committed to a planted bug \(sealed\)/);
+  assert.ok(!body.includes("committed to a planted bug"), "plant commitments are not placed in the stream");
+});
+
+test("an id that is a URL dot segment gets a reachable page", () => {
+  const overview = get("/").body;
+  assert.ok(overview.includes(`href="/submissions?seq=${fx.dotsSeq}"`), "'..' is linked by seq");
+  for (const url of [`/submissions?seq=${fx.dotsSeq}`, "/submissions?id=.."]) {
+    const r = get(url);
+    assert.equal(r.status, 200, url);
+    assert.match(r.body, /<h1>PR <code class="id" title="\.\.">\.\.<\/code>/, url);
+  }
+  assert.equal(get("/submissions?seq=0").status, 404, "seq of an entry that is not a submission");
+  assert.equal(get("/submissions?seq=99999").status, 404);
+  assert.equal(get("/submissions?id=nope").status, 404);
+  assert.equal(get("/snapshots?seq=x").status, 404);
 });
 
 test("submission page shows reviewers with model family and tree distance", () => {
@@ -272,44 +373,72 @@ test("submission page shows reviewers with model family and tree distance", () =
   assert.match(body, /did not reproduce/);
 });
 
+test("a failed gate stays a block after a later pass, and the page says why", () => {
+  const body = get("/submissions/s2").body;
+  assert.match(body, /blocked: gate failed/);
+  assert.match(body, /a later run passed; the ledger still counts this failure/);
+});
+
 test("snapshot, owner and agent pages show promotion checks and track records", () => {
   const snap = get("/snapshots/S-3").body;
   assert.match(snap, /promoted to main/);
   assert.match(snap, /not ready/);
   assert.match(snap, /1 of 2 required/);
   assert.match(snap, /1\/2 revealed/);
+  assert.match(snap, /<h2>Escapes<\/h2>/);
   const dave = get("/owners/dave").body;
   assert.match(dave, /False findings/);
   assert.match(dave, /<b>1<\/b> false findings/);
+  assert.match(dave, /<b>1<\/b> findings held up/);
   assert.match(dave, /falseFinding/);
   const alice = get("/owners/alice").body;
   assert.match(alice, /<b>1<\/b> merged of 1 PRs/);
   assert.match(alice, /Anthill reputation<\/dt><dd>100/);
 });
 
-test("a failing derived statistic renders as unavailable, not a 500", () => {
+test("failures never put exception text on a public reply", () => {
+  const secret = "/srv/operator/secret/ledger.jsonl";
   const boom = () => {
-    throw new Error(`boom ${XSS}`);
+    throw new Error(`boom ${secret} ${XSS}`);
   };
-  const s = () => site({ metrics: boom, promotion: boom, reviewerScores: boom });
+  const logged: unknown[] = [];
+  const s = () => ({ ...site({ metrics: boom, promotion: boom, reviewerScores: boom }), log: (e: unknown) => logged.push(e) });
   for (const url of ["/", "/snapshots/S-3", "/owners/alice"]) {
-    const r = get(url, s);
+    const r = route(s, "GET", url, quiet);
     assert.equal(r.status, 200, url);
     assert.match(r.body, /unavailable/, url);
-    assert.ok(!r.body.includes("<script>alert"), url);
+    assert.ok(!r.body.includes("boom") && !r.body.includes(secret), url);
   }
-  assert.equal(get("/api/metrics", s).status, 500);
+  const m = route(s, "GET", "/api/metrics", quiet);
+  assert.equal(m.status, 500);
+  assert.ok(!m.body.includes("boom"));
+  assert.ok(logged.length >= 3, "failures are logged instead");
 });
 
-test("an unreadable ledger is a 503, and the refresh script is still served", () => {
-  const broken = () => {
-    throw new Error("torn <b>line</b>");
+test("an unreadable ledger is a 503 with only the error code, and the refresh script is still served", () => {
+  const secretPath = "/srv/operator/secret/ledger.jsonl";
+  const torn = () => {
+    throw new LedgerError("torn", `last line of ${secretPath} is not terminated <b>x</b>`);
   };
-  const r = get("/", broken);
-  assert.equal(r.status, 503);
-  assert.ok(!r.body.includes("<b>line"));
-  assert.equal(get("/api/state", broken).status, 503);
-  assert.equal(get("/static/refresh.js", broken).status, 200);
+  const enoent = () => {
+    throw new Error(`ENOENT: no such file or directory, stat '${secretPath}'`);
+  };
+  const logged: unknown[] = [];
+  const log = (e: unknown) => logged.push(e);
+  const html = route(torn, "GET", "/", log);
+  assert.equal(html.status, 503);
+  assert.ok(!html.body.includes(secretPath) && !html.body.includes("<b>x"));
+  assert.match(html.body, /\(torn\)/);
+  const json = route(torn, "GET", "/api/state", log);
+  assert.equal(json.status, 503);
+  assert.deepEqual(JSON.parse(json.body), { error: "ledger unavailable", code: "torn" });
+  for (const url of ["/", "/api/state"]) {
+    const r = route(enoent, "GET", url, log);
+    assert.equal(r.status, 503, url);
+    assert.ok(!r.body.includes(secretPath) && !r.body.includes("ENOENT"), url);
+  }
+  assert.equal(logged.length, 4);
+  assert.equal(route(torn, "GET", "/static/refresh.js", log).status, 200);
 });
 
 test("/api/entries pages raw signed entries and caps the page size", () => {
@@ -317,6 +446,7 @@ test("/api/entries pages raw signed entries and caps the page size", () => {
   assert.equal(all.entries.length, fx.ledger.entries().length);
   assert.deepEqual(all.entries, fx.ledger.entries(), "entries are the raw signed ledger lines");
   assert.equal(all.next, null);
+  assert.match(all.cursor, /inclusive/);
   const part = JSON.parse(get("/api/entries?since=3&limit=2").body);
   assert.deepEqual(
     part.entries.map((e: LedgerEntry) => e.seq),
@@ -327,29 +457,107 @@ test("/api/entries pages raw signed entries and caps the page size", () => {
   // A long ledger: the cap holds whatever limit is asked for.
   const s = site();
   const long = Array.from({ length: 1200 }, (_, i) => ({ ...(s.entries[0] as LedgerEntry), seq: i }));
-  const big = JSON.parse(route(() => ({ ...s, entries: long }), "GET", "/api/entries?since=100&limit=100000").body);
+  const big = JSON.parse(route(() => ({ ...s, entries: long }), "GET", "/api/entries?since=100&limit=100000", quiet).body);
   assert.equal(big.entries.length, MAX_ENTRIES_PAGE);
   assert.equal(big.limit, MAX_ENTRIES_PAGE);
   assert.equal(big.next, 100 + MAX_ENTRIES_PAGE);
 });
 
-test("/api/state converts maps and carries counts", () => {
-  const state = JSON.parse(get("/api/state").body);
+test("/api/state carries counts and short summaries, compactly", () => {
+  const body = get("/api/state").body;
+  assert.ok(!body.includes("\n"), "no pretty-printing");
+  const state = JSON.parse(body);
   assert.equal(state.project, "anthill");
   assert.equal(state.counts.owners, 4);
   assert.equal(state.counts.merged, 1);
   assert.equal(state.counts.falseFindings, 1);
+  assert.equal(state.counts.plantsRevealed, 1);
   assert.ok(Array.isArray(state.owners));
-  assert.ok(Array.isArray(state.agents));
+  assert.equal(state.owners.find((o: { id: string }) => o.id === "bob").agents, 1);
+  assert.equal(state.recentSubmissions[0].id, "..", "newest first");
+  assert.equal(state.recentSubmissions[0].page, `/submissions?seq=${fx.dotsSeq}`);
+  assert.equal(state.recentSubmissions.find((x: { id: string }) => x.id === "s1").status, "merged");
   const metrics = JSON.parse(get("/api/metrics").body);
   assert.equal(metrics.rows.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Size: one agent writing huge strings and lists must not make pages huge
+// ---------------------------------------------------------------------------
+
+test("huge titles, ids, paths and lists are clipped, and /api/entries is capped by bytes", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "playground-big-"));
+  try {
+    const file = path.join(dir, "ledger.jsonl");
+    const admin = generateKeyPair();
+    const coord = generateKeyPair();
+    const [alice, bob, a1, b1] = [generateKeyPair(), generateKeyPair(), generateKeyPair(), generateKeyPair()];
+    const ledger = Ledger.create(
+      file,
+      { kind: "genesis", project: "anthill", admins: [admin.publicKey], coordinator: coord.publicKey, rules: defaultRules() },
+      tick(),
+    );
+    const add = (body: EntryBody, signer: Signer) => ledger.append(body, signer, tick());
+    const MB = "x".repeat(1 << 20);
+    add({ kind: "ownerKey", owner: "alice", publicKey: alice.publicKey, inviter: null }, admin);
+    add({ kind: "ownerKey", owner: "bob", publicKey: bob.publicKey, inviter: "alice" }, admin);
+    add({ kind: "agentRegistered", owner: "alice", publicKey: a1.publicKey, modelFamily: "claude", harness: MB }, alice);
+    add({ kind: "agentRegistered", owner: "bob", publicKey: b1.publicKey, modelFamily: "gpt", harness: "cli" }, bob);
+    for (let i = 0; i < 3; i++) {
+      add({ kind: "proposal", id: `p${i}`, title: MB, evidence: [{ kind: "failingTest", testId: "t", command: "c" }] }, a1);
+    }
+    const longId = `L${"y".repeat(100_000)}`;
+    const files = Array.from({ length: 5000 }, (_, i) => `src/f${i}.ts`);
+    add({ kind: "submission", id: longId, taskId: null, baseCommit: "b", headCommit: "h", changedFiles: files, linesChanged: 1 }, a1);
+    add({ kind: "gateResult", submissionId: longId, gate: "tsc", pass: false, details: MB }, coord);
+    add(
+      { kind: "finding", id: "F1", target: { submissionId: longId }, severity: "low", testPath: `t/${"z".repeat(100_000)}`, testCommand: MB, stake: 5 },
+      b1,
+    );
+    add({ kind: "settlement", owner: "alice", delta: 1, reason: "mergeVest", ref: MB }, coord);
+
+    const l = Ledger.open(file);
+    const s: Site = { state: l.state(), entries: l.entries(), tree, nowIso: NOW, derive: fakeDerive, log: quiet };
+    const at = (url: string) => route(() => s, "GET", url, quiet);
+    const sub = s.state.submissions.get(longId);
+    assert.ok(sub);
+    const prUrl = `/submissions?seq=${sub.submittedSeq}`;
+    for (const url of ["/", prUrl, "/owners/alice", `/agents/${keyIdOf(a1.publicKey)}`, "/api/state", "/api/metrics"]) {
+      const r = at(url);
+      assert.equal(r.status, 200, url);
+      assert.ok(r.body.length < 200_000, `${url} is ${r.body.length} bytes`);
+      assert.ok(!r.body.includes("x".repeat(CLIP.text + 1)), `${url} renders a huge string in full`);
+    }
+    const overview = at("/").body;
+    assert.ok(overview.includes(`href="${prUrl}"`), "a huge id is linked by seq");
+    assert.ok(!overview.includes("y".repeat(CLIP.id + 1)));
+    assert.match(at(prUrl).body, /and 4800 more not shown/);
+    assert.equal(clip("abcdef", 3), "abc… [3 more characters]");
+
+    // Pages of raw entries stop at the byte cap and still reach every entry.
+    const seen: LedgerEntry[] = [];
+    let since: number | null = 0;
+    let pages = 0;
+    while (since !== null) {
+      const r = at(`/api/entries?since=${since}`);
+      assert.ok(Buffer.byteLength(r.body) <= MAX_ENTRIES_BYTES + 2048, `page ${pages} is ${r.body.length} bytes`);
+      const p = JSON.parse(r.body) as { entries: LedgerEntry[]; next: number | null };
+      seen.push(...p.entries);
+      since = p.next;
+      pages++;
+    }
+    assert.ok(pages > 1, "a big ledger takes more than one page");
+    assert.deepEqual(seen, l.entries());
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
 // The real server (needs metrics.ts, promotion.ts and review.ts to exist)
 // ---------------------------------------------------------------------------
 
-test("startPlayground serves the ledger over HTTP and follows appends", async (t) => {
+test("startPlayground serves the ledger over HTTP, follows appends and survives torn writes", async (t) => {
   let mod: typeof import("../src/playground");
   try {
     mod = await import("../src/playground");
@@ -380,13 +588,32 @@ test("startPlayground serves the ledger over HTTP and follows appends", async (t
   assert.equal(head.status, 200);
   assert.equal(await head.text(), "");
 
+  const stateNow = async () => {
+    const res = await fetch(base + "/api/state");
+    assert.equal(res.status, 200);
+    return JSON.parse(await res.text());
+  };
   // An append by another writer shows up on the next request.
-  const before = JSON.parse(await (await fetch(base + "/api/state")).text()).length;
+  const before = (await stateNow()).length;
   const writer = Ledger.open(fx.file);
   writer.append({ kind: "settlement", owner: "bob", delta: 2, reason: "cleanReview", ref: "s1" }, fx.coord, tick());
-  const after = JSON.parse(await (await fetch(base + "/api/state")).text());
+  const after = await stateNow();
   assert.equal(after.length, before + 1);
-  assert.equal(after.counts.settlements, 3);
+  assert.equal(after.counts.settlements, 4);
+
+  // A half-written line is not an error: the last complete state is served.
+  const size = fs.statSync(fx.file).size;
+  fs.appendFileSync(fx.file, `{"seq":${before + 1},"half":`);
+  assert.equal((await stateNow()).length, before + 1);
+  // The file shrinking (here: back to the last complete line) is a full re-read.
+  fs.truncateSync(fx.file, size);
+  assert.equal((await stateNow()).length, before + 1);
+  // Garbage appended: logged, and the last good state is still served.
+  const errors = t.mock.method(console, "error", () => {});
+  fs.appendFileSync(fx.file, "not json\n");
+  assert.equal((await stateNow()).length, before + 1);
+  assert.ok(errors.mock.callCount() >= 1);
+  fs.truncateSync(fx.file, size);
 });
 
 test.after(() => fs.rmSync(fx.dir, { recursive: true, force: true }));

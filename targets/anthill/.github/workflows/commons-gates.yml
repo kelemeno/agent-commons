@@ -1,63 +1,102 @@
 # Agent-commons gates for every pull request. See .commons/README.md.
 #
-# Trust: this runs on `pull_request` (never `pull_request_target`), so a fork's
-# code runs with a read-only token and no secrets. The PR's code is executed
-# only by the behaviour-delta replay (its anthill-backend engine); nothing from
-# the PR is `npm install`ed. What the PR is judged against comes from the base
-# checkout: the ratified rules (.commons/rules.json) and the replay log, which
-# the base backend generates. Only declarations are taken from the PR, and only
-# the ones it adds (see "Behaviour-delta manifest" below).
+# Two jobs, two trust levels:
 #
-# A `pull_request` workflow runs the PR's own copy of this file, so a PR can
-# weaken it. .github/** is ring 0: such a PR is a kernel change and gets kernel
-# review; make this check required in branch protection.
+# - `static` runs on `pull_request_target`, so GitHub runs the BASE branch's
+#   copy of this file, and a PR cannot change what it does. It checks out only
+#   base code and the pinned agent-commons, fetches the PR's commits as data
+#   (git objects, never checked out or executed) and runs the static gates
+#   (rings, airlock, size) against the base's ratified rules. This is the
+#   authoritative gate.
+#
+# - `delta` runs on `pull_request`, because the behaviour-delta replay has to
+#   execute the PR's anthill-backend. GitHub runs the PR's own copy of this file
+#   for it, so a PR that edits .github/** controls what `delta` does and its
+#   result is advisory for that PR. Such a PR is ring 0 (the `static` job says
+#   so) and needs code-owner review of the workflow change itself.
+#
+# Neither job proves itself: any workflow a PR adds can create a check with
+# the same name as these. What makes them binding is branch protection outside
+# this file: CODEOWNERS on .github/**, .commons/** and the kernel with "Require
+# review from Code Owners", and, where available, a ruleset that requires this
+# workflow (pinned) to pass. See .commons/README.md, "What protects the gates".
+#
+# Tokens and secrets: both jobs ask for `contents: read` and use no secrets.
+# For `delta` that guarantee holds only for PRs from FORKS. A PR from a branch
+# of this repo gets the repository's secrets, and its copy of this file can ask
+# for write permissions. So agents submit from forks, the repository's default
+# workflow token is read-only, and deploy secrets are not repository secrets.
+#
+# Scope: this gates PRs to the monorepo. PRs opened against the submodule
+# repos (anthill-backend, anthill-contracts, anthill-frontend) are not gated
+# here; their changes are gated when the monorepo bumps the gitlink.
 
 name: commons-gates
 
 on:
+  pull_request_target:
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: commons-gates-${{ github.event.pull_request.number }}
+  group: commons-gates-${{ github.event_name }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
-  # The coordinator version that judges PRs. Pin to a release tag or commit
-  # once agent-commons publishes one; changing it is a ring 0 change here.
-  COMMONS_REF: main
+  # The agent-commons commit that judges PRs: a full commit SHA, never a branch
+  # or tag (both can be moved). Changing it is a ring 0 change here. Until
+  # agent-commons has a commit to pin, this placeholder makes both jobs fail.
+  COMMONS_SHA: "0000000000000000000000000000000000000000"
 
 jobs:
-  gates:
+  static:
+    if: ${{ github.event_name == 'pull_request_target' }}
+    name: static gates (base-controlled)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      # The merge commit GitHub builds for the PR (github.sha): what the base
-      # branch becomes if the PR lands. Its first parent is the base tip, so
-      # base.sha..github.sha is exactly the PR's change.
-      - name: Check out the PR (merge commit) with submodules
-        uses: actions/checkout@v4
-        with:
-          path: head
-          submodules: recursive
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Check the agent-commons pin
+        run: |
+          if ! [[ "$COMMONS_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$COMMONS_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::COMMONS_SHA must pin agent-commons to a real commit SHA"
+            exit 1
+          fi
 
+      # github.sha here is the tip of the base branch. Credentials are kept so
+      # the CLI can fetch submodule commits; nothing from the PR runs in this job.
       - name: Check out the base with submodules
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: base
+          ref: ${{ github.sha }}
+          path: repo
           submodules: recursive
-          persist-credentials: false
+          fetch-depth: 0
+
+      # The PR's commits as objects only: not checked out, not executed.
+      - name: Fetch the PR's commits
+        id: pr
+        working-directory: repo
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --no-recurse-submodules origin "+refs/pull/${PR_NUMBER}/head:refs/commons/pr-head"
+          fetched=$(git rev-parse refs/commons/pr-head)
+          if [ "$fetched" != "$PR_HEAD_SHA" ]; then
+            echo "::error::the PR moved while this ran (event head $PR_HEAD_SHA, fetched $fetched); the run for the new head judges it"
+            exit 1
+          fi
+          # The PR's own change: from where it meets the base branch to its head.
+          echo "base=$(git merge-base "$GITHUB_SHA" "$PR_HEAD_SHA")" >> "$GITHUB_OUTPUT"
+          echo "head=$PR_HEAD_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Check out agent-commons
         uses: actions/checkout@v4
         with:
           repository: kelemeno/agent-commons
-          ref: ${{ env.COMMONS_REF }}
+          ref: ${{ env.COMMONS_SHA }}
           path: commons
           persist-credentials: false
 
@@ -69,71 +108,102 @@ jobs:
         working-directory: commons
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      # Rules from the base branch tip: the ratified ones, never the PR's copy.
       - name: Static gates (rings, airlock, size)
         working-directory: commons
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
         run: |
-          rules="$GITHUB_WORKSPACE/base/.commons/rules.json"
+          rules="$GITHUB_WORKSPACE/repo/.commons/rules.json"
           if [ ! -f "$rules" ]; then
             echo "::error::the base branch has no .commons/rules.json; there are no ratified rules to judge this PR against"
             exit 1
           fi
-          npx tsx src/cli.ts gates \
-            --repo "$GITHUB_WORKSPACE/head" \
+          node --import tsx src/cli.ts gates \
+            --repo "$GITHUB_WORKSPACE/repo" \
             --base "$BASE_SHA" \
             --head "$HEAD_SHA" \
             --rules "$rules"
 
+  delta:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: behaviour delta (runs PR code)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check the agent-commons pin
+        run: |
+          if ! [[ "$COMMONS_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$COMMONS_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::COMMONS_SHA must pin agent-commons to a real commit SHA"
+            exit 1
+          fi
+
+      # The merge commit GitHub builds for the PR (github.sha): what the base
+      # branch becomes if the PR lands.
+      - name: Check out the PR (merge commit) with submodules
+        uses: actions/checkout@v4
+        with:
+          path: head
+          submodules: recursive
+          fetch-depth: 2
+          persist-credentials: false
+
+      # The base is the merge commit's first parent, the base GitHub actually
+      # merged into. pull_request.base.sha in the event can be older (re-runs,
+      # a base that moved), and judging against it would compare the wrong trees.
+      - name: Find the base the merge commit was built on
+        id: base
+        working-directory: head
+        env:
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base=$(git rev-parse HEAD^1)
+          if [ "$base" != "$EVENT_BASE_SHA" ]; then
+            echo "::notice::the merge commit's base is $base, not the event's $EVENT_BASE_SHA; judging against $base"
+          fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the base with submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.base.outputs.sha }}
+          path: base
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check out agent-commons
+        uses: actions/checkout@v4
+        with:
+          repository: kelemeno/agent-commons
+          ref: ${{ env.COMMONS_SHA }}
+          path: commons
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install agent-commons
+        working-directory: commons
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # The log comes from code that is already trusted: the base backend.
       - name: Generate the replay log with the base backend
-        if: ${{ !cancelled() }}
         working-directory: commons
         run: |
-          npx tsx scripts/make-anthill-fixture-log.ts \
+          node --import tsx scripts/make-anthill-fixture-log.ts \
             --backend "$GITHUB_WORKSPACE/base/anthill-backend" \
             --out "$RUNNER_TEMP/anthill-log.jsonl"
 
-      # A declaration counts only in the PR that adds it: declarations already
-      # on the base are dropped, so a stale one cannot cover a later change.
-      # A head manifest that is not {declared: [...]} is passed on unchanged,
-      # and the gate fails on it.
-      - name: Behaviour-delta manifest (declarations this PR adds)
-        if: ${{ !cancelled() }}
-        run: |
-          node - "$GITHUB_WORKSPACE/base/.commons/behaviour-delta.json" \
-                 "$GITHUB_WORKSPACE/head/.commons/behaviour-delta.json" \
-                 "$RUNNER_TEMP/behaviour-delta.json" <<'JS'
-          const fs = require("node:fs");
-          const [basePath, headPath, outPath] = process.argv.slice(2);
-          const key = (d) => JSON.stringify(d, Object.keys(d ?? {}).sort());
-          const baseDeclared = (() => {
-            try { return JSON.parse(fs.readFileSync(basePath, "utf8")).declared ?? []; }
-            catch { return []; }
-          })();
-          if (!fs.existsSync(headPath)) {
-            fs.writeFileSync(outPath, JSON.stringify({ declared: [] }));
-            process.exit(0);
-          }
-          const headText = fs.readFileSync(headPath, "utf8");
-          let head;
-          try { head = JSON.parse(headText); } catch { head = undefined; }
-          if (!head || !Array.isArray(head.declared) || !Array.isArray(baseDeclared)) {
-            fs.writeFileSync(outPath, headText);
-            process.exit(0);
-          }
-          const old = new Set(baseDeclared.map(key));
-          const declared = head.declared.filter((d) => !old.has(key(d)));
-          fs.writeFileSync(outPath, JSON.stringify({ declared }, null, 2));
-          console.log(`${declared.length} declaration(s) added by this PR`);
-          JS
-
+      # Only the declarations this PR adds count (--base-manifest); the same
+      # command works locally, see .commons/README.md.
       - name: Behaviour-delta gate (base vs PR anthill-backend)
-        if: ${{ !cancelled() }}
         working-directory: commons
         run: |
-          npx tsx src/cli.ts delta \
+          node --import tsx src/cli.ts delta \
             --old "$GITHUB_WORKSPACE/base/anthill-backend" \
             --new "$GITHUB_WORKSPACE/head/anthill-backend" \
             --log "$RUNNER_TEMP/anthill-log.jsonl" \
-            --manifest "$RUNNER_TEMP/behaviour-delta.json"
+            --manifest "$GITHUB_WORKSPACE/head/.commons/behaviour-delta.json" \
+            --base-manifest "$GITHUB_WORKSPACE/base/.commons/behaviour-delta.json"

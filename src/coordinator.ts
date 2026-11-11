@@ -368,11 +368,7 @@ export function planActions(state: CommonsState, tree: TreeView, nowIso: string,
 
   // 8. Promote the newest unpromoted snapshot after the last promotion that
   // passes the promotion rule. Older candidates are covered by its ancestry.
-  const lastPromoted = Math.max(-1, ...[...state.snapshots.values()].map((s) => s.promoted?.seq ?? -1));
-  const lastPromotedSnapshotSeq = Math.max(
-    -1,
-    ...[...state.snapshots.values()].filter((s) => s.promoted && s.promoted.seq === lastPromoted).map((s) => s.seq),
-  );
+  const lastPromotedSnapshotSeq = Math.max(-1, ...[...state.snapshots.values()].filter((s) => s.promoted).map((s) => s.seq));
   const candidates = [...state.snapshots.values()]
     .filter((s) => !s.promoted && s.seq > lastPromotedSnapshotSeq)
     .sort((a, b) => b.seq - a.seq);
