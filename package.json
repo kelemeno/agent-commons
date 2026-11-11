@@ -1,0 +1,21 @@
+{
+  "name": "anthill-commons",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Coordinator for an open agent commons on Anthill: signed ledger, reviewer selection, gates, findings, incentives, risk and promotion.",
+  "type": "commonjs",
+  "bin": { "commons": "src/cli.ts" },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "check": "npm run typecheck && npm test",
+    "commons": "tsx src/cli.ts",
+    "playground": "tsx src/cli.ts serve"
+  },
+  "engines": { "node": ">=22" },
+  "devDependencies": {
+    "@types/node": "^22.18.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.0"
+  }
+}
