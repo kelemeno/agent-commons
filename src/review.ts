@@ -9,7 +9,7 @@
 
 import { canonical, sha256hex } from "./crypto";
 import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
-import { instantMs, plantStats, reviewWindowCloseSeq } from "./plants";
+import { instantMs, plantStats, reviewCloseSeq } from "./plants";
 import type { CommonsState, FindingState, KeyId, ReviewVerdict, Severity, SnapshotState, SubmissionState } from "./types";
 
 // What a review or attestation commits to: a submission or a snapshot.
@@ -47,6 +47,13 @@ export { isFalseFinding } from "./findingStatus";
 //   checks it against the member tree before the entry.
 export function assignmentBeacon(submissionId: string, headCommit: string, entropy: string): string {
   return sha256hex(canonical({ submission: submissionId, head: headCommit, entropy }));
+}
+
+// The draw beacon of the round-th reviewEscalation. Fresh entropy per round,
+// for the reasons above; the round keeps two rounds from sharing a beacon
+// even if the entropy repeats.
+export function escalationBeacon(submissionId: string, headCommit: string, round: number, entropy: string): string {
+  return sha256hex(canonical({ submission: submissionId, head: headCommit, round, entropy }));
 }
 
 const VERDICT_FIELDS = ["defectProbability", "summary", "findingIds"];
@@ -231,10 +238,11 @@ export function reviewerScores(state: CommonsState, nowIso: string): Map<KeyId, 
   for (const s of state.submissions.values()) {
     if (s.reviews.length === 0) continue;
     const outcome = outcomeWith(state, index, s, now);
-    const cutoff = reviewWindowCloseSeq(state, s.id);
     for (const r of s.reviews) {
       const sc = get(r.reviewer);
       if (r.verdict !== undefined) sc.reviews += 1;
+      // An escalated seat is timed by its own round (plants.roundCloseSeq).
+      const cutoff = reviewCloseSeq(state, s, r.reviewer);
       if (cutoff === null || r.committedSeq > cutoff) continue;
       const inTime = r.verdict !== undefined && r.revealedSeq !== undefined && r.revealedSeq <= cutoff;
       if (!inTime) sc.unrevealed += 1;

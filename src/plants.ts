@@ -25,7 +25,7 @@
 
 import { sha256hex } from "./crypto";
 import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
-import type { CommonsState, FindingState, KeyId, ModelFamily, Rules, SubmissionState } from "./types";
+import type { CommonsState, FindingState, KeyId, ModelFamily, ReviewRound, Rules, SubmissionState } from "./types";
 
 // A revealed review at or above this probability counts as flagging the change.
 export const CATCH_THRESHOLD = 0.5;
@@ -146,6 +146,69 @@ export function reviewWindowCloseSeq(state: CommonsState, submissionId: string):
 // Revealing a plant before this is true would tell the remaining reviewers what to look for.
 export function reviewWindowClosed(state: CommonsState, submissionId: string): boolean {
   return reviewWindowCloseSeq(state, submissionId) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Review rounds
+// ---------------------------------------------------------------------------
+
+// The submission's review rounds in order: round 0 (the reviewAssignment)
+// and each reviewEscalation. Empty before the assignment. The plant window
+// above is round 0's: escalations come after it closed, so plant catches,
+// missed-plant charges and seeded recall never count them.
+export function reviewRounds(s: SubmissionState): ReviewRound[] {
+  const a = s.assignment;
+  if (!a) return [];
+  const first: ReviewRound = {
+    round: 0,
+    beacon: a.beacon,
+    entropy: a.entropy,
+    treeDigest: a.treeDigest,
+    reviewers: a.reviewers,
+    seq: a.seq,
+    ...(a.at !== undefined ? { at: a.at } : {}),
+    ...(s.windowClosed ? { closed: s.windowClosed } : {}),
+  };
+  return [first, ...(s.escalations ?? [])];
+}
+
+// The round in which `reviewer` holds a seat. The ledger never seats an owner twice.
+export function seatRound(s: SubmissionState, reviewer: KeyId): ReviewRound | undefined {
+  return reviewRounds(s).find((r) => r.reviewers.includes(reviewer));
+}
+
+// The seq of the entry that closed review round `round`, or null while it is
+// open. Round 0 closes as reviewWindowCloseSeq says. An escalation round
+// closes at the first of: the merge; its reviewWindowClosed entry; the reveal
+// that completed its seats; a reproduced finding nobody dismissed; the
+// plant's reveal.
+export function roundCloseSeq(state: CommonsState, submissionId: string, round: number): number | null {
+  if (round === 0) return reviewWindowCloseSeq(state, submissionId);
+  const s = state.submissions.get(submissionId);
+  const r = s?.escalations?.find((x) => x.round === round);
+  if (!s || !r) return null;
+  let close = Number.POSITIVE_INFINITY;
+  if (s.merged) close = s.merged.seq;
+  if (r.closed) close = Math.min(close, r.closed.seq);
+  if (r.reviewers.length > 0) {
+    let last = Number.NEGATIVE_INFINITY;
+    for (const k of r.reviewers) {
+      const seq = s.reviews.find((v) => v.reviewer === k && v.verdict !== undefined)?.revealedSeq;
+      last = Math.max(last, seq ?? Number.POSITIVE_INFINITY);
+    }
+    close = Math.min(close, last);
+  }
+  for (const f of findingsOn(state, s)) {
+    if (f.result && isReproducedOpen(f)) close = Math.min(close, f.result.seq);
+  }
+  if (s.planted?.seq !== undefined) close = Math.min(close, s.planted.seq);
+  return close === Number.POSITIVE_INFINITY ? null : close;
+}
+
+// The close of the round a review belongs to: its seat's round, or round 0
+// for an open reviewer (who commits on the submission, not on a round).
+export function reviewCloseSeq(state: CommonsState, s: SubmissionState, reviewer: KeyId): number | null {
+  return roundCloseSeq(state, s.id, seatRound(s, reviewer)?.round ?? 0);
 }
 
 // ---------------------------------------------------------------------------

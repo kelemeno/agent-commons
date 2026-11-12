@@ -150,9 +150,30 @@ export type EntryBody =
   // assigned reviews; `missing` never revealed. Closes the window on the
   // ledger (plants.reviewWindowCloseSeq) before any merge, so the plant
   // custodian can reveal in the grace that follows.
-  | { kind: "reviewWindowClosed"; submissionId: string; missing: KeyId[] }
-  // signer: coordinator. Submission merged into dev.
-  | { kind: "merge"; submissionId: string; commit: CommitSha }
+  // `round` (absent = 0) names the review round: 0 is the reviewAssignment,
+  // k >= 1 the k-th reviewEscalation. A round closed this way may be below
+  // quorum; what follows is the merge judgement's call (judgement.ts).
+  | { kind: "reviewWindowClosed"; submissionId: string; missing: KeyId[]; round?: number }
+  // signer: coordinator. More reviewers for a submission whose earlier rounds
+  // closed without a mechanical verdict (judgement.ts: disagreement, a
+  // well-calibrated "risky", a pooled risk above the ring's threshold, or too
+  // few reveals). round = escalations so far + 1; beacon =
+  // review.escalationBeacon(submissionId, headCommit, round, entropy). The
+  // draw is selection.selectReviewers over owners holding no seat and no
+  // commit on the submission (selection.verifyEscalation).
+  | {
+      kind: "reviewEscalation";
+      submissionId: string;
+      round: number;
+      beacon: string;
+      entropy: string;
+      treeDigest: string;
+      reviewers: KeyId[];
+    }
+  // signer: coordinator. Submission merged into dev. `judgement` records the
+  // merge judgement the coordinator applied (judgement.ts); the ledger
+  // re-pools it and requires a passing one on a merge without mergeApproval.
+  | { kind: "merge"; submissionId: string; commit: CommitSha; judgement?: MergeJudgement }
   // signer: coordinator. A release candidate frozen at a dev commit.
   | { kind: "snapshot"; id: string; commit: CommitSha; previousSnapshotId: string | null; submissionIds: string[] }
   // signer: agent. Second-pass review of a snapshot's cumulative diff (commit-reveal like reviews)
@@ -261,6 +282,28 @@ export type Rules = {
     kernelSignoffs: number; // k
   };
   kernelSigners: OwnerId[]; // the n
+  // The merge judgement (judgement.ts): reviews decide the merge, weighted by
+  // each reviewer's track record. Probabilistic about the code, deterministic
+  // about the reviewers.
+  judgement: {
+    // Highest pooled defect risk that merges without a human, per ring 0, 1, 2.
+    // Ring 0 also always needs a mergeApproval.
+    maxRisk: [number, number, number];
+    // The pool starts from this risk at this weight, as if one more reviewer
+    // had said it: with only untried reviewers, the pool stays near it.
+    priorRisk: number;
+    priorWeight: number;
+    // Weight of a reviewer with no record; a record of n scored reviews
+    // counts against priorReviews reviews at newReviewerWeight.
+    newReviewerWeight: number;
+    priorReviews: number;
+    // Escalate when the counted verdicts spread at least this far (max p - min p) ...
+    disagreement: number;
+    // ... or a reviewer of at least this weight said p >= CATCH_THRESHOLD.
+    trustedWeight: number;
+    maxEscalations: number; // review rounds after the first; then a human decides
+    escalationReviewers: number; // seats per escalation round
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -307,6 +350,31 @@ export type ReviewState = {
   revealedSeq?: number;
 };
 
+// The merge judgement as a merge entry records it. `weights` lists every
+// counted reveal (judgement.countedVerdicts), sorted by reviewer, with the
+// weight judgement.reviewerWeights gave it at `asOf`; `pooledRisk` is
+// judgement.poolRisk over those verdicts and weights. Numbers are rounded to
+// JUDGEMENT_PRECISION, so every verifier agrees on them.
+export type MergeJudgement = {
+  asOf: string;
+  ring: Ring;
+  pooledRisk: number;
+  threshold: number;
+  weights: { reviewer: KeyId; weight: number }[];
+};
+
+// One review round: round 0 is the reviewAssignment, k >= 1 a reviewEscalation.
+export type ReviewRound = {
+  round: number;
+  beacon: string;
+  entropy: string;
+  treeDigest: string;
+  reviewers: KeyId[];
+  seq: number;
+  at?: string; // always set by replay
+  closed?: { missing: KeyId[]; seq: number; at: string }; // reviewWindowClosed with this round
+};
+
 export type SubmissionState = {
   id: string;
   author: KeyId;
@@ -320,10 +388,11 @@ export type SubmissionState = {
   gates: { gate: string; pass: boolean; details: string }[];
   assignment?: { beacon: string; entropy: string; treeDigest: string; reviewers: KeyId[]; seq: number; at?: string }; // at: always set by replay
   approval?: { by: KeyId; seq: number; at: string }; // mergeApproval
-  windowClosed?: { missing: KeyId[]; seq: number; at: string }; // reviewWindowClosed
+  windowClosed?: { missing: KeyId[]; seq: number; at: string }; // reviewWindowClosed, round 0
+  escalations?: ReviewRound[]; // reviewEscalation rounds 1, 2, ...; always set by replay
   reviews: ReviewState[];
   findingIds: string[];
-  merged?: { commit: CommitSha; seq: number; at: string };
+  merged?: { commit: CommitSha; seq: number; at: string; judgement?: MergeJudgement };
   planted?: { severity: Severity; description: string; seq?: number }; // set only after plantReveal; seq always set by replay
 };
 

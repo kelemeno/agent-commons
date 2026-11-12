@@ -66,12 +66,22 @@
 // coordinator still chooses is which agents it revokes (a suspension, on the
 // ledger with its reason, promotes the next-ranked owner); Phase 1 trusts it
 // with that.
+//
+// Escalation rounds (reviewEscalation, judgement.ts) draw the same way, with
+// fresh entropy (review.escalationBeacon), over the pool as it was at the
+// submission less every owner that holds a seat or a commit on it, for
+// rules.judgement.escalationReviewers seats.
 
 import { sha256hex } from "./crypto";
+import { JUDGEMENT_PRECISION, judgementProblem, reviewerWeights } from "./judgement";
 import { replay } from "./ledger";
 import { memberDigest, memberTree } from "./members";
-import { assignmentBeacon } from "./review";
+import { reviewRounds } from "./plants";
+import { assignmentBeacon, escalationBeacon } from "./review";
 import type { AgentState, CommonsState, EntryBody, KeyId, LedgerEntry, OwnerId, OwnerState, SubmissionState } from "./types";
+
+// An escalation draw: how many seats, and the owners that may not hold one.
+export type DrawOptions = { seats?: number; exclude?: ReadonlySet<OwnerId> };
 
 export type Selection = { reviewers: KeyId[]; candidates: number; notes: string[] };
 
@@ -166,10 +176,11 @@ const familyKey = (f: string) => f.trim().toLowerCase();
 // fills at most one seat. Owner ids are exact: the ledger refuses a second
 // spelling of an owner (ids ignore case there), so one person cannot hold two
 // tickets under two spellings.
-export function selectReviewers(state: CommonsState, submissionId: string, beacon: string): Selection {
+export function selectReviewers(state: CommonsState, submissionId: string, beacon: string, draw: DrawOptions = {}): Selection {
   const s = submissionOf(state, submissionId);
   const tree = memberTree(state);
   const rules = state.rules;
+  const seats = draw.seats ?? rules.assignedReviewers;
   if (!Number.isInteger(rules.minTreeDistance)) throw new Error("selection: rules.minTreeDistance must be an integer");
   const notes: string[] = [];
   const author = state.agents.get(s.author);
@@ -202,7 +213,7 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
     // owner could register an agent exactly when its draw would win a seat.
     if (agent.registeredSeq !== undefined && agent.registeredSeq >= s.submittedSeq) continue;
     const owner = agent.owner;
-    if (owner === authorOwner) continue;
+    if (owner === authorOwner || draw.exclude?.has(owner)) continue;
     const committed = committedFor.get(owner);
     if (committed !== undefined && committed !== agent.keyId) continue;
     let o = ownerDraw.get(owner);
@@ -235,7 +246,7 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
     seen.add(c.owner);
     bestPerOwner.push(c);
   }
-  const picks = bestPerOwner.slice(0, Math.max(0, rules.assignedReviewers));
+  const picks = bestPerOwner.slice(0, Math.max(0, seats));
 
   if (rules.requireOtherModelFamily && picks.length > 0 && picks.every((p) => p.family === authorFamily)) {
     // `eligible` is sorted: the first other-family candidate of a seated
@@ -267,9 +278,9 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
     }
   }
 
-  if (picks.length < rules.assignedReviewers) {
+  if (picks.length < seats) {
     notes.push(
-      `only ${picks.length} of ${rules.assignedReviewers} reviewers: ${bestPerOwner.length} eligible owner(s) farther than ${rules.minTreeDistance} from ${author.owner}`,
+      `only ${picks.length} of ${seats} reviewers: ${bestPerOwner.length} eligible owner(s) farther than ${rules.minTreeDistance} from ${author.owner}`,
     );
   }
   return { reviewers: picks.map((p) => p.keyId), candidates: bestPerOwner.length, notes };
@@ -299,7 +310,13 @@ function stateAt(state: CommonsState, seq: number, submissionId: string): Common
   const rules = state.rulesHistory?.filter((r) => r.seq < seq).at(-1)?.rules ?? state.rules;
   const submissions = new Map(state.submissions);
   const s = state.submissions.get(submissionId);
-  if (s) submissions.set(submissionId, { ...s, reviews: s.reviews.filter((r) => r.committedSeq < seq) });
+  if (s) {
+    submissions.set(submissionId, {
+      ...s,
+      reviews: s.reviews.filter((r) => r.committedSeq < seq),
+      escalations: (s.escalations ?? []).filter((r) => r.seq < seq),
+    });
+  }
   return { ...state, owners, agents, rules, submissions };
 }
 
@@ -335,4 +352,109 @@ export function verifyAssignmentInLedger(entries: readonly LedgerEntry[], submis
   if (!s || assignmentBeacon(s.id, s.headCommit, body.entropy) !== body.beacon) return false;
   const { reviewers } = selectReviewers(before, submissionId, body.beacon);
   return sameSet(reviewers, body.reviewers);
+}
+
+// ---------------------------------------------------------------------------
+// Escalation rounds
+// ---------------------------------------------------------------------------
+
+// Owners an escalation may not seat: every owner holding a seat in an earlier
+// round or a review commit on the submission (one seat and one commit per
+// owner).
+export function escalationExcluded(state: CommonsState, s: SubmissionState): Set<OwnerId> {
+  const out = new Set<OwnerId>();
+  const add = (k: KeyId) => {
+    const owner = state.agents.get(k)?.owner;
+    if (owner !== undefined) out.add(owner);
+  };
+  for (const round of reviewRounds(s)) round.reviewers.forEach(add);
+  for (const r of s.reviews) add(r.reviewer);
+  return out;
+}
+
+const NO_BEACON = "0".repeat(64);
+
+// Eligible owners a next escalation round could seat. Eligibility does not
+// depend on the beacon, so this needs no entropy.
+export function escalationCandidates(state: CommonsState, submissionId: string): number {
+  const s = submissionOf(state, submissionId);
+  return selectReviewers(state, submissionId, NO_BEACON, { exclude: escalationExcluded(state, s), seats: 0 }).candidates;
+}
+
+// The next reviewEscalation body for an already drawn set of reviewers.
+export function escalationBody(
+  state: CommonsState,
+  submissionId: string,
+  reviewers: KeyId[],
+  entropy: string,
+): Extract<EntryBody, { kind: "reviewEscalation" }> {
+  const s = submissionOf(state, submissionId);
+  const round = (s.escalations?.length ?? 0) + 1;
+  const beacon = escalationBeacon(s.id, s.headCommit, round, entropy);
+  return { kind: "reviewEscalation", submissionId, round, beacon, entropy, treeDigest: memberDigest(state), reviewers };
+}
+
+// Draws the next escalation round over the member tree of `state`.
+export function drawEscalation(
+  state: CommonsState,
+  submissionId: string,
+  entropy: string,
+): Selection & { body: Extract<EntryBody, { kind: "reviewEscalation" }> } {
+  const s = submissionOf(state, submissionId);
+  const round = (s.escalations?.length ?? 0) + 1;
+  const beacon = escalationBeacon(s.id, s.headCommit, round, entropy);
+  const picked = selectReviewers(state, submissionId, beacon, {
+    exclude: escalationExcluded(state, s),
+    seats: state.rules.judgement.escalationReviewers,
+  });
+  return { ...picked, body: escalationBody(state, submissionId, picked.reviewers, entropy) };
+}
+
+function redrawEscalation(before: CommonsState, s: SubmissionState, round: { round: number; beacon: string; entropy: string; treeDigest: string; reviewers: KeyId[] }): boolean {
+  if (memberDigest(before) !== round.treeDigest) return false;
+  if (escalationBeacon(s.id, s.headCommit, round.round, round.entropy) !== round.beacon) return false;
+  const bs = before.submissions.get(s.id);
+  if (!bs) return false;
+  const { reviewers } = selectReviewers(before, s.id, round.beacon, {
+    exclude: escalationExcluded(before, bs),
+    seats: before.rules.judgement.escalationReviewers,
+  });
+  return sameSet(reviewers, round.reviewers);
+}
+
+// True if escalation round `round` is the draw the state before it gives (as
+// verifyAssignment does for round 0).
+export function verifyEscalation(state: CommonsState, submissionId: string, round: number): boolean {
+  const s = state.submissions.get(submissionId);
+  const r = s?.escalations?.find((x) => x.round === round);
+  if (!s || !r) return false;
+  return redrawEscalation(stateAt(state, r.seq, submissionId), s, r);
+}
+
+// The same audit by replay of the entries before the escalation.
+export function verifyEscalationInLedger(entries: readonly LedgerEntry[], submissionId: string, round: number, entropy?: string): boolean {
+  const at = entries.findIndex((e) => e.body.kind === "reviewEscalation" && e.body.submissionId === submissionId && e.body.round === round);
+  const entry = entries[at];
+  if (!entry || entry.body.kind !== "reviewEscalation") return false;
+  if (entropy !== undefined && entry.body.entropy !== entropy) return false;
+  const before = replay(entries.slice(0, at));
+  const s = before.submissions.get(submissionId);
+  return s !== undefined && redrawEscalation(before, s, entry.body);
+}
+
+// The audit the ledger leaves out of a merge's recorded judgement: replays the
+// entries before the merge and recomputes every reviewer's weight at the
+// recorded asOf. True when the merge recorded no judgement (it then had a
+// mergeApproval, which the ledger checks) or every weight matches.
+export function verifyJudgementInLedger(entries: readonly LedgerEntry[], submissionId: string): boolean {
+  const at = entries.findIndex((e) => e.body.kind === "merge" && e.body.submissionId === submissionId);
+  const entry = entries[at];
+  if (!entry || entry.body.kind !== "merge") return false;
+  const j = entry.body.judgement;
+  if (j === undefined) return true;
+  const before = replay(entries.slice(0, at));
+  const s = before.submissions.get(submissionId);
+  if (!s || judgementProblem(before, s, j) !== null) return false;
+  const weightOf = reviewerWeights(before, j.asOf);
+  return j.weights.every((w) => Math.abs(weightOf(w.reviewer) - w.weight) <= JUDGEMENT_PRECISION);
 }

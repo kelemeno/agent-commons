@@ -24,8 +24,9 @@ import { canonical, isValidPublicKey, keyIdOf, sha256hex, sign, verify } from ".
 import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
 import { ringOf } from "./gates/rings";
 import { MEMBER_ROOT, memberDigest } from "./members";
-import { commitDeadlineMs, plantCommitment } from "./plants";
-import { assignmentBeacon, type CommitSubject, commitmentFor, validateVerdict } from "./review";
+import { judgementPasses, judgementProblem } from "./judgement";
+import { commitDeadlineMs, plantCommitment, reviewRounds, roundCloseSeq, seatRound } from "./plants";
+import { assignmentBeacon, type CommitSubject, commitmentFor, escalationBeacon, validateVerdict } from "./review";
 import { claimStake, validateRules } from "./rules";
 import type {
   CommonsState,
@@ -110,6 +111,9 @@ export type LedgerErrorCode =
   | "not-decidable"
   | "approved"
   | "window-closed"
+  | "window-open"
+  | "escalations"
+  | "judgement"
   // file
   | "exists"
   | "torn"
@@ -361,6 +365,14 @@ const SHAPES: { [K in EntryKind]: Record<string, Check> } = {
     treeDigest: hex64,
     reviewers: listOf(L.reviewers, id),
   },
+  reviewEscalation: {
+    submissionId: id,
+    round: nat,
+    beacon: hex64,
+    entropy: text(L.ref),
+    treeDigest: hex64,
+    reviewers: listOf(L.reviewers, id),
+  },
   reviewCommit: { submissionId: id, commitment: hex64, stake: int },
   reviewReveal: { submissionId: id, verdict: any, salt: id },
   finding: { id, target, severity, testPath: str, testCommand: text(L.command), stake: int },
@@ -395,6 +407,8 @@ const SHAPES: { [K in EntryKind]: Record<string, Check> } = {
 const OPTIONAL: Partial<Record<EntryKind, Record<string, Check>>> = {
   submission: { planted: any },
   findingResult: { harnessError: text(L.text) },
+  reviewWindowClosed: { round: nat },
+  merge: { judgement: any },
 };
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -638,6 +652,7 @@ const SIGNERS: { [K in Exclude<EntryKind, "genesis">]: Role } = {
   submission: "agent",
   gateResult: "coordinator",
   reviewAssignment: "coordinator",
+  reviewEscalation: "coordinator",
   reviewCommit: "agent",
   reviewReveal: "agent",
   finding: "agent",
@@ -891,6 +906,7 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
         submittedSeq: seq,
         submittedAt: at,
         gates: [],
+        escalations: [],
         reviews: [],
         findingIds: [],
       });
@@ -944,14 +960,72 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       return;
     }
 
+    case "reviewEscalation": {
+      const s = submission(body.submissionId);
+      if (s.merged) reject("merged", "submission already merged");
+      if (!s.assignment) reject("not-assigned", "no reviewer assignment");
+      if (s.planted) reject("planted", "a revealed plant is a known defect");
+      // Nobody new could commit (reviewCommitsClosedBy), and the reproduction
+      // blocks the merge whatever more reviewers say.
+      if (s.findingIds.some((fid) => isReproducedOpen(finding(fid)))) {
+        reject("reproduced-finding", "a reproduced finding targets this submission");
+      }
+      const rounds = (s.escalations ??= []);
+      if (body.round !== rounds.length + 1) reject("invalid-value", `round must be ${rounds.length + 1}`);
+      if (body.round > state.rules.judgement.maxEscalations) {
+        reject("escalations", `rules.judgement.maxEscalations is ${state.rules.judgement.maxEscalations}`);
+      }
+      // The judgement escalates on closed rounds only: what the earlier
+      // reviewers said is what calls for more of them.
+      if (roundCloseSeq(state, s.id, body.round - 1) === null) reject("window-open", `review round ${body.round - 1} has not closed`);
+      if (body.reviewers.length === 0) reject("invalid-reviewers", "no reviewers");
+      if (body.reviewers.length > state.rules.judgement.escalationReviewers) {
+        reject("invalid-reviewers", `more than rules.judgement.escalationReviewers (${state.rules.judgement.escalationReviewers}) reviewers`);
+      }
+      // As for the assignment: the tree is the ledger's, the beacon follows
+      // from the entry; selection.verifyEscalation redoes the draw.
+      if (body.treeDigest !== memberDigest(state)) {
+        reject("invalid-value", "treeDigest is not the digest of the member tree before this entry");
+      }
+      if (body.beacon !== escalationBeacon(s.id, s.headCommit, body.round, body.entropy)) {
+        reject("invalid-value", "beacon is not escalationBeacon(submissionId, headCommit, round, entropy)");
+      }
+      const authorOwner = ownerOf(s.author);
+      const taken = new Set<OwnerId>();
+      for (const k of [...reviewRounds(s).flatMap((r) => r.reviewers), ...s.reviews.map((r) => r.reviewer)]) {
+        const o = ownerOf(k);
+        if (o !== undefined) taken.add(o);
+      }
+      const owners = new Set<OwnerId>();
+      for (const r of body.reviewers) {
+        const agent = state.agents.get(r);
+        if (!agent?.active) return reject("invalid-reviewers", `reviewer ${r} is not an active agent`);
+        if (agent.owner === authorOwner) reject("invalid-reviewers", `reviewer ${r} shares the author's owner`);
+        if (taken.has(agent.owner)) reject("invalid-reviewers", `owner ${agent.owner} already holds a seat or a commit on ${s.id}`);
+        if (owners.has(agent.owner)) reject("invalid-reviewers", `owner ${agent.owner} holds two seats`);
+        owners.add(agent.owner);
+      }
+      rounds.push({
+        round: body.round,
+        beacon: body.beacon,
+        entropy: body.entropy,
+        treeDigest: body.treeDigest,
+        reviewers: [...body.reviewers],
+        seq,
+        at,
+      });
+      return;
+    }
+
     case "reviewCommit": {
       const s = submission(body.submissionId);
       if (s.merged) reject("merged", "submission already merged");
-      checkCommit(s.reviews, ownerSet([s.id]), body.commitment, body.stake, reviewCommitsClosedBy(state, s.id, ms));
+      checkCommit(s.reviews, ownerSet([s.id]), body.commitment, body.stake, reviewCommitsClosedBy(state, s.id, ms, signer));
       // The owner's seat is its assigned agent's: a commit by another of its
       // agents would leave that seat unfillable (one commit per owner). A
       // seated agent since revoked can fill nothing, so it holds nothing.
-      const seat = s.assignment?.reviewers.find((k) => k !== signer && ownerOf(k) === ownerOf(signer) && state.agents.get(k)?.active === true);
+      const seated = reviewRounds(s).flatMap((r) => r.reviewers);
+      const seat = seated.find((k) => k !== signer && ownerOf(k) === ownerOf(signer) && state.agents.get(k)?.active === true);
       if (seat !== undefined) reject("duplicate-commit", `this owner's seat on ${s.id} is ${seat}'s; commit with that agent`);
       s.reviews.push({ reviewer: signer, commitment: body.commitment, stake: body.stake, committedSeq: seq });
       return;
@@ -963,10 +1037,13 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       // committed or the phase ended. Otherwise one reveal, by anyone, seconds
       // after a submission would shut the assigned reviewers out for good.
       if (!s.assignment) reject("commit-phase", "reveals wait for the reviewer assignment");
-      const deadline = commitDeadlineMs(state.rules, s.assignment?.at);
-      const allCommitted = (s.assignment?.reviewers ?? []).every((k) => s.reviews.some((r) => r.reviewer === k));
+      // An escalated seat waits for its own round's commit phase; everyone
+      // else for round 0's.
+      const round = seatRound(s, signer) ?? reviewRounds(s)[0];
+      const deadline = commitDeadlineMs(state.rules, round?.at);
+      const allCommitted = (round?.reviewers ?? []).every((k) => s.reviews.some((r) => r.reviewer === k));
       if (!allCommitted && ms < deadline) {
-        reject("commit-phase", `reveals wait until every assigned reviewer committed or ${new Date(deadline).toISOString()}`);
+        reject("commit-phase", `reveals wait until every reviewer of round ${round?.round ?? 0} committed or ${new Date(deadline).toISOString()}`);
       }
       const review = checkReveal(s.reviews, body.verdict, body.salt, { submissionId: s.id });
       review.verdict = cloneJson(body.verdict);
@@ -1074,12 +1151,17 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       const s = submission(body.submissionId);
       if (s.merged) reject("merged", "submission already merged");
       if (!s.assignment) reject("not-assigned", "no reviewer assignment");
-      if (s.windowClosed) reject("window-closed", "review window already closed");
-      const unrevealed = (s.assignment?.reviewers ?? []).filter((k) => !s.reviews.some((r) => r.reviewer === k && r.verdict));
+      const k = body.round ?? 0;
+      const round = reviewRounds(s).find((r) => r.round === k);
+      if (!round) return reject("unknown-ref", `no review round ${k}`);
+      if (round.closed) reject("window-closed", `review round ${k} already closed`);
+      const unrevealed = round.reviewers.filter((r) => !s.reviews.some((v) => v.reviewer === r && v.verdict));
       if (canon([...body.missing].sort()) !== canon([...unrevealed].sort())) {
-        reject("invalid-reviewers", "missing must be exactly the assigned reviewers who have not revealed");
+        reject("invalid-reviewers", "missing must be exactly the round's reviewers who have not revealed");
       }
-      s.windowClosed = { missing: [...body.missing], seq, at };
+      const closed = { missing: [...body.missing], seq, at };
+      if (k === 0) s.windowClosed = closed;
+      else round.closed = closed;
       return;
     }
 
@@ -1104,7 +1186,24 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
         reject("finding-pending", "a finding on this submission has no result yet");
       }
       if (s.planted) reject("planted", "a revealed plant is a known defect");
-      s.merged = { commit: body.commit, seq, at };
+      // The reviews decide (judgement.ts): without a human's approval the
+      // merge must record a judgement that passes. Its pool and fields are
+      // checked here; its weights by replay (selection.verifyJudgementInLedger).
+      const j = body.judgement;
+      if (j !== undefined) {
+        const problem = judgementProblem(state, s, j);
+        if (problem !== null) reject("judgement", problem);
+        const asOf = typeof j.asOf === "string" && iso(j.asOf) ? Date.parse(j.asOf) : Number.NaN;
+        if (!(asOf >= Date.parse(headAtOf(state)) && asOf <= ms)) {
+          reject("judgement", "judgement.asOf must be a time between the previous entry and this one");
+        }
+      }
+      if (!s.approval) {
+        if (j === undefined) return reject("judgement", "a merge without a mergeApproval must record the merge judgement");
+        const fails = judgementPasses(state, s, j);
+        if (fails !== null) reject("judgement", `the judgement does not pass without a mergeApproval: ${fails}`);
+      }
+      s.merged = { commit: body.commit, seq, at, ...(j !== undefined ? { judgement: cloneJson(j) } : {}) };
       return;
     }
 
@@ -1372,12 +1471,20 @@ function settledKeys(state: CommonsState): Set<string> {
 // back until every assigned reviewer committed or the phase ended), at a plant
 // reveal, or while a reproduction nobody dismissed stands: a later commit
 // could copy the answer.
-export function reviewCommitsClosedBy(state: CommonsState, submissionId: string, atMs: number): string | null {
+// `reviewer` matters for an escalated seat: its round has its own commit
+// phase, which opens after earlier reveals are public.
+export function reviewCommitsClosedBy(state: CommonsState, submissionId: string, atMs: number, reviewer?: KeyId): string | null {
   const s = state.submissions.get(submissionId);
   if (!s) return "no such submission";
   if (s.merged) return "the submission merged";
-  if (s.assignment && atMs >= commitDeadlineMs(state.rules, s.assignment.at)) return "the commit phase ended";
-  if (s.reviews.some((r) => r.verdict)) return "a review was revealed";
+  const escalated = reviewer === undefined ? undefined : s.escalations?.find((r) => r.reviewers.includes(reviewer));
+  if (escalated) {
+    if (atMs >= commitDeadlineMs(state.rules, escalated.at)) return `round ${escalated.round}'s commit phase ended`;
+    if (escalated.reviewers.some((k) => s.reviews.some((r) => r.reviewer === k && r.verdict))) return `a review of round ${escalated.round} was revealed`;
+  } else {
+    if (s.assignment && atMs >= commitDeadlineMs(state.rules, s.assignment.at)) return "the commit phase ended";
+    if (s.reviews.some((r) => r.verdict)) return "a review was revealed";
+  }
   if (s.planted) return "the plant was revealed";
   const open = s.findingIds.some((fid) => {
     const f = state.findings.get(fid);

@@ -186,6 +186,21 @@ export function defaultRules(): Rules {
       kernelSignoffs: 2,
     },
     kernelSigners: [],
+    // Two untried reviewers at p = 0.01 pool to 0.21: nothing merges on
+    // reviewers without a record until escalation has added more of them.
+    // Two at weight 0.73 (ten clean, well-scored reviews each) at p = 0.02
+    // pool to 0.09, under ring 1's threshold.
+    judgement: {
+      maxRisk: [0.1, 0.15, 0.2],
+      priorRisk: 0.5,
+      priorWeight: 1,
+      newReviewerWeight: 0.2,
+      priorReviews: 5,
+      disagreement: 0.5,
+      trustedWeight: 0.5,
+      maxEscalations: 2,
+      escalationReviewers: 2,
+    },
   };
 }
 
@@ -362,6 +377,26 @@ export function validateRules(rules: Rules): string[] {
   if (dev < 1 || release < 1 || main < 1) problems.push("rules.rewards.stageMultiplier values must be >= 1");
   if (!(dev <= release && release <= main)) {
     problems.push("rules.rewards.stageMultiplier must be non-decreasing: dev <= release <= main");
+  }
+  const j = r.judgement;
+  if (j.maxRisk.length !== 3) problems.push("rules.judgement.maxRisk must have 3 entries");
+  j.maxRisk.forEach((m, i) => {
+    if (!(isNonNegative(m) && m <= 1)) problems.push(`rules.judgement.maxRisk[${i}] must be in [0, 1]`);
+  });
+  // The pool works in log-odds: a prior of exactly 0 or 1 has none.
+  if (!(j.priorRisk > 0 && j.priorRisk < 1)) problems.push("rules.judgement.priorRisk must be in (0, 1)");
+  for (const [name, value] of [
+    ["newReviewerWeight", j.newReviewerWeight],
+    ["disagreement", j.disagreement],
+    ["trustedWeight", j.trustedWeight],
+  ] as const) {
+    if (value > 1) problems.push(`rules.judgement.${name} must be <= 1`);
+  }
+  for (const [name, value, min] of [
+    ["maxEscalations", j.maxEscalations, 0],
+    ["escalationReviewers", j.escalationReviewers, 1],
+  ] as const) {
+    if (!Number.isInteger(value) || value < min) problems.push(`rules.judgement.${name} must be an integer >= ${min}`);
   }
   if (r.kernelSigners.length > 0 && r.promotion.kernelSignoffs > r.kernelSigners.length) {
     problems.push("rules.promotion.kernelSignoffs exceeds the number of kernelSigners");
